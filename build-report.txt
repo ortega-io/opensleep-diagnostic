@@ -1,6 +1,29 @@
 opensleep-diagnostic — build report
 ====================================
 
+Patch revision: 2 (sensor-first post-reset bootloader retry-probe)
+Supersedes revision 1 (initial diagnostic-only fork). Same upstream base commit; only
+source.patch changed. Revision 1's artifact SHA-256 was
+0900b8667033faa7b6b10423d3460a7e489f3214389bc758bf1465342ebd4c52 (1,839,464 bytes); see git
+history for that report if needed.
+
+What changed in revision 2
+---------------------------
+When --reset-subsystems is used, Sensor is now tested before Frozen by default
+(--sensor-first, tied to --reset-subsystems unless explicitly overridden), and immediately after
+the reset-expander sequence releases, Sensor's bootloader baud (38400) is probed with repeated
+Ping attempts (default: every 100ms for up to 3000ms, or until a valid response) instead of a
+single Ping several seconds later behind a Frozen-first ordering. Frozen's optional GetFirmware
+step is now skipped by default (--skip-frozen-firmware, default on) since it was previously
+delaying the whole Frozen phase behind a timeout for no diagnostic benefit; its outcome was
+already structurally incapable of invalidating a successful Frozen Ping, and still is. New CLI
+options: --sensor-first, --sensor-bootloader-probe-ms, --sensor-bootloader-interval-ms,
+--skip-frozen-firmware. New summary/JSON fields covering the bootloader retry-probe's attempt
+count, bytes received, valid-frame/decode-error counts, and first-byte/first-valid-frame latency
+relative to reset release. No new command is reachable: the whitelist (Ping, GetHardwareInfo,
+GetFirmware(Hash), JumpToFirmware per subsystem) and the two-layer enforcement
+(closed probe enums + SafetyAudit) are unchanged; see SAFETY.md.
+
 Source
 ------
 Upstream repository:        https://github.com/LiamSnow/opensleep
@@ -8,7 +31,7 @@ Cloned branch:               main
 Pinned source commit:        29ea3f8f51d208a02b5d2691720157c7ce96c292
 Diagnostic patch:            source.patch (applied with `git apply` after `git checkout` to the
                               pinned commit above; verified to apply cleanly with
-                              `git apply --check`)
+                              `git apply --check` against a fresh checkout of that commit)
 
 Toolchain
 ---------
@@ -57,16 +80,26 @@ cross-toolchain via the host's QEMU binfmt handler)
 ------------------------------------------------------------------------------------------------
   opensleep (lib, unmodified normal-OpenSleep tests):        51 passed; 0 failed
   opensleep (bin "opensleep", src/main.rs, no unit tests):     0 passed; 0 failed
-  opensleep-diagnostic (bin, safety/mock-transport tests):    22 passed; 0 failed
+  opensleep-diagnostic (bin, safety/mock-transport tests):    34 passed; 0 failed
   opensleep (doc-tests):                                       0 passed; 0 failed
   ------------------------------------------------------------------------------
-  Total:                                                      73 passed; 0 failed; 0 ignored
+  Total:                                                      85 passed; 0 failed; 0 ignored
+
+  The 34 diagnostic-binary tests include 12 new to this revision, covering: the bootloader
+  retry-probe's timing/retry/stop-on-response behavior, partial-frame reassembly across reads,
+  continuing past a malformed (bad-checksum) frame, distinguishing "no bytes received" from
+  "bytes received but undecodable", first-byte/first-valid-frame latency recording, the
+  bootloader port being opened exactly once for the whole probe window, JumpToFirmware gating on
+  the new sensor-first code path specifically, Frozen's GetFirmware being skipped by default,
+  Frozen's GetFirmware timeout not invalidating an already-successful Ping, and an end-to-end
+  mocked-transport check that Sensor fully completes before Frozen starts under sensor-first
+  ordering.
 
 Artifact
 --------
 Path:            target/aarch64-unknown-linux-musl/release/opensleep-diagnostic
 Exported as:      dist/opensleep-diagnostic-aarch64-static
-Size:             1,839,464 bytes
+Size:             1,905,064 bytes
 
 `file` output:
   dist/opensleep-diagnostic-aarch64-static: ELF 64-bit LSB executable, ARM aarch64, version 1
@@ -75,24 +108,24 @@ Size:             1,839,464 bytes
 `readelf -l` output (no PT_INTERP / dynamic-interpreter segment present — confirms static
 linking, not merely inferred from the target triple):
   Elf file type is EXEC (Executable file)
-  Entry point 0x413400
+  Entry point 0x40f7c8
   There are 6 program headers, starting at offset 64
 
   Program Headers:
     Type           Offset             VirtAddr           PhysAddr
                    FileSiz            MemSiz              Flags  Align
     LOAD           0x0000000000000000 0x0000000000400000 0x0000000000400000
-                   0x00000000001affc8 0x00000000001affc8  R E    0x10000
-    LOAD           0x00000000001b4098 0x00000000005b4098 0x00000000005b4098
-                   0x000000000000cb78 0x000000000000e360  RW     0x10000
-    TLS            0x00000000001b4098 0x00000000005b4098 0x00000000005b4098
+                   0x00000000001b83c0 0x00000000001b83c0  R E    0x10000
+    LOAD           0x00000000001c3e38 0x00000000005c3e38 0x00000000005c3e38
+                   0x000000000000ce18 0x000000000000e600  RW     0x10000
+    TLS            0x00000000001c3e38 0x00000000005c3e38 0x00000000005c3e38
                    0x0000000000000090 0x0000000000000128  R      0x8
-    GNU_EH_FRAME   0x0000000000179c78 0x0000000000579c78 0x0000000000579c78
-                   0x0000000000004ea4 0x0000000000004ea4  R      0x4
+    GNU_EH_FRAME   0x00000000001813e0 0x00000000005813e0 0x00000000005813e0
+                   0x0000000000004f54 0x0000000000004f54  R      0x4
     GNU_STACK      0x0000000000000000 0x0000000000000000 0x0000000000000000
                    0x0000000000000000 0x0000000000000000  RW     0x10
-    GNU_RELRO      0x00000000001b4098 0x00000000005b4098 0x00000000005b4098
-                   0x000000000000bf68 0x000000000000bf68  R      0x1
+    GNU_RELRO      0x00000000001c3e38 0x00000000005c3e38 0x00000000005c3e38
+                   0x000000000000c1c8 0x000000000000c1c8  R      0x1
 
    Section to Segment mapping:
     Segment Sections...
@@ -108,7 +141,7 @@ linking, not merely inferred from the target triple):
   name alone is not treated as sufficient evidence.)
 
 SHA-256:
-  0900b8667033faa7b6b10423d3460a7e489f3214389bc758bf1465342ebd4c52  opensleep-diagnostic-aarch64-static
+  6b429724a9e0a1af3fa9265e4f70638d1a9942e2a2ce94b5810e08a4b9698c9b  opensleep-diagnostic-aarch64-static
 
 `sha256sum -c` against the shipped .sha256 file: OK
 
@@ -117,19 +150,20 @@ Runtime smoke test
 The exported dist/opensleep-diagnostic-aarch64-static was additionally executed directly on the
 x86_64 build host (via the same transparent QEMU binfmt path described above) as a sanity check
 independent of the build container:
-  - `--help` exits 0 and lists exactly the CLI options specified in the task (no temperature,
-    pump, priming, vibration, alarm, raw-command, or profile options are present).
-  - An unknown/invalid flag (and a probe with a hypothetical `--set-temperature`-style flag,
-    which does not exist) exits 30.
-  - Run against this build host's actual (non-Pod) /dev/i2c-1, /dev/ttyS1, /dev/ttyS2 (which
-    exist but are not accessible/are not the real subsystems) correctly logs each open/probe
-    failure with its OS error, marks the LED controller probe SKIPPED-vs-FAIL appropriately,
-    still attempts both the Frozen and Sensor UART phases despite the I2C failure, prints the
-    full text summary table, writes an equivalent JSON file when --json-output is given, and
-    exits 20 (I2C/reset initialization problem) as specified.
+  - `--help` lists the four new options (--sensor-first, --sensor-bootloader-probe-ms,
+    --sensor-bootloader-interval-ms, --skip-frozen-firmware) alongside the unchanged prior set;
+    still no temperature, pump, priming, vibration, alarm, raw-command, or profile option exists.
+  - `--sensor-first --sensor-bootloader-probe-ms 100 --sensor-bootloader-interval-ms 30
+    --timeout-seconds 1` (no --reset-subsystems) runs the sensor-first path on demand, correctly
+    reports "Sensor tested first after reset: YES" and the new bootloader-probe summary fields
+    (all zero/unavailable here since this host's /dev/ttyS2 isn't a real Sensor MCU), and exits
+    20 (I2C open failure on this non-Pod host takes precedence, as designed).
+  - `--reset-subsystems --sensor-first=false` correctly reports "Sensor tested first after
+    reset: NO", confirming the explicit-override path works, not just the tied-to-reset default.
+  - `--skip-frozen-firmware=false` correctly flips the logged "Frozen GetFirmware requested"
+    line to true, confirming the backward-compatibility override works.
   - `Arch:` in the startup log correctly reports `aarch64` (read from the running binary's own
-    target, not the host), confirming this is genuinely the cross-compiled artifact and not a
-    host-arch build being tested by mistake.
+    target, not the host), confirming this is genuinely the cross-compiled artifact.
 
 Local (non-Docker) validation performed during development
 ------------------------------------------------------------
@@ -137,7 +171,7 @@ Before the Docker cross-build, the same source tree was also built and tested na
 build host (x86_64, rustc/cargo 1.96.0) as a fast development loop:
   cargo build --bin opensleep   (unmodified normal OpenSleep binary; builds and behaves
                                   identically to before this fork — same 51 lib tests pass)
-  cargo test                    (73 tests passed: 51 lib + 22 diagnostic, 0 failed)
+  cargo test                    (85 tests passed: 51 lib + 34 diagnostic, 0 failed)
   cargo clippy --bin opensleep-diagnostic --all-targets
-                                 (0 warnings in new code; 3 pre-existing warnings in unmodified
-                                  upstream files, not touched by this fork)
+                                 (0 warnings in new/changed code; 3 pre-existing warnings in
+                                  unmodified upstream files, not touched by this fork)

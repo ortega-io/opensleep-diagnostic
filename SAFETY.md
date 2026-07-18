@@ -17,17 +17,22 @@ was built specifically so those operations are structurally impossible to trigge
 |---|---|---|---|
 | `Ping` | `0x01` | `7E 01 01 DC BD` | Always, first Frozen command |
 | `GetHardwareInfo` | `0x02` | `7E 01 02 EC DE` | After a successful Ping |
-| `GetFirmware` | `0x04` | `7E 01 04 8C 18` | After a successful Ping (best-effort, passive) |
+| `GetFirmware` | `0x04` | `7E 01 04 8C 18` | Only if `--skip-frozen-firmware=false` is explicitly passed (default: never sent). Best-effort and passive: its timeout can never turn an already-successful Ping into a failure. |
 | `JumpToFirmware` | `0x10` | `7E 01 10 DE AD` | Only if Frozen is detected in its bootloader **and** `--allow-firmware-jump` was passed |
 
 ### Sensor subsystem (`/dev/ttyS2` by default, 115200 baud firmware / 38400 baud bootloader, 8N1, no flow control)
 
 | Command | Opcode | Serialized frame | Sent when |
 |---|---|---|---|
-| `Ping` | `0x01` | `7E 01 01 DC BD` | At firmware baud first, then at bootloader baud if unanswered; again after a firmware jump |
+| `Ping` | `0x01` | `7E 01 01 DC BD` | Repeatedly: when sensor-first is active (default whenever `--reset-subsystems` is used), immediately after reset at bootloader baud, once every `--sensor-bootloader-interval-ms` (default 100ms) for up to `--sensor-bootloader-probe-ms` (default 3000ms) or until a valid response, then once at firmware baud; otherwise (sensor-first inactive), once at firmware baud, then once at bootloader baud only if firmware didn't answer; either way, once more after a firmware jump |
 | `GetHardwareInfo` | `0x02` | `7E 01 02 EC DE` | After a successful firmware-mode Ping (initial or post-jump) |
 | `GetFirmwareHash` | `0x04` | `7E 01 04 8C 18` | After a successful firmware-mode Ping (best-effort, passive) |
 | `JumpToFirmware` | `0x10` | `7E 01 10 DE AD` | Only if Sensor is detected in its bootloader **and** `--allow-firmware-jump` was passed |
+
+Repeating `Ping` many times during the post-reset bootloader probe window does not change what is
+reachable: `Ping` is on the whitelist regardless of how many times it's sent, and the retry loop
+(`sensor_phase::probe_sensor_bootloader_retries`) only ever constructs `SensorProbe::Ping` --
+there is no code path in that loop capable of constructing any other command.
 
 (Frame bytes are from `opensleep`'s own encoder — `FrozenCommand`/`SensorCommand::to_bytes()` —
 and are exercised directly by this fork's unit tests, e.g. `frozen::command::tests::test_ping`
@@ -89,9 +94,11 @@ alone:
 transitions an MCU from its bootloader to its normal firmware) but is additionally gated behind
 the `--allow-firmware-jump` CLI flag at the call site in `frozen_phase.rs`/`sensor_phase.rs`, and
 is never followed by any temperature, pump, or priming command in either phase.
-`frozen_phase::tests::jump_to_firmware_is_never_sent_without_opt_in` and
-`sensor_phase::tests::jump_to_firmware_not_sent_without_opt_in_even_in_bootloader` assert this
-holds even when the target hardware is actively detected as being in its bootloader.
+`frozen_phase::tests::jump_to_firmware_is_never_sent_without_opt_in`,
+`sensor_phase::tests::jump_to_firmware_not_sent_without_opt_in_even_in_bootloader`, and (for the
+sensor-first, post-reset code path specifically)
+`sensor_phase::tests::reset_first_jump_to_firmware_not_sent_without_opt_in` all assert this holds
+even when the target hardware is actively detected as being in its bootloader.
 
 ## Other guarantees
 
