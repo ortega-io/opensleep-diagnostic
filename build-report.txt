@@ -1,0 +1,143 @@
+opensleep-diagnostic — build report
+====================================
+
+Source
+------
+Upstream repository:        https://github.com/LiamSnow/opensleep
+Cloned branch:               main
+Pinned source commit:        29ea3f8f51d208a02b5d2691720157c7ce96c292
+Diagnostic patch:            source.patch (applied with `git apply` after `git checkout` to the
+                              pinned commit above; verified to apply cleanly with
+                              `git apply --check`)
+
+Toolchain
+---------
+Rust compiler (in build image): rustc 1.96.1 (31fca3adb 2026-06-26)
+Cargo (in build image):         cargo 1.96.1 (356927216 2026-06-26)
+Edition-2024 requirement (>=1.85): satisfied by the image's preinstalled toolchain; no
+                                    `rustup update` was needed or performed for this build.
+                                    (See Dockerfile comment: the pinned image tag's rustup
+                                    component metadata is out of sync with its doc-stripped
+                                    toolchain directory, which makes `rustup update stable` fail
+                                    while removing the old clippy component. The Dockerfile only
+                                    calls `rustup update` when the preinstalled rustc is actually
+                                    below 1.85, and works around that same bug if it ever does.)
+
+Docker builder image:       messense/rust-musl-cross:aarch64-musl
+Image digest (as pulled):   sha256:ecae5dd62d1c938c14f8071d36c16fa699860aace03bfb5284fb1216474d2643
+Cargo target:                aarch64-unknown-linux-musl
+Linker override:              CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-unknown-linux-musl-gcc
+                              (NOTE: this deviates from the commonly cited
+                              `aarch64-linux-musl-gcc`; that binary does not exist in this image
+                              tag — verified with `find / -iname '*aarch64-linux-musl-gcc*'`
+                              inside the container, no match. The correct binary in this image is
+                              `aarch64-unknown-linux-musl-gcc`, confirmed present under
+                              /usr/local/musl/bin/. Using the former name fails the build with
+                              "linker not found".)
+RUSTFLAGS:                    -C target-feature=+crt-static
+
+Build host
+----------
+Host architecture:          x86_64 (Docker Engine 29.6.1, driver "docker")
+Cross-execution of the built aarch64 binaries during `cargo test` and for the ad-hoc smoke tests
+below was performed transparently via the host kernel's registered `qemu-aarch64` binfmt_misc
+handler (flags: PF) pointing at /usr/bin/qemu-aarch64-static — no `--platform` flag was used or
+needed, per the intended cross-compiler workflow.
+
+Exact build commands
+---------------------
+  docker buildx build --output type=local,dest=dist .
+
+which, inside the builder stage, runs:
+  cargo test --locked
+  cargo build --locked --release --target aarch64-unknown-linux-musl --bin opensleep-diagnostic
+
+Unit-test results (from `cargo test --locked`, executed under the aarch64-musl release
+cross-toolchain via the host's QEMU binfmt handler)
+------------------------------------------------------------------------------------------------
+  opensleep (lib, unmodified normal-OpenSleep tests):        51 passed; 0 failed
+  opensleep (bin "opensleep", src/main.rs, no unit tests):     0 passed; 0 failed
+  opensleep-diagnostic (bin, safety/mock-transport tests):    22 passed; 0 failed
+  opensleep (doc-tests):                                       0 passed; 0 failed
+  ------------------------------------------------------------------------------
+  Total:                                                      73 passed; 0 failed; 0 ignored
+
+Artifact
+--------
+Path:            target/aarch64-unknown-linux-musl/release/opensleep-diagnostic
+Exported as:      dist/opensleep-diagnostic-aarch64-static
+Size:             1,839,464 bytes
+
+`file` output:
+  dist/opensleep-diagnostic-aarch64-static: ELF 64-bit LSB executable, ARM aarch64, version 1
+  (SYSV), statically linked, stripped
+
+`readelf -l` output (no PT_INTERP / dynamic-interpreter segment present — confirms static
+linking, not merely inferred from the target triple):
+  Elf file type is EXEC (Executable file)
+  Entry point 0x413400
+  There are 6 program headers, starting at offset 64
+
+  Program Headers:
+    Type           Offset             VirtAddr           PhysAddr
+                   FileSiz            MemSiz              Flags  Align
+    LOAD           0x0000000000000000 0x0000000000400000 0x0000000000400000
+                   0x00000000001affc8 0x00000000001affc8  R E    0x10000
+    LOAD           0x00000000001b4098 0x00000000005b4098 0x00000000005b4098
+                   0x000000000000cb78 0x000000000000e360  RW     0x10000
+    TLS            0x00000000001b4098 0x00000000005b4098 0x00000000005b4098
+                   0x0000000000000090 0x0000000000000128  R      0x8
+    GNU_EH_FRAME   0x0000000000179c78 0x0000000000579c78 0x0000000000579c78
+                   0x0000000000004ea4 0x0000000000004ea4  R      0x4
+    GNU_STACK      0x0000000000000000 0x0000000000000000 0x0000000000000000
+                   0x0000000000000000 0x0000000000000000  RW     0x10
+    GNU_RELRO      0x00000000001b4098 0x00000000005b4098 0x00000000005b4098
+                   0x000000000000bf68 0x000000000000bf68  R      0x1
+
+   Section to Segment mapping:
+    Segment Sections...
+     00     .init .text .fini .rodata .eh_frame_hdr .eh_frame .gcc_except_table
+     01     .tdata .init_array .fini_array .data.rel.ro .got .data .bss
+     02     .tdata .tbss
+     03     .eh_frame_hdr
+     04
+     05     .tdata .init_array .fini_array .data.rel.ro .got
+
+  (No "Requesting program interpreter" line and no INTERP segment type appear anywhere in the
+  above — this is what confirms static linking, per the acceptance criteria; the target triple
+  name alone is not treated as sufficient evidence.)
+
+SHA-256:
+  0900b8667033faa7b6b10423d3460a7e489f3214389bc758bf1465342ebd4c52  opensleep-diagnostic-aarch64-static
+
+`sha256sum -c` against the shipped .sha256 file: OK
+
+Runtime smoke test
+-------------------
+The exported dist/opensleep-diagnostic-aarch64-static was additionally executed directly on the
+x86_64 build host (via the same transparent QEMU binfmt path described above) as a sanity check
+independent of the build container:
+  - `--help` exits 0 and lists exactly the CLI options specified in the task (no temperature,
+    pump, priming, vibration, alarm, raw-command, or profile options are present).
+  - An unknown/invalid flag (and a probe with a hypothetical `--set-temperature`-style flag,
+    which does not exist) exits 30.
+  - Run against this build host's actual (non-Pod) /dev/i2c-1, /dev/ttyS1, /dev/ttyS2 (which
+    exist but are not accessible/are not the real subsystems) correctly logs each open/probe
+    failure with its OS error, marks the LED controller probe SKIPPED-vs-FAIL appropriately,
+    still attempts both the Frozen and Sensor UART phases despite the I2C failure, prints the
+    full text summary table, writes an equivalent JSON file when --json-output is given, and
+    exits 20 (I2C/reset initialization problem) as specified.
+  - `Arch:` in the startup log correctly reports `aarch64` (read from the running binary's own
+    target, not the host), confirming this is genuinely the cross-compiled artifact and not a
+    host-arch build being tested by mistake.
+
+Local (non-Docker) validation performed during development
+------------------------------------------------------------
+Before the Docker cross-build, the same source tree was also built and tested natively on the
+build host (x86_64, rustc/cargo 1.96.0) as a fast development loop:
+  cargo build --bin opensleep   (unmodified normal OpenSleep binary; builds and behaves
+                                  identically to before this fork — same 51 lib tests pass)
+  cargo test                    (73 tests passed: 51 lib + 22 diagnostic, 0 failed)
+  cargo clippy --bin opensleep-diagnostic --all-targets
+                                 (0 warnings in new code; 3 pre-existing warnings in unmodified
+                                  upstream files, not touched by this fork)

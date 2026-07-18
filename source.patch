@@ -1,0 +1,2244 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 5d0a522..a2176be 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -177,6 +177,46 @@ version = "0.2.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
+ 
++[[package]]
++name = "clap"
++version = "4.5.60"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2797f34da339ce31042b27d23607e051786132987f595b02ba4f6a6dffb7030a"
++dependencies = [
++ "clap_builder",
++ "clap_derive",
++]
++
++[[package]]
++name = "clap_builder"
++version = "4.5.60"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "24a241312cea5059b13574bb9b3861cabf758b879c15190b37b6d6fd63ab6876"
++dependencies = [
++ "anstream",
++ "anstyle",
++ "clap_lex",
++ "strsim",
++]
++
++[[package]]
++name = "clap_derive"
++version = "4.5.55"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a92793da1a46a5f2a02a6f4c46c6496b28c43638adea8306fcb0caa1634f24e5"
++dependencies = [
++ "heck",
++ "proc-macro2",
++ "quote",
++ "syn",
++]
++
++[[package]]
++name = "clap_lex"
++version = "1.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
++
+ [[package]]
+ name = "colorchoice"
+ version = "1.0.4"
+@@ -707,6 +747,7 @@ dependencies = [
+  "async-trait",
+  "bytes",
+  "cbor4ii",
++ "clap",
+  "csv",
+  "embedded-hal",
+  "env_logger",
+@@ -1128,6 +1169,12 @@ version = "0.2.4"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "fe895eb47f22e2ddd4dabc02bce419d2e643c8e3b585c78158b349195bc24d82"
+ 
++[[package]]
++name = "strsim"
++version = "0.11.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
++
+ [[package]]
+ name = "strum"
+ version = "0.27.2"
+diff --git a/Cargo.toml b/Cargo.toml
+index 5907317..ee89097 100755
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -5,6 +5,7 @@ edition = "2024"
+ 
+ [dependencies]
+ async-trait = "0.1.88"
++clap = { version = "4.5", features = ["derive"] }
+ ron = "0.10.1"
+ rumqttc = "0.24.0"
+ bytes = "1.10.1"
+diff --git a/src/bin/opensleep-diagnostic/cli.rs b/src/bin/opensleep-diagnostic/cli.rs
+new file mode 100644
+index 0000000..f64269f
+--- /dev/null
++++ b/src/bin/opensleep-diagnostic/cli.rs
+@@ -0,0 +1,49 @@
++use clap::Parser;
++
++/// Diagnostic-only, non-actuating hardware probe for an Eight Sleep Pod 3 Hub.
++///
++/// Tests whether the Frozen and Sensor subsystem microcontrollers answer over UART, and whether
++/// the I2C reset/enable expander answers, while treating the missing 0x53 LED controller as
++/// expected and non-fatal. This tool never transmits a command that can activate a pump, heater,
++/// cooler, vibration motor, alarm, or piezo sensor. It runs once and exits; it is not a daemon.
++#[derive(Parser, Debug, Clone)]
++#[command(name = "opensleep-diagnostic", version, about, long_about = None)]
++pub struct Args {
++    /// I2C device used to probe the reset/enable expander (0x20) and LED controller (0x53)
++    #[arg(long, default_value = "/dev/i2c-1")]
++    pub i2c_device: String,
++
++    /// Serial port for the Frozen (pump/heating/cooling) subsystem
++    #[arg(long, default_value = "/dev/ttyS1")]
++    pub frozen_port: String,
++
++    /// Serial port for the Sensor (piezo/capacitance) subsystem
++    #[arg(long, default_value = "/dev/ttyS2")]
++    pub sensor_port: String,
++
++    /// Seconds to wait for a response before treating a command as unanswered
++    #[arg(long, default_value_t = 3)]
++    pub timeout_seconds: u64,
++
++    /// Opt-in: run the known 0x20 reset-expander sequence before the UART tests.
++    /// Never writes to any register other than the fixed reset-expander sequence.
++    #[arg(long, default_value_t = false)]
++    pub reset_subsystems: bool,
++
++    /// Opt-in: allow sending JumpToFirmware if a subsystem is found in its bootloader.
++    /// Without this flag, JumpToFirmware can never be transmitted.
++    #[arg(long, default_value_t = false)]
++    pub allow_firmware_jump: bool,
++
++    /// Skip the (always read-only, always non-fatal) 0x53 LED controller probe entirely
++    #[arg(long, default_value_t = false)]
++    pub skip_led_probe: bool,
++
++    /// Write the structured result summary as JSON to this path
++    #[arg(long, value_name = "PATH")]
++    pub json_output: Option<String>,
++
++    /// Verbose logging: raw TX/RX frame hex and decoded packets
++    #[arg(long, default_value_t = false)]
++    pub verbose: bool,
++}
+diff --git a/src/bin/opensleep-diagnostic/frozen_phase.rs b/src/bin/opensleep-diagnostic/frozen_phase.rs
+new file mode 100644
+index 0000000..49fc927
+--- /dev/null
++++ b/src/bin/opensleep-diagnostic/frozen_phase.rs
+@@ -0,0 +1,344 @@
++//! Frozen subsystem diagnostic: Ping, GetHardwareInfo, optionally GetFirmware, and (only with
++//! `--allow-firmware-jump`) JumpToFirmware. Never enters `opensleep::frozen::manager::run`'s
++//! command loop, never constructs `SetTargetTemperature`, `GetTemperatures`, or `Prime`.
++
++use std::time::Duration;
++
++use opensleep::common::codec::PacketCodec;
++use opensleep::common::packet::HardwareInfo;
++use opensleep::common::serial::create_port;
++use opensleep::frozen::FrozenPacket;
++use tokio::io::{AsyncRead, AsyncWrite};
++use tokio_util::codec::Framed;
++
++use crate::io_logging::LoggingIo;
++use crate::safety::{FROZEN_WHITELIST, FrozenProbe, SafetyAudit};
++use crate::transport::{ExchangeOutcome, HasHardwareInfo, PongPacket, send_and_await};
++
++pub const BAUD: u32 = 38400;
++
++#[derive(Debug, Clone, Default)]
++pub struct FrozenPhaseResult {
++    pub port_opened: bool,
++    pub open_error: Option<String>,
++    pub ping_ok: bool,
++    pub detected_in_bootloader: Option<bool>,
++    pub hardware_info: Option<HardwareInfo>,
++    pub firmware_probed: bool,
++    pub firmware_jump_sent: bool,
++}
++
++/// Opens the real Frozen UART (8N1, no flow control, 38400 baud, matching stock OpenSleep) and
++/// runs the diagnostic sequence against it.
++pub async fn run_frozen_phase(
++    port: &str,
++    timeout: Duration,
++    allow_firmware_jump: bool,
++) -> (FrozenPhaseResult, SafetyAudit) {
++    let mut audit = SafetyAudit::new(FROZEN_WHITELIST);
++
++    let raw = match create_port(port, BAUD) {
++        Ok(p) => p,
++        Err(e) => {
++            log::error!("failed to open Frozen port {port}: {e}");
++            return (
++                FrozenPhaseResult {
++                    open_error: Some(e.to_string()),
++                    ..Default::default()
++                },
++                audit,
++            );
++        }
++    };
++    log::info!("Frozen UART opened: {port} @ {BAUD} baud, 8N1, no flow control");
++
++    let mut framed = Framed::new(
++        LoggingIo::new(raw, "Frozen"),
++        PacketCodec::<FrozenPacket>::new(),
++    );
++    let result = run_frozen_phase_on(&mut framed, timeout, allow_firmware_jump, &mut audit).await;
++    (result, audit)
++}
++
++/// Core diagnostic sequence, generic over the transport so it can run against a real serial
++/// port or an in-memory mock in tests.
++pub async fn run_frozen_phase_on<T>(
++    framed: &mut Framed<T, PacketCodec<FrozenPacket>>,
++    timeout: Duration,
++    allow_firmware_jump: bool,
++    audit: &mut SafetyAudit,
++) -> FrozenPhaseResult
++where
++    T: AsyncRead + AsyncWrite + Unpin,
++{
++    let mut result = FrozenPhaseResult {
++        port_opened: true,
++        ..Default::default()
++    };
++
++    match send_and_await(framed, audit, FrozenProbe::Ping.command(), timeout).await {
++        Ok(ExchangeOutcome::Received(pkt)) => match pkt.as_pong() {
++            Some(in_firmware) => {
++                result.ping_ok = true;
++                result.detected_in_bootloader = Some(!in_firmware);
++            }
++            None => log::warn!("Frozen Ping got unexpected packet: {pkt:?}"),
++        },
++        Ok(_) => log::warn!("Frozen did not respond to Ping within {timeout:?}"),
++        Err(e) => log::error!("Frozen Ping failed: {e}"),
++    }
++
++    if result.ping_ok {
++        match send_and_await(framed, audit, FrozenProbe::GetHardwareInfo.command(), timeout).await
++        {
++            Ok(ExchangeOutcome::Received(pkt)) => match pkt.as_hardware_info() {
++                Some(hw) => result.hardware_info = Some(hw.clone()),
++                None => log::warn!("Frozen GetHardwareInfo got unexpected packet: {pkt:?}"),
++            },
++            Ok(_) => log::warn!("Frozen did not respond to GetHardwareInfo within {timeout:?}"),
++            Err(e) => log::error!("Frozen GetHardwareInfo failed: {e}"),
++        }
++
++        // Optional and passive: reports firmware image identity, does not alter device state.
++        match send_and_await(framed, audit, FrozenProbe::GetFirmware.command(), timeout).await {
++            Ok(ExchangeOutcome::Received(pkt)) => {
++                result.firmware_probed = true;
++                log::info!("Frozen GetFirmware: {pkt:?}");
++            }
++            Ok(_) => log::debug!("Frozen did not respond to GetFirmware within {timeout:?}"),
++            Err(e) => log::debug!("Frozen GetFirmware failed: {e}"),
++        }
++    }
++
++    if result.detected_in_bootloader == Some(true) {
++        if allow_firmware_jump {
++            log::warn!(
++                "Frozen appears to be in its bootloader; --allow-firmware-jump supplied, sending JumpToFirmware"
++            );
++            match send_and_await(framed, audit, FrozenProbe::JumpToFirmware.command(), timeout)
++                .await
++            {
++                Ok(ExchangeOutcome::Received(pkt)) => {
++                    result.firmware_jump_sent = true;
++                    log::info!("Frozen JumpToFirmware response: {pkt:?}");
++                }
++                Ok(_) => {
++                    result.firmware_jump_sent = true;
++                    log::warn!("Frozen did not respond to JumpToFirmware within {timeout:?}");
++                }
++                Err(e) => log::error!("Frozen JumpToFirmware failed: {e}"),
++            }
++        } else {
++            log::info!(
++                "Frozen appears to be in its bootloader; not sending JumpToFirmware (pass --allow-firmware-jump to opt in)"
++            );
++        }
++    }
++
++    result
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use bytes::{Buf, BytesMut};
++    use std::time::Duration;
++    use tokio::io::DuplexStream;
++
++    fn hw_info_frame() -> Vec<u8> {
++        // Reuses the exact CBOR fixture already verified by
++        // `opensleep::common::packet::tests::test_hardware_info`. Byte 0x82 doubles as both the
++        // Frozen/HardwareInfo opcode and the CBOR "2-element array" header the codec expects.
++        use hex_literal::hex;
++        let payload = hex!(
++            "82 00 A6 63 73 6B 75 01 68 64 61 74 65
++            63 6F 64 65 1A 00 16 01 0D 6B 66 61 63
++            74 6F 72 79 6C 69 6E 65 01 65 68 77 72
++            65 76 19 05 00 62 70 6E 19 50 78 68 64
++            65 76 69 63 65 73 6E 1A 00 01 08 9C"
++        );
++        opensleep::common::codec::command(payload.to_vec())
++    }
++
++    fn pong_frame(in_firmware: bool) -> Vec<u8> {
++        let code: u8 = if in_firmware { 0b0100_0110 } else { 0b0100_0010 };
++        opensleep::common::codec::command(vec![0x81, 0x00, code])
++    }
++
++    /// Spawns a fake Frozen device on the far end of a duplex pair: decodes each incoming
++    /// command frame with the real wire framing (start byte, length, checksum-validated) and
++    /// replies according to `script` (opcode -> raw response frame). Proves the diagnostic and
++    /// its mock speak the exact same on-wire protocol. Accumulates across reads so a frame split
++    /// over multiple `poll_write` calls is still parsed correctly.
++    fn spawn_fake_frozen(
++        mut device_side: DuplexStream,
++        script: Vec<(u8, Vec<u8>)>,
++    ) -> tokio::task::JoinHandle<Vec<u8>> {
++        tokio::spawn(async move {
++            use tokio::io::{AsyncReadExt, AsyncWriteExt};
++            let mut seen_opcodes = Vec::new();
++            let mut acc = BytesMut::new();
++            let mut read_buf = [0u8; 256];
++
++            'script: for (want_opcode, response) in script {
++                loop {
++                    if acc.len() >= 2 {
++                        let len = acc[1] as usize;
++                        let total = 1 + 1 + len + 2;
++                        if acc.len() >= total {
++                            let opcode = acc[2];
++                            seen_opcodes.push(opcode);
++                            acc.advance(total);
++                            if opcode == want_opcode {
++                                let _ = device_side.write_all(&response).await;
++                                continue 'script;
++                            }
++                            continue;
++                        }
++                    }
++                    let n = match device_side.read(&mut read_buf).await {
++                        Ok(0) | Err(_) => break 'script,
++                        Ok(n) => n,
++                    };
++                    acc.extend_from_slice(&read_buf[..n]);
++                }
++            }
++            seen_opcodes
++        })
++    }
++
++    #[tokio::test]
++    async fn ping_and_hardware_info_succeed_and_only_whitelisted_opcodes_are_sent() {
++        let (client, device) = tokio::io::duplex(4096);
++        let device_task = spawn_fake_frozen(
++            device,
++            vec![
++                (0x01, pong_frame(true)),
++                (0x02, hw_info_frame()),
++                (0x04, opensleep::common::codec::command(vec![0x84])),
++            ],
++        );
++
++        let mut framed = Framed::new(
++            LoggingIo::new(client, "test"),
++            PacketCodec::<FrozenPacket>::new(),
++        );
++        let mut audit = SafetyAudit::new(FROZEN_WHITELIST);
++        let result =
++            run_frozen_phase_on(&mut framed, Duration::from_secs(1), false, &mut audit).await;
++
++        assert!(result.ping_ok);
++        assert_eq!(result.detected_in_bootloader, Some(false));
++        assert!(result.hardware_info.is_some());
++        assert!(result.firmware_probed);
++        assert!(!result.firmware_jump_sent);
++
++        drop(framed);
++        let seen = device_task.await.unwrap();
++        assert_eq!(seen, vec![0x01, 0x02, 0x04]);
++        assert_eq!(audit.sent_count(), 3);
++        for frame in audit.sent_frames() {
++            assert!(FROZEN_WHITELIST.contains(&frame[2]));
++        }
++    }
++
++    #[tokio::test]
++    async fn jump_to_firmware_is_never_sent_without_opt_in() {
++        let (client, device) = tokio::io::duplex(4096);
++        // bootloader pong, then hwinfo, then firmware probe -- device never expects opcode 0x10
++        let device_task = spawn_fake_frozen(
++            device,
++            vec![
++                (0x01, pong_frame(false)),
++                (0x02, hw_info_frame()),
++                (0x04, opensleep::common::codec::command(vec![0x84])),
++            ],
++        );
++
++        let mut framed = Framed::new(
++            LoggingIo::new(client, "test"),
++            PacketCodec::<FrozenPacket>::new(),
++        );
++        let mut audit = SafetyAudit::new(FROZEN_WHITELIST);
++        // allow_firmware_jump = false, even though Frozen is in its bootloader
++        let result =
++            run_frozen_phase_on(&mut framed, Duration::from_secs(1), false, &mut audit).await;
++
++        assert_eq!(result.detected_in_bootloader, Some(true));
++        assert!(!result.firmware_jump_sent);
++        assert!(
++            !audit
++                .sent_frames()
++                .iter()
++                .any(|f| f.get(2) == Some(&0x10))
++        );
++
++        drop(framed);
++        let seen = device_task.await.unwrap();
++        assert!(!seen.contains(&0x10));
++    }
++
++    #[tokio::test]
++    async fn jump_to_firmware_is_sent_when_explicitly_allowed_and_bootloader_detected() {
++        let (client, device) = tokio::io::duplex(4096);
++        let device_task = spawn_fake_frozen(
++            device,
++            vec![
++                (0x01, pong_frame(false)),
++                (0x02, hw_info_frame()),
++                (0x04, opensleep::common::codec::command(vec![0x84])),
++                (
++                    0x10,
++                    opensleep::common::codec::command(vec![0x90, 0x00]),
++                ),
++            ],
++        );
++
++        let mut framed = Framed::new(
++            LoggingIo::new(client, "test"),
++            PacketCodec::<FrozenPacket>::new(),
++        );
++        let mut audit = SafetyAudit::new(FROZEN_WHITELIST);
++        let result =
++            run_frozen_phase_on(&mut framed, Duration::from_secs(1), true, &mut audit).await;
++
++        assert!(result.firmware_jump_sent);
++
++        drop(framed);
++        let seen = device_task.await.unwrap();
++        assert_eq!(seen, vec![0x01, 0x02, 0x04, 0x10]);
++    }
++
++    #[tokio::test]
++    async fn no_response_does_not_panic_and_is_reported_as_failed() {
++        // nothing on the far end at all -- times out
++        let (client, _device) = tokio::io::duplex(4096);
++        let mut framed = Framed::new(
++            LoggingIo::new(client, "test"),
++            PacketCodec::<FrozenPacket>::new(),
++        );
++        let mut audit = SafetyAudit::new(FROZEN_WHITELIST);
++        let result =
++            run_frozen_phase_on(&mut framed, Duration::from_millis(100), false, &mut audit).await;
++
++        assert!(!result.ping_ok);
++        assert!(result.hardware_info.is_none());
++        assert_eq!(audit.sent_count(), 1); // only the Ping was ever attempted
++    }
++
++    /// Direct proof that this phase's command surface, run through the very same `SafetyAudit`
++    /// gate used on the wire, can never contain a disallowed opcode -- independent of whatever
++    /// the fake device does or doesn't send back.
++    #[test]
++    fn every_command_this_phase_can_construct_passes_the_audit() {
++        let mut audit = SafetyAudit::new(FROZEN_WHITELIST);
++        for probe in [
++            FrozenProbe::Ping,
++            FrozenProbe::GetHardwareInfo,
++            FrozenProbe::GetFirmware,
++            FrozenProbe::JumpToFirmware,
++        ] {
++            audit.check(&probe.command()).unwrap();
++        }
++    }
++}
+diff --git a/src/bin/opensleep-diagnostic/i2c_phase.rs b/src/bin/opensleep-diagnostic/i2c_phase.rs
+new file mode 100644
+index 0000000..f8a7044
+--- /dev/null
++++ b/src/bin/opensleep-diagnostic/i2c_phase.rs
+@@ -0,0 +1,125 @@
++//! Read-only I2C address probes, and the optional reset-expander write sequence.
++//!
++//! This module never writes to 0x53 (the LED controller) and never performs any I2C write other
++//! than the four fixed reset-expander register writes below, gated behind `--reset-subsystems`.
++
++use embedded_hal::i2c::I2c;
++use linux_embedded_hal::I2cdev;
++use linux_embedded_hal::i2cdev::linux::LinuxI2CError;
++use std::time::Duration;
++use tokio::time::sleep;
++
++pub const RESET_EXPANDER_ADDR: u8 = 0x20;
++pub const LED_CONTROLLER_ADDR: u8 = 0x53;
++
++#[derive(Debug, Clone)]
++pub struct ProbeResult {
++    pub address: u8,
++    pub success: bool,
++    pub value: Option<u8>,
++    pub os_error: Option<i32>,
++}
++
++impl ProbeResult {
++    pub fn describe(&self) -> String {
++        if self.success {
++            format!(
++                "0x{:02X} probe: success (byte = 0x{:02X})",
++                self.address,
++                self.value.unwrap_or(0)
++            )
++        } else {
++            let errno_desc = self
++                .os_error
++                .map(|e| std::io::Error::from_raw_os_error(e).to_string())
++                .unwrap_or_else(|| "unknown error".to_string());
++            format!(
++                "0x{:02X} probe: failed (errno {:?}: {errno_desc})",
++                self.address, self.os_error
++            )
++        }
++    }
++}
++
++/// Read-only one-byte probe: `I2c::read` performs an I2C read transaction and nothing else.
++pub fn probe_address(dev: &mut I2cdev, addr: u8) -> ProbeResult {
++    let mut buf = [0u8; 1];
++    match dev.read(addr, &mut buf) {
++        Ok(()) => ProbeResult {
++            address: addr,
++            success: true,
++            value: Some(buf[0]),
++            os_error: None,
++        },
++        Err(e) => ProbeResult {
++            address: addr,
++            success: false,
++            value: None,
++            os_error: extract_errno(&e),
++        },
++    }
++}
++
++fn extract_errno(e: &linux_embedded_hal::I2CError) -> Option<i32> {
++    match e.inner() {
++        LinuxI2CError::Errno(errno) => Some(*errno),
++        LinuxI2CError::Io(io_err) => io_err.raw_os_error(),
++    }
++}
++
++#[derive(Debug, Clone)]
++#[allow(dead_code)] // register/value/os_error are logged individually in `write_reg`; kept here for callers/tests that want per-step detail
++pub struct ResetStepResult {
++    pub register: u8,
++    pub value: u8,
++    pub success: bool,
++    pub os_error: Option<i32>,
++}
++
++/// Mirrors `opensleep::reset::ResetController::reset_subsystems`'s exact register/value/timing
++/// sequence for the PCAL6416A reset/enable expander at 0x20, except that every write is logged
++/// individually and a failure does not abort the remaining steps (so the diagnostic can still
++/// attempt UART tests afterward). No other registers are touched.
++pub async fn run_reset_sequence(dev: &mut I2cdev) -> Vec<ResetStepResult> {
++    const REG_CONFIG_PORT_0: u8 = 0x06;
++    const REG_CONFIG_PORT_1: u8 = 0x07;
++    const REG_OUTPUT_PORT_0: u8 = 0x02;
++    const PORT_0_CONFIG: u8 = 0b1111_1100;
++    const PORT_1_CONFIG: u8 = 0b0011_0001;
++    const OUTPUT_RESET: u8 = 0b1111_1111;
++    const OUTPUT_ENABLED: u8 = 0b1111_1101;
++
++    let mut results = Vec::with_capacity(4);
++
++    results.push(write_reg(dev, REG_CONFIG_PORT_0, PORT_0_CONFIG));
++    results.push(write_reg(dev, REG_CONFIG_PORT_1, PORT_1_CONFIG));
++    sleep(Duration::from_millis(10)).await;
++
++    results.push(write_reg(dev, REG_OUTPUT_PORT_0, OUTPUT_RESET));
++    sleep(Duration::from_millis(100)).await;
++
++    results.push(write_reg(dev, REG_OUTPUT_PORT_0, OUTPUT_ENABLED));
++    sleep(Duration::from_millis(100)).await;
++
++    results
++}
++
++fn write_reg(dev: &mut I2cdev, reg: u8, value: u8) -> ResetStepResult {
++    let result = dev.write(RESET_EXPANDER_ADDR, &[reg, value]);
++    let success = result.is_ok();
++    let os_error = result.err().as_ref().and_then(extract_errno);
++    log::info!(
++        "reset-expander write: reg=0x{reg:02X} value=0x{value:02X} -> {}",
++        if success {
++            "success".to_string()
++        } else {
++            format!("failed (errno {os_error:?})")
++        }
++    );
++    ResetStepResult {
++        register: reg,
++        value,
++        success,
++        os_error,
++    }
++}
+diff --git a/src/bin/opensleep-diagnostic/io_logging.rs b/src/bin/opensleep-diagnostic/io_logging.rs
+new file mode 100644
+index 0000000..00f7d23
+--- /dev/null
++++ b/src/bin/opensleep-diagnostic/io_logging.rs
+@@ -0,0 +1,61 @@
++//! Transparent `AsyncRead + AsyncWrite` wrapper that logs every raw byte chunk that crosses it,
++//! so raw TX/RX frames can be logged in hex without touching the shared `PacketCodec` (which is
++//! also used, unmodified, by normal OpenSleep).
++
++use std::io;
++use std::pin::Pin;
++use std::task::{Context, Poll};
++use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
++
++pub struct LoggingIo<T> {
++    inner: T,
++    label: &'static str,
++}
++
++impl<T> LoggingIo<T> {
++    pub fn new(inner: T, label: &'static str) -> Self {
++        Self { inner, label }
++    }
++}
++
++impl<T: AsyncRead + Unpin> AsyncRead for LoggingIo<T> {
++    fn poll_read(
++        self: Pin<&mut Self>,
++        cx: &mut Context<'_>,
++        buf: &mut ReadBuf<'_>,
++    ) -> Poll<io::Result<()>> {
++        let before = buf.filled().len();
++        let this = self.get_mut();
++        let poll = Pin::new(&mut this.inner).poll_read(cx, buf);
++        if let Poll::Ready(Ok(())) = &poll {
++            let data = &buf.filled()[before..];
++            if !data.is_empty() {
++                log::debug!("{} RX raw ({} bytes): {:02X?}", this.label, data.len(), data);
++            }
++        }
++        poll
++    }
++}
++
++impl<T: AsyncWrite + Unpin> AsyncWrite for LoggingIo<T> {
++    fn poll_write(
++        self: Pin<&mut Self>,
++        cx: &mut Context<'_>,
++        buf: &[u8],
++    ) -> Poll<io::Result<usize>> {
++        let this = self.get_mut();
++        let poll = Pin::new(&mut this.inner).poll_write(cx, buf);
++        if let Poll::Ready(Ok(n)) = &poll {
++            log::debug!("{} TX raw ({} bytes): {:02X?}", this.label, n, &buf[..*n]);
++        }
++        poll
++    }
++
++    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
++    }
++
++    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
++    }
++}
+diff --git a/src/bin/opensleep-diagnostic/main.rs b/src/bin/opensleep-diagnostic/main.rs
+new file mode 100644
+index 0000000..873b70d
+--- /dev/null
++++ b/src/bin/opensleep-diagnostic/main.rs
+@@ -0,0 +1,234 @@
++//! opensleep-diagnostic: a short-running, non-actuating hardware probe for an Eight Sleep Pod 3
++//! Hub. See SAFETY.md in the repository root for the full list of commands this binary can ever
++//! transmit. This is a diagnostic tool, not a daemon: it runs one pass and exits.
++
++mod cli;
++mod frozen_phase;
++mod i2c_phase;
++mod io_logging;
++mod report;
++mod safety;
++mod sensor_phase;
++mod transport;
++
++use clap::Parser;
++use cli::Args;
++use linux_embedded_hal::I2cdev;
++use report::{CheckState, Summary};
++use std::time::Duration;
++
++const DIAGNOSTIC_VERSION: &str = env!("CARGO_PKG_VERSION");
++
++struct I2cPhaseOutcome {
++    bus_open: CheckState,
++    bus_open_error: Option<String>,
++    reset_expander_probe: CheckState,
++    reset_expander_value: Option<u8>,
++    led_controller_probe: CheckState,
++    subsystem_reset_completed: CheckState,
++}
++
++#[tokio::main]
++async fn main() -> std::process::ExitCode {
++    let args = match Args::try_parse() {
++        Ok(a) => a,
++        Err(e) => {
++            let _ = e.print();
++            let code = if e.exit_code() == 0 { 0 } else { 30 };
++            return std::process::ExitCode::from(code as u8);
++        }
++    };
++
++    init_logging(args.verbose);
++    log_startup_banner(&args);
++
++    let timeout = Duration::from_secs(args.timeout_seconds.max(1));
++
++    let i2c = run_i2c_phase(&args).await;
++
++    let (frozen_result, frozen_audit) =
++        frozen_phase::run_frozen_phase(&args.frozen_port, timeout, args.allow_firmware_jump).await;
++    let frozen_uart_opened = CheckState::from_bool(frozen_result.port_opened);
++    let frozen_ping = CheckState::from_bool(frozen_result.ping_ok);
++
++    let (sensor_result, sensor_audit) =
++        sensor_phase::run_sensor_phase(&args.sensor_port, timeout, args.allow_firmware_jump).await;
++    let sensor_uart_opened = CheckState::from_bool(
++        sensor_result.firmware_port_opened || sensor_result.bootloader_port_opened,
++    );
++    let sensor_ping = CheckState::from_bool(sensor_result.ping_ok);
++
++    log::debug!(
++        "Frozen frames attempted: {}, Sensor frames attempted: {}",
++        frozen_audit.sent_count(),
++        sensor_audit.sent_count()
++    );
++    for frame in frozen_audit.sent_frames() {
++        log::debug!("Frozen audit: transmitted frame {frame:02X?}");
++    }
++    for frame in sensor_audit.sent_frames() {
++        log::debug!("Sensor audit: transmitted frame {frame:02X?}");
++    }
++
++    let exit_code = report::compute_exit_code(
++        i2c.bus_open,
++        i2c.reset_expander_probe,
++        i2c.subsystem_reset_completed,
++        frozen_ping,
++        sensor_ping,
++    );
++
++    let sensor_hardware_info = sensor_result
++        .hardware_info
++        .or(sensor_result.post_jump_hardware_info);
++
++    let summary = Summary {
++        program_version: DIAGNOSTIC_VERSION.to_string(),
++        opensleep_base_version: opensleep::VERSION.to_string(),
++        opensleep_source_commit: source_commit().to_string(),
++        kernel: Some(kernel_release()),
++        arch: std::env::consts::ARCH.to_string(),
++        i2c_device: args.i2c_device.clone(),
++        frozen_port: args.frozen_port.clone(),
++        sensor_port: args.sensor_port.clone(),
++        timeout_seconds: args.timeout_seconds,
++        reset_enabled: args.reset_subsystems,
++        firmware_jump_enabled: args.allow_firmware_jump,
++        actuator_commands_disabled: true,
++
++        i2c_bus_open: i2c.bus_open,
++        i2c_bus_open_error: i2c.bus_open_error,
++        reset_expander_probe: i2c.reset_expander_probe,
++        reset_expander_value: i2c.reset_expander_value,
++        led_controller_probe: i2c.led_controller_probe,
++        subsystem_reset_requested: args.reset_subsystems,
++        subsystem_reset_completed: i2c.subsystem_reset_completed,
++
++        frozen_uart_opened,
++        frozen_open_error: frozen_result.open_error,
++        frozen_ping,
++        frozen_hardware_info: frozen_result.hardware_info,
++        frozen_detected_in_bootloader: frozen_result.detected_in_bootloader,
++        frozen_firmware_jump_sent: frozen_result.firmware_jump_sent,
++
++        sensor_uart_opened,
++        sensor_detected_mode: report::detected_mode_str(sensor_result.detected_mode),
++        sensor_ping,
++        sensor_hardware_info,
++        sensor_firmware_jump_sent: sensor_result.firmware_jump_sent,
++        sensor_post_jump_ping: if sensor_result.firmware_jump_sent {
++            Some(CheckState::from_bool(sensor_result.post_jump_ping_ok))
++        } else {
++            None
++        },
++
++        // Structurally guaranteed by `safety::SafetyAudit` + the closed `FrozenProbe`/
++        // `SensorProbe` enums: no opcode outside the whitelist can ever be transmitted, and the
++        // whitelist contains no actuator command. See safety.rs and SAFETY.md.
++        actuator_commands_sent: 0,
++        exit_code,
++    };
++
++    summary.print_table();
++
++    if let Some(path) = &args.json_output {
++        match summary.write_json(path) {
++            Ok(()) => log::info!("JSON summary written to {path}"),
++            Err(e) => log::error!("failed to write JSON output to {path}: {e}"),
++        }
++    }
++
++    std::process::ExitCode::from(exit_code as u8)
++}
++
++async fn run_i2c_phase(args: &Args) -> I2cPhaseOutcome {
++    let mut dev = match I2cdev::new(&args.i2c_device) {
++        Ok(d) => d,
++        Err(e) => {
++            log::error!("failed to open I2C device {}: {e}", args.i2c_device);
++            return I2cPhaseOutcome {
++                bus_open: CheckState::Fail,
++                bus_open_error: Some(e.to_string()),
++                reset_expander_probe: CheckState::Fail,
++                reset_expander_value: None,
++                led_controller_probe: CheckState::Skipped,
++                subsystem_reset_completed: CheckState::Skipped,
++            };
++        }
++    };
++    log::info!("I2C bus opened: {}", args.i2c_device);
++
++    let expander = i2c_phase::probe_address(&mut dev, i2c_phase::RESET_EXPANDER_ADDR);
++    log::info!("{}", expander.describe());
++
++    let led_controller_probe = if args.skip_led_probe {
++        log::info!("LED controller 0x53 probe skipped (--skip-led-probe)");
++        CheckState::Skipped
++    } else {
++        let led = i2c_phase::probe_address(&mut dev, i2c_phase::LED_CONTROLLER_ADDR);
++        if led.success {
++            log::info!("{}", led.describe());
++        } else {
++            log::info!(
++                "LED controller unavailable; continuing diagnostic ({})",
++                led.describe()
++            );
++        }
++        CheckState::from_bool(led.success)
++    };
++
++    let subsystem_reset_completed = if args.reset_subsystems {
++        let steps = i2c_phase::run_reset_sequence(&mut dev).await;
++        CheckState::from_bool(steps.iter().all(|s| s.success))
++    } else {
++        log::info!("Subsystem reset not requested (pass --reset-subsystems to opt in)");
++        CheckState::Skipped
++    };
++
++    I2cPhaseOutcome {
++        bus_open: CheckState::Pass,
++        bus_open_error: None,
++        reset_expander_probe: CheckState::from_bool(expander.success),
++        reset_expander_value: expander.value,
++        led_controller_probe,
++        subsystem_reset_completed,
++    }
++}
++
++fn source_commit() -> &'static str {
++    option_env!("OPENSLEEP_SOURCE_COMMIT")
++        .unwrap_or("unknown (set OPENSLEEP_SOURCE_COMMIT at build time)")
++}
++
++fn kernel_release() -> String {
++    std::fs::read_to_string("/proc/sys/kernel/osrelease")
++        .map(|s| s.trim().to_string())
++        .unwrap_or_else(|_| "unknown".to_string())
++}
++
++fn init_logging(verbose: bool) {
++    let default_level = if verbose { "debug" } else { "info" };
++    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level))
++        .init();
++}
++
++fn log_startup_banner(args: &Args) {
++    log::info!(
++        "opensleep-diagnostic v{DIAGNOSTIC_VERSION} (opensleep base {})",
++        opensleep::VERSION
++    );
++    log::info!("OpenSleep source commit: {}", source_commit());
++    log::info!("Kernel: {}", kernel_release());
++    log::info!("Arch: {}", std::env::consts::ARCH);
++    log::info!("I2C device: {}", args.i2c_device);
++    log::info!("Frozen port: {}", args.frozen_port);
++    log::info!("Sensor port: {}", args.sensor_port);
++    log::info!("Timeout: {}s", args.timeout_seconds);
++    log::info!("Subsystem reset enabled: {}", args.reset_subsystems);
++    log::info!("Firmware jump enabled: {}", args.allow_firmware_jump);
++    log::warn!("================================================================");
++    log::warn!(" ACTUATOR COMMANDS ARE STRUCTURALLY DISABLED IN THIS BINARY.");
++    log::warn!(" No pump, heater/cooler, vibration, alarm, or piezo command can");
++    log::warn!(" be transmitted by this diagnostic tool. See SAFETY.md.");
++    log::warn!("================================================================");
++}
+diff --git a/src/bin/opensleep-diagnostic/report.rs b/src/bin/opensleep-diagnostic/report.rs
+new file mode 100644
+index 0000000..06e476e
+--- /dev/null
++++ b/src/bin/opensleep-diagnostic/report.rs
+@@ -0,0 +1,274 @@
++use opensleep::common::packet::HardwareInfo;
++use serde::Serialize;
++
++use crate::sensor_phase::DetectedMode;
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
++#[serde(rename_all = "UPPERCASE")]
++pub enum CheckState {
++    Pass,
++    Fail,
++    Skipped,
++}
++
++impl std::fmt::Display for CheckState {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        let s = match self {
++            CheckState::Pass => "PASS",
++            CheckState::Fail => "FAIL",
++            CheckState::Skipped => "SKIPPED",
++        };
++        write!(f, "{s}")
++    }
++}
++
++impl CheckState {
++    pub fn from_bool(ok: bool) -> Self {
++        if ok { CheckState::Pass } else { CheckState::Fail }
++    }
++}
++
++#[derive(Debug, Clone, Serialize)]
++pub struct Summary {
++    // Phase 1
++    pub program_version: String,
++    pub opensleep_base_version: String,
++    pub opensleep_source_commit: String,
++    pub kernel: Option<String>,
++    pub arch: String,
++    pub i2c_device: String,
++    pub frozen_port: String,
++    pub sensor_port: String,
++    pub timeout_seconds: u64,
++    pub reset_enabled: bool,
++    pub firmware_jump_enabled: bool,
++    pub actuator_commands_disabled: bool,
++
++    // Phase 2 / 3
++    pub i2c_bus_open: CheckState,
++    pub i2c_bus_open_error: Option<String>,
++    pub reset_expander_probe: CheckState,
++    pub reset_expander_value: Option<u8>,
++    pub led_controller_probe: CheckState,
++    pub subsystem_reset_requested: bool,
++    pub subsystem_reset_completed: CheckState,
++
++    // Phase 4
++    pub frozen_uart_opened: CheckState,
++    pub frozen_open_error: Option<String>,
++    pub frozen_ping: CheckState,
++    pub frozen_hardware_info: Option<HardwareInfo>,
++    pub frozen_detected_in_bootloader: Option<bool>,
++    pub frozen_firmware_jump_sent: bool,
++
++    // Phase 5
++    pub sensor_uart_opened: CheckState,
++    pub sensor_detected_mode: String,
++    pub sensor_ping: CheckState,
++    pub sensor_hardware_info: Option<HardwareInfo>,
++    pub sensor_firmware_jump_sent: bool,
++    pub sensor_post_jump_ping: Option<CheckState>,
++
++    // Phase 6
++    pub actuator_commands_sent: usize,
++    pub exit_code: i32,
++}
++
++/// Exit-code precedence, decided once all phases have run:
++///
++/// 1. An I2C/reset problem (the bus itself failed to open, the 0x20 reset-expander did not
++///    answer, or a requested reset write failed) always yields 20, regardless of how the UART
++///    tests went -- the UART results are still collected and logged, just not reflected in the
++///    exit code, since a broken I2C path calls the whole probe into question.
++/// 2. Otherwise the exit code reflects only whether Frozen and/or Sensor responded to Ping.
++///
++/// The missing 0x53 LED controller is deliberately excluded from "I2C problem": it is the
++/// expected, documented state of this hardware revision.
++pub fn compute_exit_code(
++    i2c_bus_open: CheckState,
++    reset_expander_probe: CheckState,
++    subsystem_reset_completed: CheckState,
++    frozen_ping: CheckState,
++    sensor_ping: CheckState,
++) -> i32 {
++    let i2c_problem = i2c_bus_open == CheckState::Fail
++        || reset_expander_probe == CheckState::Fail
++        || subsystem_reset_completed == CheckState::Fail;
++
++    if i2c_problem {
++        return 20;
++    }
++
++    match (frozen_ping == CheckState::Pass, sensor_ping == CheckState::Pass) {
++        (true, true) => 0,
++        (false, true) => 10,
++        (true, false) => 11,
++        (false, false) => 12,
++    }
++}
++
++impl Summary {
++    pub fn print_table(&self) {
++        println!("=== opensleep-diagnostic result summary ===");
++        println!(
++            "I2C bus open:                 {}{}",
++            self.i2c_bus_open,
++            self.i2c_bus_open_error
++                .as_ref()
++                .map(|e| format!(" ({e})"))
++                .unwrap_or_default()
++        );
++        println!(
++            "Reset expander 0x20 probe:    {}",
++            self.reset_expander_probe
++        );
++        println!("LED controller 0x53 probe:    {}", self.led_controller_probe);
++        println!(
++            "Subsystem reset requested:    {}",
++            if self.subsystem_reset_requested { "YES" } else { "NO" }
++        );
++        println!(
++            "Subsystem reset completed:    {}",
++            self.subsystem_reset_completed
++        );
++        println!("Frozen UART opened:           {}", self.frozen_uart_opened);
++        println!("Frozen Ping response:         {}", self.frozen_ping);
++        println!(
++            "Frozen hardware info:         {}",
++            self.frozen_hardware_info
++                .as_ref()
++                .map(|h| h.to_string())
++                .unwrap_or_else(|| "unavailable".to_string())
++        );
++        println!("Sensor UART opened:           {}", self.sensor_uart_opened);
++        println!("Sensor detected mode:         {}", self.sensor_detected_mode);
++        println!("Sensor Ping response:         {}", self.sensor_ping);
++        println!(
++            "Sensor hardware info:         {}",
++            self.sensor_hardware_info
++                .as_ref()
++                .map(|h| h.to_string())
++                .unwrap_or_else(|| "unavailable".to_string())
++        );
++        println!(
++            "Actuator commands sent:       {}",
++            self.actuator_commands_sent
++        );
++        println!("Exit code:                     {}", self.exit_code);
++    }
++
++    pub fn write_json(&self, path: &str) -> std::io::Result<()> {
++        let file = std::fs::File::create(path)?;
++        serde_json::to_writer_pretty(file, self)?;
++        Ok(())
++    }
++}
++
++pub fn detected_mode_str(mode: DetectedMode) -> String {
++    mode.to_string()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn both_respond_is_zero() {
++        assert_eq!(
++            compute_exit_code(
++                CheckState::Pass,
++                CheckState::Pass,
++                CheckState::Skipped,
++                CheckState::Pass,
++                CheckState::Pass
++            ),
++            0
++        );
++    }
++
++    #[test]
++    fn frozen_fails_sensor_ok_is_ten() {
++        assert_eq!(
++            compute_exit_code(
++                CheckState::Pass,
++                CheckState::Pass,
++                CheckState::Skipped,
++                CheckState::Fail,
++                CheckState::Pass
++            ),
++            10
++        );
++    }
++
++    #[test]
++    fn sensor_fails_frozen_ok_is_eleven() {
++        assert_eq!(
++            compute_exit_code(
++                CheckState::Pass,
++                CheckState::Pass,
++                CheckState::Skipped,
++                CheckState::Pass,
++                CheckState::Fail
++            ),
++            11
++        );
++    }
++
++    #[test]
++    fn neither_responds_is_twelve() {
++        assert_eq!(
++            compute_exit_code(
++                CheckState::Pass,
++                CheckState::Pass,
++                CheckState::Skipped,
++                CheckState::Fail,
++                CheckState::Fail
++            ),
++            12
++        );
++    }
++
++    #[test]
++    fn i2c_bus_failure_takes_precedence_over_uart_results() {
++        assert_eq!(
++            compute_exit_code(
++                CheckState::Fail,
++                CheckState::Fail,
++                CheckState::Skipped,
++                CheckState::Pass,
++                CheckState::Pass
++            ),
++            20
++        );
++    }
++
++    #[test]
++    fn led_probe_failure_alone_does_not_trigger_i2c_problem_exit_code() {
++        // led_controller_probe is intentionally NOT one of compute_exit_code's inputs: a missing
++        // 0x53 must never change the exit code.
++        assert_eq!(
++            compute_exit_code(
++                CheckState::Pass,
++                CheckState::Pass,
++                CheckState::Skipped,
++                CheckState::Pass,
++                CheckState::Pass
++            ),
++            0
++        );
++    }
++
++    #[test]
++    fn failed_reset_write_yields_twenty_even_if_uart_passes() {
++        assert_eq!(
++            compute_exit_code(
++                CheckState::Pass,
++                CheckState::Pass,
++                CheckState::Fail,
++                CheckState::Pass,
++                CheckState::Pass
++            ),
++            20
++        );
++    }
++}
+diff --git a/src/bin/opensleep-diagnostic/safety.rs b/src/bin/opensleep-diagnostic/safety.rs
+new file mode 100644
+index 0000000..aa22593
+--- /dev/null
++++ b/src/bin/opensleep-diagnostic/safety.rs
+@@ -0,0 +1,226 @@
++//! Structural enforcement of the diagnostic command whitelist.
++//!
++//! Two independent layers keep actuator commands unreachable:
++//!
++//! 1. [`FrozenProbe`] and [`SensorProbe`] are closed enums with one variant per whitelisted
++//!    command. There is no CLI option, constructor, or conversion that produces any other
++//!    `FrozenCommand`/`SensorCommand` variant from user input anywhere in this binary.
++//! 2. [`SafetyAudit`] is consulted on every single outgoing frame (real hardware or test
++//!    transport alike) and rejects any opcode outside the configured whitelist before it can
++//!    reach a `Sink::send`. This is defense in depth, not the only gate.
++
++use opensleep::common::codec::CommandTrait;
++use opensleep::frozen::FrozenCommand;
++use opensleep::sensor::SensorCommand;
++
++/// Frozen opcodes this tool is permitted to transmit: Ping, GetHardwareInfo, GetFirmware,
++/// JumpToFirmware. Notably absent: 0x40 SetTargetTemperature, 0x41 GetTemperatures,
++/// 0x52 Prime, and any other value.
++pub const FROZEN_WHITELIST: &[u8] = &[0x01, 0x02, 0x04, 0x10];
++
++/// Sensor opcodes this tool is permitted to transmit: Ping, GetHardwareInfo, GetFirmwareHash,
++/// JumpToFirmware. Notably absent: piezo/vibration/alarm/calibration/temperature-probe opcodes
++/// and any other value.
++pub const SENSOR_WHITELIST: &[u8] = &[0x01, 0x02, 0x04, 0x10];
++
++/// The only Frozen commands reachable from this binary.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum FrozenProbe {
++    Ping,
++    GetHardwareInfo,
++    GetFirmware,
++    JumpToFirmware,
++}
++
++impl FrozenProbe {
++    pub fn command(self) -> FrozenCommand {
++        match self {
++            FrozenProbe::Ping => FrozenCommand::Ping,
++            FrozenProbe::GetHardwareInfo => FrozenCommand::GetHardwareInfo,
++            FrozenProbe::GetFirmware => FrozenCommand::GetFirmware,
++            FrozenProbe::JumpToFirmware => FrozenCommand::JumpToFirmware,
++        }
++    }
++}
++
++/// The only Sensor commands reachable from this binary.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum SensorProbe {
++    Ping,
++    GetHardwareInfo,
++    GetFirmwareHash,
++    JumpToFirmware,
++}
++
++impl SensorProbe {
++    pub fn command(self) -> SensorCommand {
++        match self {
++            SensorProbe::Ping => SensorCommand::Ping,
++            SensorProbe::GetHardwareInfo => SensorCommand::GetHardwareInfo,
++            SensorProbe::GetFirmwareHash => SensorCommand::GetFirmwareHash,
++            SensorProbe::JumpToFirmware => SensorCommand::JumpToFirmware,
++        }
++    }
++}
++
++/// Raised when [`SafetyAudit::check`] sees an opcode outside its whitelist. This should be
++/// unreachable via any path this binary exposes; its only purpose is to make that claim
++/// falsifiable in tests, and to fail closed if it is ever wrong.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct SafetyViolation {
++    pub frame: Vec<u8>,
++    pub opcode: Option<u8>,
++}
++
++impl std::fmt::Display for SafetyViolation {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        write!(
++            f,
++            "refused to transmit non-whitelisted opcode {:?}: frame {:02X?}",
++            self.opcode, self.frame
++        )
++    }
++}
++
++impl std::error::Error for SafetyViolation {}
++
++/// Records and gates every frame this process ever attempts to transmit on a given subsystem.
++pub struct SafetyAudit {
++    allowed_opcodes: &'static [u8],
++    sent_frames: Vec<Vec<u8>>,
++}
++
++impl SafetyAudit {
++    pub fn new(allowed_opcodes: &'static [u8]) -> Self {
++        Self {
++            allowed_opcodes,
++            sent_frames: Vec::new(),
++        }
++    }
++
++    /// Encodes `cmd` and either records it (returning the frame bytes to send) or rejects it.
++    /// A frame is laid out as `[START, len, opcode, ...payload, checksum_hi, checksum_lo]`,
++    /// so byte index 2 is the opcode.
++    pub fn check<C: CommandTrait>(&mut self, cmd: &C) -> Result<Vec<u8>, SafetyViolation> {
++        let frame = cmd.to_bytes();
++        let opcode = frame.get(2).copied();
++        match opcode {
++            Some(op) if self.allowed_opcodes.contains(&op) => {
++                self.sent_frames.push(frame.clone());
++                Ok(frame)
++            }
++            _ => Err(SafetyViolation { frame, opcode }),
++        }
++    }
++
++    pub fn sent_frames(&self) -> &[Vec<u8>] {
++        &self.sent_frames
++    }
++
++    pub fn sent_count(&self) -> usize {
++        self.sent_frames.len()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use opensleep::common::packet::BedSide;
++    use opensleep::frozen::command::FrozenCommand as FC;
++    use opensleep::frozen::packet::FrozenTarget;
++    use opensleep::sensor::command::{AlarmCommand, AlarmPattern, SensorCommand as SC};
++
++    #[test]
++    fn whitelisted_frozen_probes_are_accepted() {
++        let mut audit = SafetyAudit::new(FROZEN_WHITELIST);
++        for probe in [
++            FrozenProbe::Ping,
++            FrozenProbe::GetHardwareInfo,
++            FrozenProbe::GetFirmware,
++            FrozenProbe::JumpToFirmware,
++        ] {
++            assert!(audit.check(&probe.command()).is_ok());
++        }
++        assert_eq!(audit.sent_count(), 4);
++    }
++
++    #[test]
++    fn whitelisted_sensor_probes_are_accepted() {
++        let mut audit = SafetyAudit::new(SENSOR_WHITELIST);
++        for probe in [
++            SensorProbe::Ping,
++            SensorProbe::GetHardwareInfo,
++            SensorProbe::GetFirmwareHash,
++            SensorProbe::JumpToFirmware,
++        ] {
++            assert!(audit.check(&probe.command()).is_ok());
++        }
++        assert_eq!(audit.sent_count(), 4);
++    }
++
++    /// Even though `FrozenCommand` itself can still represent actuator commands (it is the
++    /// shared library type), the audit must reject every one of them if they are ever handed
++    /// to it. This binary never does so on any reachable path; this test proves the gate works
++    /// if that invariant is ever broken by a future change.
++    #[test]
++    fn frozen_actuator_commands_are_rejected() {
++        let mut audit = SafetyAudit::new(FROZEN_WHITELIST);
++        let disallowed = [
++            FC::SetTargetTemperature {
++                side: BedSide::Left,
++                tar: FrozenTarget {
++                    enabled: true,
++                    temp: 3600,
++                },
++            },
++            FC::GetTemperatures,
++            FC::Prime,
++            FC::Random(0x99),
++        ];
++        for cmd in disallowed {
++            let err = audit.check(&cmd).expect_err("must be rejected");
++            assert!(!audit.sent_frames().contains(&err.frame));
++        }
++        assert_eq!(audit.sent_count(), 0);
++    }
++
++    #[test]
++    fn sensor_actuator_and_config_commands_are_rejected() {
++        let mut audit = SafetyAudit::new(SENSOR_WHITELIST);
++        let disallowed = [
++            SC::SetPiezoFreq(1000),
++            SC::SetPiezoGain(400, 400),
++            SC::EnablePiezo,
++            SC::DisablePiezo,
++            SC::EnableVibration,
++            SC::ProbeTemperature,
++            SC::SetAlarm(AlarmCommand::new(
++                BedSide::Left,
++                50,
++                10,
++                AlarmPattern::Single,
++            )),
++            SC::ClearAlarm,
++            SC::GetHeaterOffset,
++            SC::Random(vec![0x99]),
++        ];
++        for cmd in disallowed {
++            assert!(audit.check(&cmd).is_err());
++        }
++        assert_eq!(audit.sent_count(), 0);
++    }
++
++    #[test]
++    fn frozen_and_sensor_whitelists_reject_each_others_opcodes_are_disjoint_from_actuators() {
++        // 0x40, 0x41, 0x52 (Frozen actuator/observational-but-banned opcodes) must never appear
++        // in the Frozen whitelist.
++        for banned in [0x40u8, 0x41, 0x52] {
++            assert!(!FROZEN_WHITELIST.contains(&banned));
++        }
++        // Sensor piezo/vibration/alarm/calibration opcodes must never appear in the Sensor
++        // whitelist.
++        for banned in [0x20u8, 0x21, 0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F] {
++            assert!(!SENSOR_WHITELIST.contains(&banned));
++        }
++    }
++}
+diff --git a/src/bin/opensleep-diagnostic/sensor_phase.rs b/src/bin/opensleep-diagnostic/sensor_phase.rs
+new file mode 100644
+index 0000000..f9dd922
+--- /dev/null
++++ b/src/bin/opensleep-diagnostic/sensor_phase.rs
+@@ -0,0 +1,620 @@
++//! Sensor subsystem diagnostic: try firmware baud first, fall back to bootloader baud, and only
++//! with `--allow-firmware-jump` send JumpToFirmware and re-probe at firmware baud. Never enters
++//! `opensleep::sensor::manager::run`'s command scheduler; never enables vibration, piezo, an
++//! alarm, or a temperature probe.
++
++use std::io;
++use std::pin::Pin;
++use std::task::{Context, Poll};
++use std::time::Duration;
++
++use async_trait::async_trait;
++use opensleep::common::codec::PacketCodec;
++use opensleep::common::packet::HardwareInfo;
++use opensleep::common::serial::create_port;
++use opensleep::sensor::SensorPacket;
++use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
++use tokio_serial::SerialStream;
++use tokio_util::codec::Framed;
++
++use crate::io_logging::LoggingIo;
++use crate::safety::{SENSOR_WHITELIST, SafetyAudit, SensorProbe};
++use crate::transport::{ExchangeOutcome, HasHardwareInfo, PongPacket, send_and_await};
++
++pub const BOOTLOADER_BAUD: u32 = 38400;
++pub const FIRMWARE_BAUD: u32 = 115200;
++/// Settle time after JumpToFirmware before reopening the port at firmware baud. The normal
++/// OpenSleep manager instead polls for a device-mode change driven by its full packet loop; this
++/// diagnostic does not run that loop, so a fixed settle delay is used instead.
++const POST_JUMP_SETTLE: Duration = Duration::from_millis(300);
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
++pub enum DetectedMode {
++    Firmware,
++    Bootloader,
++    #[default]
++    Unavailable,
++}
++
++impl std::fmt::Display for DetectedMode {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        let s = match self {
++            DetectedMode::Firmware => "firmware",
++            DetectedMode::Bootloader => "bootloader",
++            DetectedMode::Unavailable => "unavailable",
++        };
++        write!(f, "{s}")
++    }
++}
++
++#[derive(Debug, Clone, Default)]
++pub struct SensorPhaseResult {
++    pub firmware_port_opened: bool,
++    pub bootloader_port_opened: bool,
++    pub detected_mode: DetectedMode,
++    pub ping_ok: bool,
++    pub hardware_info: Option<HardwareInfo>,
++    pub firmware_hash_probed: bool,
++    pub firmware_jump_sent: bool,
++    pub post_jump_ping_ok: bool,
++    pub post_jump_hardware_info: Option<HardwareInfo>,
++}
++
++/// Either a real serial port or (in tests) an in-memory duplex stream. A concrete enum -- rather
++/// than a `Box<dyn AsyncRead + AsyncWrite>` -- so both variants are trivially `Unpin` and `Send`
++/// with no trait-object plumbing.
++pub enum AnyIo {
++    Serial(SerialStream),
++    #[allow(dead_code)] // constructed by the test-only `SensorPortOpener` impls in `tests`
++    Duplex(DuplexStream),
++}
++
++impl AsyncRead for AnyIo {
++    fn poll_read(
++        self: Pin<&mut Self>,
++        cx: &mut Context<'_>,
++        buf: &mut ReadBuf<'_>,
++    ) -> Poll<io::Result<()>> {
++        match self.get_mut() {
++            AnyIo::Serial(s) => Pin::new(s).poll_read(cx, buf),
++            AnyIo::Duplex(s) => Pin::new(s).poll_read(cx, buf),
++        }
++    }
++}
++
++impl AsyncWrite for AnyIo {
++    fn poll_write(
++        self: Pin<&mut Self>,
++        cx: &mut Context<'_>,
++        buf: &[u8],
++    ) -> Poll<io::Result<usize>> {
++        match self.get_mut() {
++            AnyIo::Serial(s) => Pin::new(s).poll_write(cx, buf),
++            AnyIo::Duplex(s) => Pin::new(s).poll_write(cx, buf),
++        }
++    }
++
++    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        match self.get_mut() {
++            AnyIo::Serial(s) => Pin::new(s).poll_flush(cx),
++            AnyIo::Duplex(s) => Pin::new(s).poll_flush(cx),
++        }
++    }
++
++    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        match self.get_mut() {
++            AnyIo::Serial(s) => Pin::new(s).poll_shutdown(cx),
++            AnyIo::Duplex(s) => Pin::new(s).poll_shutdown(cx),
++        }
++    }
++}
++
++type SensorFramed = Framed<LoggingIo<AnyIo>, PacketCodec<SensorPacket>>;
++
++/// Abstracts "open the Sensor UART at a given baud" so the exact same reopen-after-jump
++/// orchestration logic below can run against real hardware or a scripted test double.
++#[async_trait]
++pub trait SensorPortOpener: Send {
++    async fn open_firmware(&mut self) -> io::Result<SensorFramed>;
++    async fn open_bootloader(&mut self) -> io::Result<SensorFramed>;
++}
++
++pub struct RealSensorPorts {
++    pub path: String,
++}
++
++#[async_trait]
++impl SensorPortOpener for RealSensorPorts {
++    async fn open_firmware(&mut self) -> io::Result<SensorFramed> {
++        let raw = create_port(&self.path, FIRMWARE_BAUD).map_err(io::Error::other)?;
++        log::info!(
++            "Sensor UART opened: {} @ {FIRMWARE_BAUD} baud, 8N1, no flow control",
++            self.path
++        );
++        Ok(Framed::new(
++            LoggingIo::new(AnyIo::Serial(raw), "Sensor(fw)"),
++            PacketCodec::new(),
++        ))
++    }
++
++    async fn open_bootloader(&mut self) -> io::Result<SensorFramed> {
++        let raw = create_port(&self.path, BOOTLOADER_BAUD).map_err(io::Error::other)?;
++        log::info!(
++            "Sensor UART opened: {} @ {BOOTLOADER_BAUD} baud, 8N1, no flow control",
++            self.path
++        );
++        Ok(Framed::new(
++            LoggingIo::new(AnyIo::Serial(raw), "Sensor(bl)"),
++            PacketCodec::new(),
++        ))
++    }
++}
++
++pub async fn run_sensor_phase(
++    port: &str,
++    timeout: Duration,
++    allow_firmware_jump: bool,
++) -> (SensorPhaseResult, SafetyAudit) {
++    let mut audit = SafetyAudit::new(SENSOR_WHITELIST);
++    let mut opener = RealSensorPorts {
++        path: port.to_string(),
++    };
++    let result =
++        run_sensor_phase_generic(&mut opener, timeout, allow_firmware_jump, &mut audit).await;
++    (result, audit)
++}
++
++async fn fetch_hardware_info(
++    framed: &mut SensorFramed,
++    audit: &mut SafetyAudit,
++    timeout: Duration,
++) -> Option<HardwareInfo> {
++    match send_and_await(framed, audit, SensorProbe::GetHardwareInfo.command(), timeout).await {
++        Ok(ExchangeOutcome::Received(pkt)) => match pkt.as_hardware_info() {
++            Some(hw) => Some(hw.clone()),
++            None => {
++                log::warn!("Sensor GetHardwareInfo got unexpected packet: {pkt:?}");
++                None
++            }
++        },
++        Ok(_) => {
++            log::warn!("Sensor did not respond to GetHardwareInfo within {timeout:?}");
++            None
++        }
++        Err(e) => {
++            log::error!("Sensor GetHardwareInfo failed: {e}");
++            None
++        }
++    }
++}
++
++async fn probe_firmware_hash(
++    framed: &mut SensorFramed,
++    audit: &mut SafetyAudit,
++    timeout: Duration,
++) -> bool {
++    match send_and_await(framed, audit, SensorProbe::GetFirmwareHash.command(), timeout).await {
++        Ok(ExchangeOutcome::Received(pkt)) => {
++            log::info!("Sensor GetFirmwareHash: {pkt:?}");
++            true
++        }
++        Ok(_) => {
++            log::debug!("Sensor did not respond to GetFirmwareHash within {timeout:?}");
++            false
++        }
++        Err(e) => {
++            log::debug!("Sensor GetFirmwareHash failed: {e}");
++            false
++        }
++    }
++}
++
++pub async fn run_sensor_phase_generic<O: SensorPortOpener>(
++    opener: &mut O,
++    timeout: Duration,
++    allow_firmware_jump: bool,
++    audit: &mut SafetyAudit,
++) -> SensorPhaseResult {
++    let mut result = SensorPhaseResult::default();
++
++    // 1. Firmware mode first, at 115200 baud.
++    if let Ok(mut framed) = opener.open_firmware().await.inspect_err(|e| {
++        log::error!("failed to open Sensor port at firmware baud: {e}");
++    }) {
++        result.firmware_port_opened = true;
++        match send_and_await(&mut framed, audit, SensorProbe::Ping.command(), timeout).await {
++            Ok(ExchangeOutcome::Received(pkt)) => match pkt.as_pong() {
++                Some(in_firmware) => {
++                    result.detected_mode = DetectedMode::Firmware;
++                    result.ping_ok = true;
++                    if !in_firmware {
++                        log::warn!(
++                            "Sensor responded at firmware baud but its Pong reports bootloader"
++                        );
++                    }
++                }
++                None => log::warn!("Sensor Ping (firmware attempt) got unexpected packet: {pkt:?}"),
++            },
++            Ok(_) => log::info!(
++                "Sensor did not respond to Ping at firmware baud ({FIRMWARE_BAUD}); trying bootloader baud"
++            ),
++            Err(e) => log::warn!("Sensor Ping (firmware attempt) failed: {e}"),
++        }
++
++        if result.ping_ok {
++            result.hardware_info = fetch_hardware_info(&mut framed, audit, timeout).await;
++            result.firmware_hash_probed = probe_firmware_hash(&mut framed, audit, timeout).await;
++            return result;
++        }
++    }
++
++    // 2. Bootloader mode, at 38400 baud. Ping only, per spec.
++    let mut bootloader_framed = match opener.open_bootloader().await {
++        Ok(f) => {
++            result.bootloader_port_opened = true;
++            Some(f)
++        }
++        Err(e) => {
++            log::error!("failed to open Sensor port at bootloader baud: {e}");
++            None
++        }
++    };
++
++    if let Some(framed) = bootloader_framed.as_mut() {
++        match send_and_await(framed, audit, SensorProbe::Ping.command(), timeout).await {
++            Ok(ExchangeOutcome::Received(pkt)) => match pkt.as_pong() {
++                Some(in_firmware) => {
++                    result.detected_mode = DetectedMode::Bootloader;
++                    result.ping_ok = true;
++                    if in_firmware {
++                        log::warn!(
++                            "Sensor responded at bootloader baud but its Pong reports firmware"
++                        );
++                    }
++                }
++                None => {
++                    log::warn!("Sensor Ping (bootloader attempt) got unexpected packet: {pkt:?}")
++                }
++            },
++            Ok(_) => log::info!(
++                "Sensor did not respond to Ping at bootloader baud ({BOOTLOADER_BAUD}) either"
++            ),
++            Err(e) => log::warn!("Sensor Ping (bootloader attempt) failed: {e}"),
++        }
++    }
++
++    if result.detected_mode != DetectedMode::Bootloader {
++        result.detected_mode = DetectedMode::Unavailable;
++        return result;
++    }
++
++    if !allow_firmware_jump {
++        log::info!(
++            "Sensor appears to be in its bootloader; not sending JumpToFirmware (pass --allow-firmware-jump to opt in)"
++        );
++        return result;
++    }
++
++    log::warn!(
++        "Sensor appears to be in its bootloader; --allow-firmware-jump supplied, sending JumpToFirmware"
++    );
++    if let Some(mut framed) = bootloader_framed {
++        match send_and_await(&mut framed, audit, SensorProbe::JumpToFirmware.command(), timeout)
++            .await
++        {
++            Ok(ExchangeOutcome::Received(pkt)) => {
++                result.firmware_jump_sent = true;
++                log::info!("Sensor JumpToFirmware response: {pkt:?}");
++            }
++            Ok(_) => {
++                result.firmware_jump_sent = true;
++                log::warn!("Sensor did not respond to JumpToFirmware within {timeout:?}");
++            }
++            Err(e) => log::error!("Sensor JumpToFirmware failed: {e}"),
++        }
++        drop(framed);
++    }
++
++    tokio::time::sleep(POST_JUMP_SETTLE).await;
++
++    match opener.open_firmware().await {
++        Ok(mut framed) => {
++            match send_and_await(&mut framed, audit, SensorProbe::Ping.command(), timeout).await {
++                Ok(ExchangeOutcome::Received(pkt)) => {
++                    if pkt.as_pong().is_some() {
++                        result.post_jump_ping_ok = true;
++                    } else {
++                        log::warn!("Sensor post-jump Ping got unexpected packet: {pkt:?}");
++                    }
++                }
++                Ok(_) => log::warn!("Sensor did not respond to post-jump Ping within {timeout:?}"),
++                Err(e) => log::error!("Sensor post-jump Ping failed: {e}"),
++            }
++            if result.post_jump_ping_ok {
++                result.post_jump_hardware_info =
++                    fetch_hardware_info(&mut framed, audit, timeout).await;
++            }
++        }
++        Err(e) => log::error!("failed to reopen Sensor port at firmware baud after jump: {e}"),
++    }
++
++    result
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use bytes::{Buf, BytesMut};
++    use tokio::sync::mpsc;
++
++    fn pong_frame(in_firmware: bool) -> Vec<u8> {
++        let code: u8 = if in_firmware { 0b0100_0110 } else { 0b0100_0010 };
++        opensleep::common::codec::command(vec![0x81, 0x00, code])
++    }
++
++    /// Reads whole frames off `device_side` and replies per `script`, keyed by opcode. Any
++    /// opcode not in `script` is recorded but gets no reply (matching real hardware silently
++    /// ignoring or not implementing an unknown command).
++    async fn run_fake_device(
++        mut device_side: DuplexStream,
++        script: std::collections::HashMap<u8, Vec<u8>>,
++        seen_tx: mpsc::UnboundedSender<u8>,
++    ) {
++        use tokio::io::{AsyncReadExt, AsyncWriteExt};
++        let mut acc = BytesMut::new();
++        let mut read_buf = [0u8; 256];
++        loop {
++            if acc.len() >= 2 {
++                let len = acc[1] as usize;
++                let total = 1 + 1 + len + 2;
++                if acc.len() >= total {
++                    let opcode = acc[2];
++                    acc.advance(total);
++                    let _ = seen_tx.send(opcode);
++                    if let Some(response) = script.get(&opcode)
++                        && device_side.write_all(response).await.is_err()
++                    {
++                        return;
++                    }
++                    continue;
++                }
++            }
++            let n = match device_side.read(&mut read_buf).await {
++                Ok(0) | Err(_) => return,
++                Ok(n) => n,
++            };
++            acc.extend_from_slice(&read_buf[..n]);
++        }
++    }
++
++    /// Test opener: firmware attempt is a duplex pair with no device on the far end (so Ping
++    /// always times out), bootloader attempt is a duplex pair with a scripted fake device.
++    struct BootloaderOnlyOpener {
++        script: std::collections::HashMap<u8, Vec<u8>>,
++        seen_tx: mpsc::UnboundedSender<u8>,
++    }
++
++    #[async_trait]
++    impl SensorPortOpener for BootloaderOnlyOpener {
++        async fn open_firmware(&mut self) -> io::Result<SensorFramed> {
++            let (client, _device_dropped_immediately) = tokio::io::duplex(4096);
++            Ok(Framed::new(
++                LoggingIo::new(AnyIo::Duplex(client), "test-fw"),
++                PacketCodec::new(),
++            ))
++        }
++
++        async fn open_bootloader(&mut self) -> io::Result<SensorFramed> {
++            let (client, device) = tokio::io::duplex(4096);
++            tokio::spawn(run_fake_device(
++                device,
++                self.script.clone(),
++                self.seen_tx.clone(),
++            ));
++            Ok(Framed::new(
++                LoggingIo::new(AnyIo::Duplex(client), "test-bl"),
++                PacketCodec::new(),
++            ))
++        }
++    }
++
++    /// Test opener where both firmware and bootloader attempts have a live fake device (used for
++    /// the JumpToFirmware -> reopen-at-firmware-baud path, which calls `open_firmware` twice).
++    ///
++    /// The *first* `open_firmware` call (the initial "try firmware mode first" probe) is always
++    /// left unanswered, so the phase logic falls through to the bootloader attempt exactly like
++    /// it would against real hardware that boots into its bootloader. Only the *second* call
++    /// (the post-JumpToFirmware reopen) gets a live scripted device.
++    struct ScriptedOpener {
++        firmware_script: std::collections::HashMap<u8, Vec<u8>>,
++        bootloader_script: std::collections::HashMap<u8, Vec<u8>>,
++        seen_tx: mpsc::UnboundedSender<u8>,
++        firmware_opens: std::sync::Arc<std::sync::atomic::AtomicUsize>,
++        /// Whether the *first* `open_firmware` call (the initial "try firmware mode first"
++        /// probe) gets a live device. Every call after the first always does, so the
++        /// post-JumpToFirmware reopen can be tested independently of the initial attempt.
++        answer_first_firmware_call: bool,
++    }
++
++    #[async_trait]
++    impl SensorPortOpener for ScriptedOpener {
++        async fn open_firmware(&mut self) -> io::Result<SensorFramed> {
++            let call_num = self
++                .firmware_opens
++                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
++                + 1;
++            let (client, device) = tokio::io::duplex(4096);
++            if call_num >= 2 || self.answer_first_firmware_call {
++                tokio::spawn(run_fake_device(
++                    device,
++                    self.firmware_script.clone(),
++                    self.seen_tx.clone(),
++                ));
++            }
++            // else: no device is attached to the far end, so any Ping sent on the first
++            // (pre-jump) firmware attempt goes unanswered, exactly like real bootloader-mode
++            // hardware would ignore a Ping sent at the wrong baud.
++            Ok(Framed::new(
++                LoggingIo::new(AnyIo::Duplex(client), "test-fw"),
++                PacketCodec::new(),
++            ))
++        }
++
++        async fn open_bootloader(&mut self) -> io::Result<SensorFramed> {
++            let (client, device) = tokio::io::duplex(4096);
++            tokio::spawn(run_fake_device(
++                device,
++                self.bootloader_script.clone(),
++                self.seen_tx.clone(),
++            ));
++            Ok(Framed::new(
++                LoggingIo::new(AnyIo::Duplex(client), "test-bl"),
++                PacketCodec::new(),
++            ))
++        }
++    }
++
++    #[tokio::test]
++    async fn firmware_mode_detected_when_it_answers_first() {
++        let (seen_tx, mut seen_rx) = mpsc::unbounded_channel();
++        let mut firmware_script = std::collections::HashMap::new();
++        firmware_script.insert(0x01u8, pong_frame(true));
++        let mut opener = ScriptedOpener {
++            firmware_script,
++            bootloader_script: std::collections::HashMap::new(),
++            seen_tx,
++            firmware_opens: Default::default(),
++            answer_first_firmware_call: true,
++        };
++        let mut audit = SafetyAudit::new(SENSOR_WHITELIST);
++        let result = run_sensor_phase_generic(
++            &mut opener,
++            Duration::from_millis(300),
++            false,
++            &mut audit,
++        )
++        .await;
++
++        assert_eq!(result.detected_mode, DetectedMode::Firmware);
++        assert!(result.ping_ok);
++        assert!(!result.bootloader_port_opened);
++        seen_rx.close();
++        let mut seen = Vec::new();
++        while let Some(op) = seen_rx.recv().await {
++            seen.push(op);
++        }
++        assert!(seen.contains(&0x01));
++    }
++
++    #[tokio::test]
++    async fn falls_back_to_bootloader_when_firmware_does_not_answer() {
++        let (seen_tx, _seen_rx) = mpsc::unbounded_channel();
++        let mut script = std::collections::HashMap::new();
++        script.insert(0x01u8, pong_frame(false));
++        let mut opener = BootloaderOnlyOpener { script, seen_tx };
++
++        let mut audit = SafetyAudit::new(SENSOR_WHITELIST);
++        let result = run_sensor_phase_generic(
++            &mut opener,
++            Duration::from_millis(150),
++            false,
++            &mut audit,
++        )
++        .await;
++
++        assert_eq!(result.detected_mode, DetectedMode::Bootloader);
++        assert!(result.ping_ok);
++        assert!(result.firmware_port_opened);
++        assert!(result.bootloader_port_opened);
++        assert!(!result.firmware_jump_sent);
++    }
++
++    #[tokio::test]
++    async fn neither_mode_answers_reports_unavailable() {
++        let (seen_tx, _seen_rx) = mpsc::unbounded_channel();
++        let mut opener = BootloaderOnlyOpener {
++            script: std::collections::HashMap::new(), // bootloader device never replies either
++            seen_tx,
++        };
++
++        let mut audit = SafetyAudit::new(SENSOR_WHITELIST);
++        let result = run_sensor_phase_generic(
++            &mut opener,
++            Duration::from_millis(100),
++            false,
++            &mut audit,
++        )
++        .await;
++
++        assert_eq!(result.detected_mode, DetectedMode::Unavailable);
++        assert!(!result.ping_ok);
++    }
++
++    #[tokio::test]
++    async fn jump_to_firmware_not_sent_without_opt_in_even_in_bootloader() {
++        let (seen_tx, mut seen_rx) = mpsc::unbounded_channel();
++        let mut script = std::collections::HashMap::new();
++        script.insert(0x01u8, pong_frame(false));
++        let mut opener = BootloaderOnlyOpener { script, seen_tx };
++
++        let mut audit = SafetyAudit::new(SENSOR_WHITELIST);
++        let result = run_sensor_phase_generic(
++            &mut opener,
++            Duration::from_millis(150),
++            false, // NOT allowed
++            &mut audit,
++        )
++        .await;
++
++        assert_eq!(result.detected_mode, DetectedMode::Bootloader);
++        assert!(!result.firmware_jump_sent);
++        assert!(!audit.sent_frames().iter().any(|f| f.get(2) == Some(&0x10)));
++
++        seen_rx.close();
++        let mut seen = Vec::new();
++        while let Some(op) = seen_rx.recv().await {
++            seen.push(op);
++        }
++        assert!(!seen.contains(&0x10));
++    }
++
++    #[tokio::test]
++    async fn jump_to_firmware_reopens_at_firmware_baud_when_allowed() {
++        let (seen_tx, _seen_rx) = mpsc::unbounded_channel();
++        let mut bootloader_script = std::collections::HashMap::new();
++        bootloader_script.insert(0x01u8, pong_frame(false));
++        bootloader_script.insert(
++            0x10u8,
++            opensleep::common::codec::command(vec![0x90, 0x00]),
++        );
++        let mut firmware_script = std::collections::HashMap::new();
++        firmware_script.insert(0x01u8, pong_frame(true));
++
++        let firmware_opens = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
++        let mut opener = ScriptedOpener {
++            firmware_script,
++            bootloader_script,
++            seen_tx,
++            firmware_opens: firmware_opens.clone(),
++            answer_first_firmware_call: false,
++        };
++
++        let mut audit = SafetyAudit::new(SENSOR_WHITELIST);
++        let result = run_sensor_phase_generic(
++            &mut opener,
++            Duration::from_millis(300),
++            true, // allowed
++            &mut audit,
++        )
++        .await;
++
++        assert_eq!(result.detected_mode, DetectedMode::Bootloader);
++        assert!(result.firmware_jump_sent);
++        assert!(result.post_jump_ping_ok);
++        assert_eq!(firmware_opens.load(std::sync::atomic::Ordering::SeqCst), 2);
++        assert!(audit.sent_frames().iter().any(|f| f.get(2) == Some(&0x10)));
++        for frame in audit.sent_frames() {
++            assert!(SENSOR_WHITELIST.contains(&frame[2]));
++        }
++    }
++}
+diff --git a/src/bin/opensleep-diagnostic/transport.rs b/src/bin/opensleep-diagnostic/transport.rs
+new file mode 100644
+index 0000000..a34ef24
+--- /dev/null
++++ b/src/bin/opensleep-diagnostic/transport.rs
+@@ -0,0 +1,129 @@
++//! Generic send/receive plumbing shared by the Frozen and Sensor phases, built on top of
++//! OpenSleep's existing `PacketCodec` and `CommandTrait` (no protocol framing is reimplemented
++//! here). Generic over the underlying I/O so the exact same code path is exercised against real
++//! serial ports and against `tokio::io::duplex` mock transports in tests.
++
++use std::fmt::Debug;
++use std::time::Duration;
++
++use futures_util::{SinkExt, StreamExt};
++use opensleep::common::codec::{CommandTrait, PacketCodec};
++use opensleep::common::packet::{HardwareInfo, Packet};
++use tokio::io::{AsyncRead, AsyncWrite};
++use tokio_util::codec::Framed;
++
++use crate::safety::{SafetyAudit, SafetyViolation};
++
++#[derive(Debug)]
++pub enum ExchangeOutcome<P> {
++    Received(P),
++    TimedOut,
++    Closed,
++}
++
++#[derive(Debug)]
++pub enum ExchangeError {
++    Safety(SafetyViolation),
++    Io(std::io::Error),
++}
++
++impl std::fmt::Display for ExchangeError {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            ExchangeError::Safety(v) => write!(f, "{v}"),
++            ExchangeError::Io(e) => write!(f, "{e}"),
++        }
++    }
++}
++
++/// Sends `cmd` (after a mandatory whitelist check against `audit`) and waits up to `wait` for a
++/// decoded response packet.
++pub async fn send_and_await<T, P, C>(
++    framed: &mut Framed<T, PacketCodec<P>>,
++    audit: &mut SafetyAudit,
++    cmd: C,
++    wait: Duration,
++) -> Result<ExchangeOutcome<P>, ExchangeError>
++where
++    T: AsyncRead + AsyncWrite + Unpin,
++    P: Packet + Debug,
++    C: CommandTrait + Debug,
++{
++    let frame = audit.check(&cmd).map_err(ExchangeError::Safety)?;
++    log::info!("-> {cmd:?} ({} bytes: {:02X?})", frame.len(), frame);
++
++    framed.send(cmd).await.map_err(ExchangeError::Io)?;
++
++    match tokio::time::timeout(wait, framed.next()).await {
++        Ok(Some(Ok(pkt))) => {
++            log::info!("<- decoded: {pkt:?}");
++            Ok(ExchangeOutcome::Received(pkt))
++        }
++        Ok(Some(Err(e))) => {
++            log::warn!("packet decode/IO error while waiting for response: {e}");
++            Err(ExchangeError::Io(e))
++        }
++        Ok(None) => {
++            log::warn!("port closed while waiting for response");
++            Ok(ExchangeOutcome::Closed)
++        }
++        Err(_elapsed) => {
++            log::warn!("timed out after {wait:?} waiting for a response");
++            Ok(ExchangeOutcome::TimedOut)
++        }
++    }
++}
++
++/// Implemented locally for the two shared-library packet types so Ping/Pong handling can be
++/// written once and reused by both the Frozen and Sensor phases.
++pub trait PongPacket {
++    /// `Some(in_firmware)` if this packet is a Pong, matching
++    /// `common::serial::DeviceMode::from_pong`'s convention.
++    fn as_pong(&self) -> Option<bool>;
++}
++
++pub trait HasHardwareInfo {
++    fn as_hardware_info(&self) -> Option<&HardwareInfo>;
++}
++
++mod impls {
++    use super::{HasHardwareInfo, PongPacket};
++    use opensleep::frozen::FrozenPacket;
++    use opensleep::sensor::SensorPacket;
++
++    impl PongPacket for FrozenPacket {
++        fn as_pong(&self) -> Option<bool> {
++            match self {
++                FrozenPacket::Pong(in_firmware) => Some(*in_firmware),
++                _ => None,
++            }
++        }
++    }
++
++    impl HasHardwareInfo for FrozenPacket {
++        fn as_hardware_info(&self) -> Option<&opensleep::common::packet::HardwareInfo> {
++            match self {
++                FrozenPacket::HardwareInfo(hw) => Some(hw),
++                _ => None,
++            }
++        }
++    }
++
++    impl PongPacket for SensorPacket {
++        fn as_pong(&self) -> Option<bool> {
++            match self {
++                SensorPacket::Pong(in_firmware) => Some(*in_firmware),
++                _ => None,
++            }
++        }
++    }
++
++    impl HasHardwareInfo for SensorPacket {
++        fn as_hardware_info(&self) -> Option<&opensleep::common::packet::HardwareInfo> {
++            match self {
++                SensorPacket::HardwareInfo(hw) => Some(hw),
++                _ => None,
++            }
++        }
++    }
++}
+diff --git a/src/lib.rs b/src/lib.rs
+new file mode 100644
+index 0000000..b9716fb
+--- /dev/null
++++ b/src/lib.rs
+@@ -0,0 +1,10 @@
++pub mod common;
++pub mod config;
++pub mod frozen;
++pub mod led;
++pub mod mqtt;
++pub mod reset;
++pub mod sensor;
++
++pub const VERSION: &str = "2.0.0";
++pub const NAME: &str = "opensleep";
+diff --git a/src/main.rs b/src/main.rs
+index 585d19d..87376f3 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,20 +1,10 @@
+-mod common;
+-mod config;
+-mod frozen;
+-mod led;
+-mod mqtt;
+-mod reset;
+-mod sensor;
+-
+ use std::fs;
+ 
+-use config::Config;
++use opensleep::config::Config;
++use opensleep::{frozen, sensor};
+ use tokio::sync::{mpsc, watch};
+ 
+-use crate::{led::IS31FL3194Controller, mqtt::MqttManager, reset::ResetController};
+-
+-pub const VERSION: &str = "2.0.0";
+-pub const NAME: &str = "opensleep";
++use opensleep::{led::IS31FL3194Controller, mqtt::MqttManager, reset::ResetController};
+ 
+ #[tokio::main]
+ pub async fn main() {
