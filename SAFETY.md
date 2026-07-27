@@ -1,116 +1,145 @@
 # SAFETY.md — opensleep-diagnostic
 
-`opensleep-diagnostic` is a short-running, read-mostly hardware probe for an Eight Sleep Pod 3
-Hub. It is **not** a fork of the normal `opensleep` runtime and does **not** run any of its
-control loops, timers, or schedulers. This document is the authoritative list of every command
-this binary can transmit, and the mechanisms that make every other command unreachable.
+`opensleep-diagnostic` is a staged, **Frozen-only** hardware diagnostic for an Eight Sleep Pod 3
+Hub. It is not a fork of normal `opensleep` and does not run its control loops, timers, MQTT
+client, profile scheduler, or Sensor/LED management. It never installs a systemd service and never
+runs unattended — every invocation is a single foreground command that starts, does its work, and
+exits.
 
-The Hub this tool targets is not connected to a mattress cover and is not filled with water. It
-is not safe for pump, TEC, heating, cooling, vibration, alarm, or priming operations. This tool
-was built specifically so those operations are structurally impossible to trigger from it.
+**Read this whole document before running `frozen-cool-test` on real hardware.**
 
-## The complete list of commands this binary can ever transmit
+## The two safety tiers
 
-### Frozen subsystem (`/dev/ttyS1` by default, 38400 baud, 8N1, no flow control)
+### `frozen-passive` — safe with the cover disconnected and no water
 
-| Command | Opcode | Serialized frame | Sent when |
-|---|---|---|---|
-| `Ping` | `0x01` | `7E 01 01 DC BD` | Always, first Frozen command |
-| `GetHardwareInfo` | `0x02` | `7E 01 02 EC DE` | After a successful Ping |
-| `GetFirmware` | `0x04` | `7E 01 04 8C 18` | Only if `--skip-frozen-firmware=false` is explicitly passed (default: never sent). Best-effort and passive: its timeout can never turn an already-successful Ping into a failure. |
-| `JumpToFirmware` | `0x10` | `7E 01 10 DE AD` | Only if Frozen is detected in its bootloader **and** `--allow-firmware-jump` was passed |
+`frozen-passive` may be run with the mattress cover disconnected and the hydraulic reservoir
+empty. It never intentionally activates a pump, fan, valve, TEC, or the priming sequence. The only
+actuator-shaped command it can ever send is `SetTargetTemperature` with `enabled = false` (a
+"safety-off"), which turns nothing on.
 
-### Sensor subsystem (`/dev/ttyS2` by default, 115200 baud firmware / 38400 baud bootloader, 8N1, no flow control)
+### `frozen-cool-test` — an active test; **must not** run with the cover disconnected
 
-| Command | Opcode | Serialized frame | Sent when |
-|---|---|---|---|
-| `Ping` | `0x01` | `7E 01 01 DC BD` | Repeatedly: when sensor-first is active (default whenever `--reset-subsystems` is used), immediately after reset at bootloader baud, once every `--sensor-bootloader-interval-ms` (default 100ms) for up to `--sensor-bootloader-probe-ms` (default 3000ms) or until a valid response, then once at firmware baud; otherwise (sensor-first inactive), once at firmware baud, then once at bootloader baud only if firmware didn't answer; either way, once more after a firmware jump |
-| `GetHardwareInfo` | `0x02` | `7E 01 02 EC DE` | After a successful firmware-mode Ping (initial or post-jump) |
-| `GetFirmwareHash` | `0x04` | `7E 01 04 8C 18` | After a successful firmware-mode Ping (best-effort, passive) |
-| `JumpToFirmware` | `0x10` | `7E 01 10 DE AD` | Only if Sensor is detected in its bootloader **and** `--allow-firmware-jump` was passed |
+`frozen-cool-test` **must not** run with the cover disconnected or the hydraulic loop unfilled.
+Running the earlier passive test successfully, with the cover disconnected, is **not** permission
+to run this mode — the two are independent, and `frozen-cool-test` re-checks its own preflight
+conditions and refuses to start unless it receives explicit confirmation, every time.
 
-Repeating `Ping` many times during the post-reset bootloader probe window does not change what is
-reachable: `Ping` is on the whitelist regardless of how many times it's sent, and the retry loop
-(`sensor_phase::probe_sensor_bootloader_retries`) only ever constructs `SensorProbe::Ping` --
-there is no code path in that loop capable of constructing any other command.
+* The hydraulic loop must be connected and filled before this mode is started.
+* Visually check for leaks before starting.
+* This binary structurally cannot verify "is the cover physically connected" — it can only trust
+  the four `--confirm-*` flags and the typed confirmation phrases described below. **You, the
+  operator, are the safety interlock for this precondition.**
 
-(Frame bytes are from `opensleep`'s own encoder — `FrozenCommand`/`SensorCommand::to_bytes()` —
-and are exercised directly by this fork's unit tests, e.g. `frozen::command::tests::test_ping`
-and `sensor::command::tests::test_sensor_commands`, which the diagnostic reuses unmodified.)
+## Hazards specific to this hardware
 
-### I2C bus (`/dev/i2c-1` by default)
+* The Hub's case may contain energized areas once the cover is connected and a cooling channel is
+  active (pump driver, TEC driver, heatsink). **Do not touch or meter the open board while an
+  active test is running.**
+* Keep a way to physically disconnect Hub power available at all times during an active test —
+  don't rely on software alone.
+* **Never run `Prime` from this diagnostic.** It is not implemented anywhere in this binary: there
+  is no `FrozenAction::Prime` (or `Random`) variant, so it cannot be constructed, whitelisted, or
+  transmitted, in any mode, under any flag combination. See PROTOCOL_AUDIT.md for the structural
+  proof.
+* Test **only one side per invocation**. `frozen-cool-test --side left` can never also enable
+  `right` in the same run — see "Command whitelist" below.
+* **Stop immediately** (Ctrl+C, or run `opensleep-diagnostic emergency-stop` from a second
+  session) if you observe a leak, a burning smell, abnormal noise, or anything that feels
+  excessively hot.
 
-* Read-only one-byte probe of `0x20` (reset/enable expander) — never a write, unless
-  `--reset-subsystems` is passed.
-* Read-only one-byte probe of `0x53` (LED controller) — always read-only, never skipped from
-  being read-only even when the probe itself is skipped via `--skip-led-probe`.
-* Only with `--reset-subsystems`: exactly four writes to `0x20`, in this fixed order, mirroring
-  `opensleep::reset::ResetController::reset_subsystems`'s existing sequence:
-  1. `reg 0x06 <- 0xFC`
-  2. `reg 0x07 <- 0x31`
-  3. `reg 0x02 <- 0xFF`
-  4. `reg 0x02 <- 0xFD`
+## Command whitelist — the complete list of commands this binary can ever transmit
 
-  No other register, on `0x20` or any other address, is ever written by this binary.
+Every outgoing Frozen command passes through `safety::AuditedTransport::check`, which enforces a
+fixed per-mode whitelist (see `src/bin/opensleep-diagnostic/safety.rs`). The full command,
+opcode, and evidence table is in `PROTOCOL_AUDIT.md`; in summary:
 
-## What is never reachable, and why
+| Mode | Permitted commands |
+|---|---|
+| `frozen-passive` | `Ping`, `GetHardwareInfo`, `GetFirmware`, `JumpToFirmware`, `GetTemperatures`, `SetTargetTemperature(enabled=false)` for either side |
+| `frozen-cool-test` | everything `frozen-passive` permits, **plus** `SetTargetTemperature(enabled=true)` for exactly the one side selected at the CLI (fixed for the whole run; the other side can only ever be sent `enabled=false`) |
+| `emergency-stop` | `SetTargetTemperature(enabled=false)` for LEFT and RIGHT, and the `0x20` reset-assert write only |
 
-Every command listed below exists in the shared `opensleep` library crate (this fork reuses that
-crate's packet codecs and command definitions rather than reimplementing them), but none of them
-can be constructed or transmitted from `opensleep-diagnostic`:
+**Never reachable, in any mode:** `Prime` (`0x52`), `Random(_)`, any raw/undocumented opcode, an
+absolute (non-derived) temperature target, or a simultaneously-enabled left+right target. This is
+enforced structurally in two independent layers (a closed `FrozenAction` enum with no
+`Prime`/`Random` variant, plus the runtime whitelist gate), not by convention — see
+`safety::tests` and PROTOCOL_AUDIT.md.
 
-**Frozen:** `SetTargetTemperature` (`0x40`), `GetTemperatures` (`0x41`), `Prime` (`0x52`),
-`Random(_)`.
+## Active-test limits (hard-coded; no CLI flag can override them)
 
-**Sensor:** `SetPiezoFreq` (`0x21`), `GetPiezoFreq` (`0x20`), `EnablePiezo` (`0x28`),
-`DisablePiezo` (`0x29`), `SetPiezoGain` (`0x2B`), `EnableVibration` (`0x2E`),
-`ProbeTemperature` (`0x2F`), `SetAlarm` (`0x2C`), `ClearAlarm` (`0x2D`), `GetHeaterOffset`
-(`0x2A`), `Random(_)`.
+* Exactly one side per invocation; cooling only (no heating) in this first build.
+* Default cooling delta: 1.0C below the measured baseline. **Maximum permitted delta: 2.0C** —
+  `safety::FrozenAction::enable_cooling` refuses to construct a command for a larger delta.
+* Default active duration: 15 seconds. **Absolute maximum: 30 seconds** —
+  `cool_test::run` refuses to start at all if `--duration-seconds` exceeds this.
+* The baseline water temperature must fall within **15.00C–35.00C**
+  (`cool_test::MIN_WATER_CENTIDEG`/`MAX_WATER_CENTIDEG`) before the test proceeds. This range is a
+  conservative, compile-time choice (not derived from a documented firmware spec — see
+  PROTOCOL_AUDIT.md for why no tighter, evidence-backed range could be established) intended to
+  reject a disconnected/faulted sensor (implausible highs/lows, `0`/`0xFFFF` sentinels) while still
+  accepting any plausible indoor ambient-to-body-adjacent water temperature.
+* No `Prime`. No arbitrary/absolute commands.
 
-**I2C `0x53` (LED controller):** any write at all — reset, mode, brightness, pattern, or color
-registers.
+## Required confirmations before `frozen-cool-test` can run
 
-This is enforced structurally, on two independent layers, not by convention or careful coding
-alone:
+All of the following are required; missing any one refuses the run before any I2C/UART access:
 
-1. **Closed probe enums.** `FrozenProbe` and `SensorProbe` (`src/bin/opensleep-diagnostic/safety.rs`)
-   are the *only* types this binary ever converts into a `FrozenCommand`/`SensorCommand`. Each has
-   exactly four variants — `Ping`, `GetHardwareInfo`, `GetFirmware(Hash)`, `JumpToFirmware` — and
-   there is no CLI flag, constructor, or code path anywhere in this binary that produces any other
-   variant of the underlying library command enums. `GetTemperatures` is deliberately excluded
-   from the Frozen whitelist even though it looks observational, per this tool's own charter.
-2. **`SafetyAudit`, a runtime whitelist gate.** Every single outgoing frame — on the real serial
-   port and in every test — passes through `SafetyAudit::check`, which encodes the command,
-   reads the opcode byte, and refuses to record/allow it unless that opcode is in a fixed
-   per-subsystem whitelist (`FROZEN_WHITELIST` / `SENSOR_WHITELIST`, both `[0x01, 0x02, 0x04,
-   0x10]`). This is defense in depth: even if a future change accidentally reached a disallowed
-   command through some other path, `SafetyAudit` still refuses to send it.
-   `safety::tests::frozen_actuator_commands_are_rejected` and
-   `safety::tests::sensor_actuator_and_config_commands_are_rejected` construct every disallowed
-   command directly (bypassing the closed enums, using the shared library's own types) and assert
-   `SafetyAudit` rejects every one of them.
+```
+--side left|right
+--confirm-cover-hydraulics-connected
+--confirm-water-loop-filled
+--confirm-no-visible-leaks
+--confirm-active-test
+```
 
-`JumpToFirmware` is on the whitelist opcode-wise (it is not an actuator command — it only
-transitions an MCU from its bootloader to its normal firmware) but is additionally gated behind
-the `--allow-firmware-jump` CLI flag at the call site in `frozen_phase.rs`/`sensor_phase.rs`, and
-is never followed by any temperature, pump, or priming command in either phase.
-`frozen_phase::tests::jump_to_firmware_is_never_sent_without_opt_in`,
-`sensor_phase::tests::jump_to_firmware_not_sent_without_opt_in_even_in_bootloader`, and (for the
-sensor-first, post-reset code path specifically)
-`sensor_phase::tests::reset_first_jump_to_firmware_not_sent_without_opt_in` all assert this holds
-even when the target hardware is actively detected as being in its bootloader.
+Additionally, unless standard input is not a TTY, you must type the exact phrase:
 
-## Other guarantees
+```
+I CONFIRM THE WATER LOOP IS CONNECTED AND FILLED
+```
 
-* `--skip-led-probe` only skips the *read* of `0x53`; there is no flag, in this tool, that could
-  make it write to `0x53` instead.
-* This binary never loads `config.ron`, never connects to MQTT, never runs Home Assistant
-  integration, never starts a profile or temperature schedule, and never installs or touches a
-  systemd unit. None of the code paths that do those things (`opensleep::config::Config::load`,
-  `opensleep::mqtt`, `opensleep::frozen::manager::run`, `opensleep::sensor::manager::run`) are
-  called anywhere in `src/bin/opensleep-diagnostic/`.
-* The "Actuator commands sent" line in every summary (text and JSON) is hardcoded to `0`, not
-  computed from runtime state — because, given the two layers above, it is structurally
-  impossible for it to be anything else.
-* This tool always exits after a single diagnostic pass (see `report::compute_exit_code` for the
-  exit-code mapping). It is not a daemon and does not loop.
+...and, after preflight validates the baseline and prints the proposed target, a second exact
+phrase naming the selected side, e.g.:
+
+```
+START LEFT COOLING TEST
+```
+
+Neither confirmation accepts `yes`/`no`/a shortened form.
+
+## Safe-stop
+
+One shared routine (`safe_stop::run_safe_stop`) runs before every active test, on normal
+completion, on Ctrl+C/SIGTERM/SIGHUP, on timeout, on any communication or telemetry error, and
+(via a `catch_unwind` boundary around the per-tick evaluation logic) after an internal panic in
+that logic. It always: sends `SetTargetTemperature(enabled=false)` for LEFT and RIGHT three times
+with short delays, flushes the UART, and asserts `0x20` subsystem reset (`reg 0x02 <- 0xFF`),
+leaving the subsystem in that asserted-reset state. A run is only reported PASS if this completes
+successfully. If the UART disable fails but the I2C reset succeeds, the run is reported
+**degraded**, not PASS. If the I2C reset *also* fails, the program prints an explicit instruction
+to disconnect Hub power immediately.
+
+## Keep a second session open
+
+Before starting `frozen-cool-test`, open a second SSH session to the Hub with this ready to run:
+
+```sh
+opensleep-diagnostic emergency-stop
+```
+
+`emergency-stop` requires no config, MQTT, Sensor, or LED access, and works even if Frozen itself
+is unresponsive (it best-effort-disables both sides, then unconditionally asserts the I2C reset,
+which is the real backstop). It exits non-zero if the reset could not be confirmed.
+
+## What this binary never does, on any path
+
+* Never loads `config.ron`, never connects to MQTT, never runs the Home Assistant integration.
+* Never calls `opensleep::frozen::manager::run` (the normal command-scheduling loop) or any
+  profile/priming logic.
+* Never opens the Sensor subsystem UART or references `opensleep::sensor` at all.
+* Never writes to the `0x53` LED controller — only ever a read-only, nonfatal probe.
+* Never installs or touches a systemd unit; every run is a single foreground pass.
+
+These are enforced both by the fact that this binary's source never references those code paths
+(`main_guardrail_tests` in `main.rs` scans the diagnostic's own sources at test time to prove it)
+and by the command whitelist above.

@@ -1,157 +1,200 @@
 # Running opensleep-diagnostic on the Pod 3 Hub
 
-This tool is a diagnostic, not a service. It runs once, prints/writes a summary, and exits. Do
-not install it as a systemd unit.
+This tool is a diagnostic, not a service. Every subcommand runs once, in the foreground, prints/
+writes a summary, and exits. **Do not install it as a systemd unit.**
 
-The target Hub is assumed to be: not connected to the mattress cover, not filled with water, and
-therefore not safe for any pump, TEC, heating/cooling, vibration, alarm, or priming operation.
-`opensleep-diagnostic` cannot transmit any of those regardless (see `SAFETY.md`), but the deploy
-steps below still assume that context.
+Three subcommands:
+
+* `opensleep-diagnostic frozen-passive` — safe with the cover disconnected and no water.
+* `opensleep-diagnostic frozen-cool-test` — intentionally activates one cooling channel; requires
+  a connected, filled hydraulic loop and multiple explicit confirmations. **Read SAFETY.md before
+  running this.**
+* `opensleep-diagnostic emergency-stop` — independent fast-path disable + reset-assert.
 
 ## 1. Copy the binary to the Pod
-
-From your build host, after `./build.sh` has produced `dist/opensleep-diagnostic-aarch64-static`:
 
 ```sh
 scp dist/opensleep-diagnostic-aarch64-static \
     root@POD_IP:/persistent/tools/opensleep-diagnostic
 ```
 
-## 2. Make it executable and sanity-check the artifact on-device
+## 2. Make it executable and sanity-check it on-device
 
 ```sh
 chmod 755 /persistent/tools/opensleep-diagnostic
 file /persistent/tools/opensleep-diagnostic
 ```
 
-`file` should report an AArch64, statically linked ELF binary, matching `build-report.txt`.
+`file` should report an AArch64, statically linked ELF binary with no dynamic interpreter,
+matching `build-report.txt`.
 
 ## 3. Stop stock services that might own the UART or I2C devices
 
-Stock `capybara`/`frank`/`frankenfirmware`/`dac` may hold `/dev/ttyS1`, `/dev/ttyS2`, or
-`/dev/i2c-1` open, which would make this diagnostic's opens fail or race with stock traffic.
-Stop them first:
-
 ```sh
 systemctl stop capybara.service 2>/dev/null || true
+systemctl stop dac.service 2>/dev/null || true
 systemctl stop frank.service 2>/dev/null || true
 systemctl stop frankenfirmware.service 2>/dev/null || true
-systemctl stop dac.service 2>/dev/null || true
+systemctl stop opensleep.service 2>/dev/null || true
 ```
 
-These `|| true` guards mean it's fine if a given unit doesn't exist on this build.
-
-## 4. First run: passive only (no reset, no firmware jump)
+Then confirm nothing still holds the devices open:
 
 ```sh
-RUST_LOG=debug \
-/persistent/tools/opensleep-diagnostic \
-    --i2c-device /dev/i2c-1 \
-    --frozen-port /dev/ttyS1 \
-    --sensor-port /dev/ttyS2 \
-    --timeout-seconds 3 \
-    --json-output /persistent/opensleep-diagnostic-passive.json \
-    --verbose \
-    2>&1 | tee /persistent/opensleep-diagnostic-passive.log
+fuser -v /dev/i2c-1 /dev/ttyS1
 ```
 
-Expected on this hardware revision: the `0x20` reset/enable expander probe should succeed, and
-the `0x53` LED controller probe should fail with `ENXIO` and be logged as "LED controller
-unavailable; continuing diagnostic" — this is expected and does not fail the run. Review
-`Frozen Ping response` and `Sensor detected mode`/`Sensor Ping response` in the summary (or the
-JSON file) to see whether either MCU answered without any reset.
+`opensleep-diagnostic` also performs this check itself before touching either device (best-effort
+`systemctl is-active` + a `/proc/*/fd` scan) and refuses to run if it detects a stock service still
+active or either device already open elsewhere.
 
-## 5. Review the first run before doing anything else
-
-Read `/persistent/opensleep-diagnostic-passive.log` (or the JSON) before proceeding. In
-particular check:
-
-* `I2C bus open` and `Reset expander 0x20 probe` — if either failed, something more fundamental
-  than "the subsystems need a reset" is wrong (wrong I2C bus path, permissions, hardware fault),
-  and running the reset sequence is unlikely to help.
-* Whether Frozen/Sensor already answered without a reset. If they did, you likely don't need
-  step 6 at all for this session.
-
-## 6. Second run: only after reviewing the first, may include the known reset sequence
-
-Whenever `--reset-subsystems` is used, Sensor is tested **before** Frozen by default (this is
-`--sensor-first`'s default, tied to `--reset-subsystems`; see below), and immediately after the
-reset-expander sequence releases, Sensor's bootloader baud is probed with repeated `Ping`s rather
-than a single one several seconds later. This is specifically to catch a short post-reset
-bootloader-listening window that a Frozen-first, single-Ping approach could miss.
+## 4. First run: `frozen-passive`, with the cover still disconnected
 
 ```sh
-RUST_LOG=debug \
-/persistent/tools/opensleep-diagnostic \
+/persistent/tools/opensleep-diagnostic frozen-passive \
     --i2c-device /dev/i2c-1 \
     --frozen-port /dev/ttyS1 \
-    --sensor-port /dev/ttyS2 \
-    --timeout-seconds 5 \
     --reset-subsystems \
-    --sensor-first \
-    --sensor-bootloader-probe-ms 3000 \
-    --sensor-bootloader-interval-ms 100 \
-    --skip-frozen-firmware \
-    --json-output /persistent/opensleep-diagnostic-sensor-first.json \
-    --verbose \
-    2>&1 | tee /persistent/opensleep-diagnostic-sensor-first.log
+    --allow-firmware-jump \
+    --duration-seconds 15 \
+    --json-output /persistent/frozen-passive.json \
+    --csv-output /persistent/frozen-passive.csv \
+    --verbose
 ```
 
-* `--reset-subsystems` runs exactly the four fixed register writes to `0x20` documented in
-  `SAFETY.md` (mirroring `opensleep::reset::ResetController`'s existing sequence) and nothing
-  else.
-* `--sensor-first` is already the default here since `--reset-subsystems` is present; it's passed
-  explicitly for clarity. Pass `--sensor-first=false` if you specifically want the old
-  Frozen-first ordering even with a reset.
-* `--sensor-bootloader-probe-ms`/`--sensor-bootloader-interval-ms` control how long and how often
-  Sensor's bootloader baud is re-pinged immediately after reset (defaults: retry every 100ms for
-  3000ms, or until a valid response, whichever comes first).
-* `--skip-frozen-firmware` (also already the default) keeps Frozen's optional `GetFirmware` step
-  out of this run entirely, since a slow/absent response to it was previously delaying the whole
-  Frozen phase behind a timeout for no diagnostic benefit. Pass `--skip-frozen-firmware=false` if
-  you specifically want that step back.
+Expected on this hardware revision: the `0x20` reset/enable expander probe succeeds, and the
+`0x53` LED controller probe fails with ENXIO and is logged as expected/nonfatal. Review the
+printed summary (or the JSON file) for:
 
-Do **not** add `--allow-firmware-jump` to these first two runs. Only consider it, deliberately
-and separately, once you've reviewed both logs above and specifically want to test whether a
-subsystem found in its bootloader can be transitioned to firmware. Even with that flag, this tool
-never follows a firmware jump with any temperature, pump, priming, vibration, alarm, or piezo
-command — see `SAFETY.md`.
+* `frozen_bootloader_ping` / `frozen_firmware_ping` — which mode Frozen was in, and whether it
+  answered.
+* `frozen_hardware_info` — the decoded hardware info string.
+* `telemetry_samples` — every decoded temperature sample, with the solicited/unsolicited source
+  tag.
+* `overall_pass` — only `true` if application firmware responded and at least one valid telemetry
+  sample was decoded.
 
-### Reading the new Sensor bootloader-probe fields
+Do **not** proceed to step 5 until you've reviewed this output. If Frozen never reached
+application firmware, or no telemetry decoded, something more fundamental needs investigating
+first — running the cooling test is unlikely to help and is not safe to attempt yet regardless
+(see below).
 
-The text summary and JSON output (from this run) include, in addition to the fields already
-described below:
-
-| Field | Meaning |
-|---|---|
-| `Sensor tested first after reset` | Whether Sensor was probed before Frozen this run |
-| `Sensor bootloader probe duration` | The configured `--sensor-bootloader-probe-ms` window |
-| `Sensor bootloader Ping attempts` | How many `Ping`s were actually sent during that window |
-| `Sensor bootloader bytes received` | Total raw bytes read back, even if none of them decoded |
-| `Sensor bootloader valid response` | PASS if at least one frame decoded successfully (not necessarily a Pong) |
-| `Sensor bootloader decode errors` | Count of byte spans discarded while scanning for a valid frame (bad checksum, bad structure, or noise) -- distinct from simply receiving nothing |
-| `Sensor first byte latency after reset` | Time from reset release to the first byte of any kind received on the Sensor UART |
-| `Sensor first valid frame latency` | Time from reset release to the first successfully decoded Sensor frame |
-| `Sensor firmware Ping response` | PASS/FAIL for the firmware-baud attempt specifically (run after the bootloader probe, regardless of its outcome) |
-
-If `Sensor bootloader bytes received` is nonzero but `Sensor bootloader valid response` is FAIL,
-something is reaching the UART (wrong baud, noise, a different protocol) but not decoding as an
-OpenSleep Sensor frame -- worth investigating before assuming the MCU is simply absent.
-
-## Interpreting the exit code
+### Exit codes (`frozen-passive`)
 
 | Code | Meaning |
 |---|---|
-| 0 | Both Sensor and Frozen responded to Ping |
-| 10 | Frozen did not respond, Sensor did |
-| 11 | Sensor did not respond, Frozen did |
-| 12 | Neither subsystem responded |
-| 20 | I2C bus failed to open, the `0x20` reset expander did not answer, or a requested reset write failed (UART tests still ran and are reported; the missing `0x53` LED controller never causes this code) |
-| 30 | Invalid CLI arguments or a local program error (nothing was probed) |
+| 0 | Application firmware responded and at least one valid telemetry sample decoded, and safe-stop fully succeeded |
+| 10 | Frozen was detected in its bootloader and never reached application firmware |
+| 11 | Frozen did not respond at all, or telemetry never validated |
+| 20 | I2C bus failed to open |
+| 30 | Invalid CLI arguments (nothing was probed) |
+| 40 | Refused: a stock service was active, or a device was already open elsewhere |
+
+## 5. Only after reviewing valid passive telemetry: prepare for `frozen-cool-test`
+
+Do this only once you've confirmed, from step 4's output, that Frozen reaches application
+firmware and reports valid telemetry.
+
+1. Connect the hydraulic cover to the Hub.
+2. Fill the water loop per the normal Eight Sleep fill procedure.
+3. Visually check every visible fitting and hose run for leaks before proceeding.
+4. **Open a second SSH session** to the Hub and have this ready to run immediately, but do not run
+   it yet:
+   ```sh
+   /persistent/tools/opensleep-diagnostic emergency-stop
+   ```
+5. Read SAFETY.md in full if you have not already.
+
+## 6. Run a 15-second cooling test on one side
+
+```sh
+/persistent/tools/opensleep-diagnostic frozen-cool-test \
+    --side left \
+    --delta-c 1.0 \
+    --duration-seconds 15 \
+    --confirm-cover-hydraulics-connected \
+    --confirm-water-loop-filled \
+    --confirm-no-visible-leaks \
+    --confirm-active-test \
+    --json-output /persistent/frozen-cool-left.json \
+    --csv-output /persistent/frozen-cool-left.csv \
+    --verbose
+```
+
+You will be asked to type, exactly:
+
+```
+I CONFIRM THE WATER LOOP IS CONNECTED AND FILLED
+```
+
+The tool will then run preflight (reset, enter firmware, collect >= 5 baseline samples over >= 5
+seconds, validate the baseline is within 15–35C and internally consistent), print the proposed
+target, and ask for a second exact phrase:
+
+```
+START LEFT COOLING TEST
+```
+
+During the active phase, watch/listen (without touching or metering the open board) for:
+
+* Pump sound or vibration
+* Fan movement or airflow
+* Unexpected noise
+* Leaks
+* A burning smell
+
+If you observe any of the last three, press **Ctrl+C** immediately, or run `emergency-stop` from
+your second session. The tool itself also aborts automatically on: lost/stale telemetry (> 2s),
+a UART read/write failure, an implausible temperature jump, the heatsink or water-temperature
+limits being exceeded, or the (non-overridable, 30-second-max) duration expiring — and always runs
+the same safe-stop sequence regardless of why it stopped.
+
+At the end, you'll be prompted for operator observations (pump heard/felt, fan seen/heard, airflow
+felt, leak observed, unusual smell/noise, free-text notes). These are stored in the JSON report as
+`operator_observations`, kept separate from the machine-decoded `telemetry_samples` and
+`outgoing_commands`.
+
+Only test one side per invocation. Repeat with `--side right` as a separate run if desired.
+
+### Reading the result
+
+The JSON/text summary reports each component separately — never collapses them into one
+pass/fail:
+
+```
+Frozen command accepted:        PASS/FAIL/UNKNOWN
+Pump operation:                 PASS/FAIL/UNVERIFIED
+Fan operation:                  PASS/FAIL/UNVERIFIED
+TEC cooling operation:          PASS/FAIL/UNVERIFIED
+Telemetry remained valid:       PASS/FAIL
+Emergency shutdown:             PASS/FAIL
+Overall selected-side result:   PASS/FAIL/INCONCLUSIVE
+```
+
+See PROTOCOL_AUDIT.md for exactly what evidence can ever produce a PASS for each line — in
+particular, pump/fan/TEC are never marked PASS merely because the command was accepted.
+
+## Dry-run mode (safe on any development machine, no hardware needed)
+
+Every subcommand accepts `--dry-run`, which performs no I2C or UART writes at all and instead runs
+the same logic against a mocked Frozen device and a mocked I2C bus:
+
+```sh
+opensleep-diagnostic frozen-passive --dry-run --json-output /tmp/dryrun-passive.json
+opensleep-diagnostic frozen-cool-test --side left --dry-run \
+    --confirm-cover-hydraulics-connected --confirm-water-loop-filled \
+    --confirm-no-visible-leaks --confirm-active-test \
+    --json-output /tmp/dryrun-cool.json
+opensleep-diagnostic emergency-stop --dry-run
+```
+
+`frozen-cool-test --dry-run` still requires the interactive typed confirmations unless stdin is
+not a TTY (e.g. when piping input in a script or CI).
 
 ## What this tool will never do on the Pod
 
-See `SAFETY.md` for the full accounting. In short: it never loads `config.ron`, never connects to
-MQTT, never runs the Home Assistant integration, never starts a profile or temperature schedule,
-never writes to `0x53`, and never transmits a pump/heater/cooler/vibration/alarm/piezo/calibration
-command. It always exits after one pass.
+See SAFETY.md and PROTOCOL_AUDIT.md for the full accounting. In short: it never loads
+`config.ron`, never connects to MQTT, never runs the Home Assistant integration, never starts a
+profile or temperature schedule outside its own bounded active phase, never writes to `0x53`, and
+never transmits `Prime` or an arbitrary/undocumented command. It always exits after one bounded
+pass and is never installed as a service.

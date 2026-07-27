@@ -1,28 +1,40 @@
 opensleep-diagnostic — build report
 ====================================
 
-Patch revision: 2 (sensor-first post-reset bootloader retry-probe)
-Supersedes revision 1 (initial diagnostic-only fork). Same upstream base commit; only
-source.patch changed. Revision 1's artifact SHA-256 was
-0900b8667033faa7b6b10423d3460a7e489f3214389bc758bf1465342ebd4c52 (1,839,464 bytes); see git
-history for that report if needed.
+Patch revision: 3 (staged, Frozen-only diagnostic: frozen-passive / frozen-cool-test / emergency-stop)
+Supersedes revision 2 (sensor-first post-reset bootloader retry-probe) and revision 1 (initial
+diagnostic-only fork). Same upstream base commit; only source.patch changed.
 
-What changed in revision 2
+What changed in revision 3
 ---------------------------
-When --reset-subsystems is used, Sensor is now tested before Frozen by default
-(--sensor-first, tied to --reset-subsystems unless explicitly overridden), and immediately after
-the reset-expander sequence releases, Sensor's bootloader baud (38400) is probed with repeated
-Ping attempts (default: every 100ms for up to 3000ms, or until a valid response) instead of a
-single Ping several seconds later behind a Frozen-first ordering. Frozen's optional GetFirmware
-step is now skipped by default (--skip-frozen-firmware, default on) since it was previously
-delaying the whole Frozen phase behind a timeout for no diagnostic benefit; its outcome was
-already structurally incapable of invalidating a successful Frozen Ping, and still is. New CLI
-options: --sensor-first, --sensor-bootloader-probe-ms, --sensor-bootloader-interval-ms,
---skip-frozen-firmware. New summary/JSON fields covering the bootloader retry-probe's attempt
-count, bytes received, valid-frame/decode-error counts, and first-byte/first-valid-frame latency
-relative to reset release. No new command is reachable: the whitelist (Ping, GetHardwareInfo,
-GetFirmware(Hash), JumpToFirmware per subsystem) and the two-layer enforcement
-(closed probe enums + SafetyAudit) are unchanged; see SAFETY.md.
+Complete redesign from a single-pass, read-mostly Frozen+Sensor probe into a staged,
+Frozen-only diagnostic with three explicit subcommands:
+
+  opensleep-diagnostic frozen-passive
+  opensleep-diagnostic frozen-cool-test
+  opensleep-diagnostic emergency-stop
+
+The Sensor subsystem and the LED controller's write path are no longer referenced anywhere in
+this binary's source (verified at test time by main.rs's guardrail_tests, which scan this
+binary's own source files for forbidden references). `frozen-passive` never enables an actuator
+command and is safe with the cover disconnected and no water. `frozen-cool-test` intentionally
+activates exactly one cooling channel, gated behind four required --confirm-* flags and two
+exact typed confirmation phrases, hard-coded limits (max 2.0C delta, max 30s duration, 15-35C
+baseline range) that no CLI flag can override, and a shared safe-stop routine (three repeated
+disable-both-sides sends, UART flush, I2C reset assert) that runs on every exit path including
+Ctrl+C/SIGTERM/SIGHUP, timeout, communication/telemetry errors, and (via a catch_unwind boundary
+around the per-tick evaluation logic) an internal panic. `emergency-stop` is an independent,
+config/MQTT/Sensor/LED-free fast path that best-effort-disables both sides and unconditionally
+asserts the I2C reset, returning non-zero if that reset could not be confirmed.
+
+`Prime` and `Random` are structurally unreachable: the closed FrozenAction enum
+(src/bin/opensleep-diagnostic/safety.rs) has no variant for either, so this binary's own command
+type cannot represent them, independent of any runtime whitelist. See SAFETY.md and
+PROTOCOL_AUDIT.md for the full command/evidence audit.
+
+A --dry-run flag on every subcommand performs no I2C or UART writes and instead runs the same
+code paths against a mocked Frozen device and a mocked I2C bus, so the full flow (including the
+interactive confirmations) is testable on an ordinary development machine.
 
 Source
 ------
@@ -30,148 +42,63 @@ Upstream repository:        https://github.com/LiamSnow/opensleep
 Cloned branch:               main
 Pinned source commit:        29ea3f8f51d208a02b5d2691720157c7ce96c292
 Diagnostic patch:            source.patch (applied with `git apply` after `git checkout` to the
-                              pinned commit above; verified to apply cleanly with
-                              `git apply --check` against a fresh checkout of that commit)
+                              pinned commit above; verified to apply cleanly with `git apply
+                              --verbose` against a fresh git worktree of that commit, and
+                              `cargo test --locked` re-run to green in that isolated worktree
+                              before this build)
 
-Toolchain
----------
-Rust compiler (in build image): rustc 1.96.1 (31fca3adb 2026-06-26)
-Cargo (in build image):         cargo 1.96.1 (356927216 2026-06-26)
-Edition-2024 requirement (>=1.85): satisfied by the image's preinstalled toolchain; no
-                                    `rustup update` was needed or performed for this build.
-                                    (See Dockerfile comment: the pinned image tag's rustup
-                                    component metadata is out of sync with its doc-stripped
-                                    toolchain directory, which makes `rustup update stable` fail
-                                    while removing the old clippy component. The Dockerfile only
-                                    calls `rustup update` when the preinstalled rustc is actually
-                                    below 1.85, and works around that same bug if it ever does.)
+Toolchain (inside messense/rust-musl-cross:aarch64-musl builder image)
+-----------------------------------------------------------------------
+rustc/cargo: preinstalled image toolchain, satisfies the edition-2024 (>=1.85) requirement; no
+             `rustup update` was needed for this build (see Dockerfile's conditional check).
+Target:      aarch64-unknown-linux-musl
+Linker:      aarch64-unknown-linux-musl-gcc (CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER)
+RUSTFLAGS:   -C target-feature=+crt-static
+Build:       cargo build --locked --release --target aarch64-unknown-linux-musl --bin opensleep-diagnostic
+Tests:       cargo test --locked (run under the image's built-in QEMU test runner, against the
+             real aarch64-musl target -- not just the host toolchain)
 
-Docker builder image:       messense/rust-musl-cross:aarch64-musl
-Image digest (as pulled):   sha256:ecae5dd62d1c938c14f8071d36c16fa699860aace03bfb5284fb1216474d2643
-Cargo target:                aarch64-unknown-linux-musl
-Linker override:              CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-unknown-linux-musl-gcc
-                              (NOTE: this deviates from the commonly cited
-                              `aarch64-linux-musl-gcc`; that binary does not exist in this image
-                              tag — verified with `find / -iname '*aarch64-linux-musl-gcc*'`
-                              inside the container, no match. The correct binary in this image is
-                              `aarch64-unknown-linux-musl-gcc`, confirmed present under
-                              /usr/local/musl/bin/. Using the former name fails the build with
-                              "linker not found".)
-RUSTFLAGS:                    -C target-feature=+crt-static
+Test results (this build, inside the builder image)
+-----------------------------------------------------
+opensleep (lib) unit tests:               51 passed, 0 failed
+opensleep-diagnostic (bin) unit tests:    70 passed, 0 failed
+Doc-tests:                                 0 (none defined)
 
-Build host
-----------
-Host architecture:          x86_64 (Docker Engine 29.6.1, driver "docker")
-Cross-execution of the built aarch64 binaries during `cargo test` and for the ad-hoc smoke tests
-below was performed transparently via the host kernel's registered `qemu-aarch64` binfmt_misc
-handler (flags: PF) pointing at /usr/bin/qemu-aarch64-static — no `--platform` flag was used or
-needed, per the intended cross-compiler workflow.
+See TEST_RESULTS.md for the full breakdown against the safety spec's 30-item test checklist.
 
-Exact build commands
----------------------
-  docker buildx build --output type=local,dest=dist .
+Artifact validation
+--------------------
+file:      dist/opensleep-diagnostic-aarch64-static: ELF 64-bit LSB executable, ARM aarch64,
+           version 1 (SYSV), statically linked, stripped
+readelf -l: 6 program headers (LOAD x2, TLS, GNU_EH_FRAME, GNU_STACK, GNU_RELRO); no
+           PT_INTERP segment -- confirms no dynamic program interpreter, i.e. truly static.
+sha256sum: 22b611308b7e69ee42428d85666a4fb8e99d32897dd610dbce10004b16c9e1d6  opensleep-diagnostic-aarch64-static
+           (2,167,520 bytes)
+           Verified against the .sha256 file written by the same build: OK
+Smoke test: qemu-aarch64-static (user-mode emulation) was used to actually run the built ARM64
+           binary on the x86-64 build host: `--help`, `frozen-passive --dry-run`,
+           `frozen-cool-test --dry-run` (with hidden --assume-* test flags standing in for the
+           interactive phrases), and `emergency-stop --dry-run` all ran successfully and produced
+           the expected JSON reports and log output. This caught and fixed one real bug before
+           this final build: the active-phase polling loop was not pacing itself to ~1 request/
+           second against a fast-responding device (it would have flooded a real Frozen UART with
+           commands far faster than intended); a tick-pacing sleep was added and reverified both
+           by `cargo test` and by rerunning this same qemu smoke test.
 
-which, inside the builder stage, runs:
-  cargo test --locked
-  cargo build --locked --release --target aarch64-unknown-linux-musl --bin opensleep-diagnostic
+Deliverables
+------------
+opensleep-diagnostic-aarch64-static
+opensleep-diagnostic-aarch64-static.sha256
+Dockerfile
+build.sh
+source.patch
+RUN_ON_POD.md
+SAFETY.md
+PROTOCOL_AUDIT.md
+TEST_RESULTS.md
+build-report.txt
 
-Unit-test results (from `cargo test --locked`, executed under the aarch64-musl release
-cross-toolchain via the host's QEMU binfmt handler)
-------------------------------------------------------------------------------------------------
-  opensleep (lib, unmodified normal-OpenSleep tests):        51 passed; 0 failed
-  opensleep (bin "opensleep", src/main.rs, no unit tests):     0 passed; 0 failed
-  opensleep-diagnostic (bin, safety/mock-transport tests):    34 passed; 0 failed
-  opensleep (doc-tests):                                       0 passed; 0 failed
-  ------------------------------------------------------------------------------
-  Total:                                                      85 passed; 0 failed; 0 ignored
-
-  The 34 diagnostic-binary tests include 12 new to this revision, covering: the bootloader
-  retry-probe's timing/retry/stop-on-response behavior, partial-frame reassembly across reads,
-  continuing past a malformed (bad-checksum) frame, distinguishing "no bytes received" from
-  "bytes received but undecodable", first-byte/first-valid-frame latency recording, the
-  bootloader port being opened exactly once for the whole probe window, JumpToFirmware gating on
-  the new sensor-first code path specifically, Frozen's GetFirmware being skipped by default,
-  Frozen's GetFirmware timeout not invalidating an already-successful Ping, and an end-to-end
-  mocked-transport check that Sensor fully completes before Frozen starts under sensor-first
-  ordering.
-
-Artifact
---------
-Path:            target/aarch64-unknown-linux-musl/release/opensleep-diagnostic
-Exported as:      dist/opensleep-diagnostic-aarch64-static
-Size:             1,905,064 bytes
-
-`file` output:
-  dist/opensleep-diagnostic-aarch64-static: ELF 64-bit LSB executable, ARM aarch64, version 1
-  (SYSV), statically linked, stripped
-
-`readelf -l` output (no PT_INTERP / dynamic-interpreter segment present — confirms static
-linking, not merely inferred from the target triple):
-  Elf file type is EXEC (Executable file)
-  Entry point 0x40f7c8
-  There are 6 program headers, starting at offset 64
-
-  Program Headers:
-    Type           Offset             VirtAddr           PhysAddr
-                   FileSiz            MemSiz              Flags  Align
-    LOAD           0x0000000000000000 0x0000000000400000 0x0000000000400000
-                   0x00000000001b83c0 0x00000000001b83c0  R E    0x10000
-    LOAD           0x00000000001c3e38 0x00000000005c3e38 0x00000000005c3e38
-                   0x000000000000ce18 0x000000000000e600  RW     0x10000
-    TLS            0x00000000001c3e38 0x00000000005c3e38 0x00000000005c3e38
-                   0x0000000000000090 0x0000000000000128  R      0x8
-    GNU_EH_FRAME   0x00000000001813e0 0x00000000005813e0 0x00000000005813e0
-                   0x0000000000004f54 0x0000000000004f54  R      0x4
-    GNU_STACK      0x0000000000000000 0x0000000000000000 0x0000000000000000
-                   0x0000000000000000 0x0000000000000000  RW     0x10
-    GNU_RELRO      0x00000000001c3e38 0x00000000005c3e38 0x00000000005c3e38
-                   0x000000000000c1c8 0x000000000000c1c8  R      0x1
-
-   Section to Segment mapping:
-    Segment Sections...
-     00     .init .text .fini .rodata .eh_frame_hdr .eh_frame .gcc_except_table
-     01     .tdata .init_array .fini_array .data.rel.ro .got .data .bss
-     02     .tdata .tbss
-     03     .eh_frame_hdr
-     04
-     05     .tdata .init_array .fini_array .data.rel.ro .got
-
-  (No "Requesting program interpreter" line and no INTERP segment type appear anywhere in the
-  above — this is what confirms static linking, per the acceptance criteria; the target triple
-  name alone is not treated as sufficient evidence.)
-
-SHA-256:
-  6b429724a9e0a1af3fa9265e4f70638d1a9942e2a2ce94b5810e08a4b9698c9b  opensleep-diagnostic-aarch64-static
-
-`sha256sum -c` against the shipped .sha256 file: OK
-
-Runtime smoke test
--------------------
-The exported dist/opensleep-diagnostic-aarch64-static was additionally executed directly on the
-x86_64 build host (via the same transparent QEMU binfmt path described above) as a sanity check
-independent of the build container:
-  - `--help` lists the four new options (--sensor-first, --sensor-bootloader-probe-ms,
-    --sensor-bootloader-interval-ms, --skip-frozen-firmware) alongside the unchanged prior set;
-    still no temperature, pump, priming, vibration, alarm, raw-command, or profile option exists.
-  - `--sensor-first --sensor-bootloader-probe-ms 100 --sensor-bootloader-interval-ms 30
-    --timeout-seconds 1` (no --reset-subsystems) runs the sensor-first path on demand, correctly
-    reports "Sensor tested first after reset: YES" and the new bootloader-probe summary fields
-    (all zero/unavailable here since this host's /dev/ttyS2 isn't a real Sensor MCU), and exits
-    20 (I2C open failure on this non-Pod host takes precedence, as designed).
-  - `--reset-subsystems --sensor-first=false` correctly reports "Sensor tested first after
-    reset: NO", confirming the explicit-override path works, not just the tied-to-reset default.
-  - `--skip-frozen-firmware=false` correctly flips the logged "Frozen GetFirmware requested"
-    line to true, confirming the backward-compatibility override works.
-  - `Arch:` in the startup log correctly reports `aarch64` (read from the running binary's own
-    target, not the host), confirming this is genuinely the cross-compiled artifact.
-
-Local (non-Docker) validation performed during development
-------------------------------------------------------------
-Before the Docker cross-build, the same source tree was also built and tested natively on the
-build host (x86_64, rustc/cargo 1.96.0) as a fast development loop:
-  cargo build --bin opensleep   (unmodified normal OpenSleep binary; builds and behaves
-                                  identically to before this fork — same 51 lib tests pass)
-  cargo test                    (85 tests passed: 51 lib + 34 diagnostic, 0 failed)
-  cargo clippy --bin opensleep-diagnostic --all-targets
-                                 (0 warnings in new/changed code; 3 pre-existing warnings in
-                                  unmodified upstream files, not touched by this fork)
+No separate opensleep-emergency-stop-aarch64-static binary was built: `emergency-stop` is a
+subcommand of the single opensleep-diagnostic binary above (see SAFETY.md/RUN_ON_POD.md for why
+this satisfies the same "independent, config/MQTT/Sensor/LED-free fast path" requirement without
+a second build target).
