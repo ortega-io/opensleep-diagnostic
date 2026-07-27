@@ -13,9 +13,23 @@ Three subcommands:
 
 ## 1. Copy the binary to the Pod
 
+From your build host:
+
 ```sh
 scp dist/opensleep-diagnostic-aarch64-static \
     root@POD_IP:/persistent/tools/opensleep-diagnostic
+```
+
+Or, if the Hub has outbound network access, download it directly from the GitHub Release instead
+of scp'ing from a build host (keep the filename matching the `.sha256` file until after
+verification, then move it into place):
+
+```sh
+cd /tmp
+curl -L -O https://github.com/ortega-io/opensleep-diagnostic/releases/download/diagnostic-v3/opensleep-diagnostic-aarch64-static
+curl -L -O https://github.com/ortega-io/opensleep-diagnostic/releases/download/diagnostic-v3/opensleep-diagnostic-aarch64-static.sha256
+sha256sum -c opensleep-diagnostic-aarch64-static.sha256
+mv opensleep-diagnostic-aarch64-static /persistent/tools/opensleep-diagnostic
 ```
 
 ## 2. Make it executable and sanity-check it on-device
