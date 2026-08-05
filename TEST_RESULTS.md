@@ -1,13 +1,68 @@
 # TEST_RESULTS.md — opensleep-diagnostic
 
-All 145 unit/integration tests in `src/bin/opensleep-diagnostic/` pass (up from 142; see the
+All 158 unit/integration tests in `src/bin/opensleep-diagnostic/` pass (up from 145; see the
 revision note directly below), plus the 51 pre-existing `opensleep` library tests (unmodified,
-reused as-is) and 0 doc-tests — 196 total, 0 failed. Verified inside the
+reused as-is) and 0 doc-tests — 209 total, 0 failed. Verified inside the
 `messense/rust-musl-cross:aarch64-musl` builder image via `cargo test --locked` under its built-in
 QEMU aarch64 runner (the same environment the release binary is built in) as part of the
-diagnostic-v8 release build -- see `build-report.txt`. (The first build attempt at this revision
-failed its own QEMU test run over two self-matching guardrail tests, described in the revision note
-below; the fix is included in these final counts.)
+diagnostic-v9 release build -- see `build-report.txt`. This revision's build succeeded on the first
+attempt.
+
+## Revision note: add `--release-frozen-only`, a minimal Frozen release with no global reset
+
+`frozen-prime-opensleep-init` gained a `--release-frozen-only` flag, replacing both the full
+upstream reset (`opensleep::reset::ResetController`) and the earlier `--preserve-boot-state` flag
+(removed in revision 7) with a third, narrower startup mode. Real hardware evidence: the full reset
+does release Frozen, but it also reconfigures I2C expander (`0x20`) registers `0x06`/`0x07` and
+leaves the reservoir-fill indicator off and unresponsive afterward. Tracing the reset sequence's
+four writes showed only the last one -- register `0x02` from `0xFF` to `0xFD` -- actually releases
+Frozen; `0x06`/`0x07` are never involved in that release at all.
+
+`i2c::release_frozen_reset_bit_only`/`assert_frozen_reset_bit_only` implement a narrow,
+read-modify-write single-bit operation instead: `released = original & !0x02` /
+`asserted = current | 0x02`, both computed from a fresh register read (never a hardcoded constant),
+verified via a readback, with the run aborting before ever opening the Frozen UART if the readback
+doesn't match or if any bit other than bit 1 differs from the original.
+
+**13 new tests** (158 total, up from 145):
+
+* 5 in `i2c.rs` (`i2c::tests`): `release_frozen_reset_bit_only_clears_exactly_bit_1_and_nothing_else`
+  and `assert_frozen_reset_bit_only_sets_exactly_bit_1_and_nothing_else` each sweep all 256 possible
+  original register values, asserting bit 1 is the only bit that ever changes;
+  `release_frozen_reset_bit_only_never_writes_registers_0x06_or_0x07` and
+  `assert_frozen_reset_bit_only_never_writes_registers_0x06_or_0x07` directly satisfy the requirement
+  that these operations never write those two registers, by inspecting the mock transport's full
+  write log; `release_frozen_reset_bit_only_detects_readback_mismatch` uses a thin wrapper `I2cPort`
+  that returns a stale value on readback, proving the mismatch-detection path is actually reachable
+  and not just theoretical.
+* 8 in `prime_opensleep_init.rs` (`prime_opensleep_init::tests::release_frozen_only`):
+  `dry_run_end_to_end_succeeds_via_the_public_entry_point` (full happy path through the public `run()`
+  entry point, including the register-0x02 release, Ping/Pong(true), `Prime`, and `"[priming] done"`);
+  `dry_run_refuses_without_the_reservoir_phrase`; `full_run_never_writes_registers_0x06_or_0x07_and_changes_only_bit_1`
+  (an end-to-end complement to the `i2c.rs` unit tests, asserting the *entire* mock I2C write log for a
+  full run is exactly the one register-0x02 release write -- no restore write on normal completion, no
+  emergency write since no fault occurred); `distinguishes_done_from_done_because_empty`;
+  `refuses_prime_when_capwater_is_unavailable_after_release` (also checks
+  `reservoir_sensor_operational_after_release` is reported `false`);
+  `jumps_to_firmware_when_frozen_answers_from_the_bootloader` (`Pong(false)` -> `JumpToFirmware` ->
+  `Pong(true)`); `aborts_before_opening_frozen_when_the_i2c_read_fails` (confirms the Frozen UART is
+  never opened/pinged if the I2C release itself fails); and
+  `reservoir_phrase_is_required_even_after_reaching_firmware`.
+
+A new proactive mock Frozen device, `mock::spawn_mock_frozen_device_release_only`, was added for
+these tests (and for `--release-frozen-only --dry-run` in production): unlike the existing shared
+`mock::spawn_mock_frozen_device` (which paces its priming-completion push across several
+`GetTemperatures` polls, tuned for `frozen-prime-test`'s tick-based active loop), this device pushes
+every message on its own short timer with no polling required at all -- matching both real Frozen
+firmware (which pushes over UART on its own schedule) and `--release-frozen-only`'s own flow, which
+never sends `GetTemperatures`.
+
+`main.rs`'s `frozen_action_prime_is_referenced_only_in_safety_and_prime_test` guardrail test was
+updated: `FrozenAction::Prime`/`FrozenAction::prime()` may now appear in `prime_opensleep_init.rs`
+(this mode's own `Mode::PrimeTest`-based `Prime` send) in addition to `safety.rs` and
+`prime_test.rs`. Smoke-tested against the real cross-compiled binary via qemu-aarch64-static -- see
+`build-report.txt` for the full account, including the reservoir-phrase-mismatch refusal path
+(`exit_code: 30`).
 
 ## Revision note: fix Frozen/Sensor UART paths for this Hub variant
 

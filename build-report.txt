@@ -1,12 +1,67 @@
 opensleep-diagnostic — build report
 ====================================
 
-Patch revision: 8 (fixes Frozen/Sensor UART paths for this Hub variant)
-Supersedes revision 7 (replaced --preserve-boot-state with frozen-prime-opensleep-init), revision 6
-(added --preserve-boot-state to frozen-prime-test, now removed), revision 5 (added
-frozen-prime-test), revision 4 (corrected active-test preflight/monitoring), revision 3 (staged,
-Frozen-only diagnostic redesign), revision 2 (sensor-first post-reset bootloader retry-probe), and
-revision 1 (initial diagnostic-only fork). Same upstream base commit; only source.patch changed.
+Patch revision: 9 (adds --release-frozen-only: minimal Frozen release, no global reset)
+Supersedes revision 8 (fixed Frozen/Sensor UART paths for this Hub variant), revision 7 (replaced
+--preserve-boot-state with frozen-prime-opensleep-init), revision 6 (added --preserve-boot-state to
+frozen-prime-test, now removed), revision 5 (added frozen-prime-test), revision 4 (corrected
+active-test preflight/monitoring), revision 3 (staged, Frozen-only diagnostic redesign), revision 2
+(sensor-first post-reset bootloader retry-probe), and revision 1 (initial diagnostic-only fork).
+Same upstream base commit; only source.patch changed.
+
+What changed in revision 9
+---------------------------
+Added `--release-frozen-only` to `frozen-prime-opensleep-init`, replacing both the global upstream
+reset (`opensleep::reset::ResetController`, revision 7/8's approach) and the earlier
+`--preserve-boot-state` flag (removed in revision 7) with a third, narrower startup mode. Real
+hardware evidence drove this: after a normal boot the reservoir-fill indicator works but Frozen
+doesn't answer `Ping`; running the full reset sequence does release Frozen, but also turns the
+reservoir indicator off and leaves it unresponsive -- firmware then reports `[fdc1004] failed to
+write config` and `[capwater] sensor unavailable`. Tracing which single write in the four-register
+reset sequence actually releases Frozen showed it is the last one, which changes I2C expander
+(`0x20`) register `0x02` from `0xFF` to `0xFD` -- clearing bit 1 and nothing else; registers `0x06`
+and `0x07` (port direction/config) are never involved in releasing Frozen, and are suspected to be
+what disturbs the reservoir indicator.
+
+  - New `i2c::release_frozen_reset_bit_only`/`assert_frozen_reset_bit_only`: narrow,
+    read-modify-write single-bit operations (`released = original & !0x02` /
+    `asserted = current | 0x02`) that read register `0x02` back and report whether the readback
+    matched and whether any bit other than bit 1 changed -- the run aborts before ever opening the
+    Frozen UART if either check fails. Neither function writes registers `0x06`/`0x07` under any
+    circumstances (proved by 5 new `i2c.rs` unit tests, including one sweeping every possible
+    original register value and one using a stale-readback mock transport to prove the mismatch
+    path is actually reachable).
+  - This mode drives Frozen through this binary's own audited `FrozenLink`/`AuditedTransport`
+    (`Mode::PrimeTest` -- the same runtime mode `frozen-prime-test` uses), not the real upstream
+    scheduler plain `frozen-prime-opensleep-init` uses -- so `Prime` remains reachable through
+    `AuditedTransport` in exactly one runtime mode, now reached from two call sites instead of one.
+    `main.rs`'s `frozen_action_prime_is_referenced_only_in_safety_and_prime_test` guardrail was
+    updated to permit `prime_opensleep_init.rs` as the second permitted file.
+  - A third, required typed confirmation phrase (`RESERVOIR INDICATOR IS STILL WORKING`) is asked
+    immediately before `Prime` -- after Frozen has reached firmware and startup messages have been
+    observed, not at the start of the run like the other two phrases.
+  - `Prime` is only sent if `[capwater] sensor unavailable` was not observed after release; the new
+    `reservoir_sensor_operational_after_release` report field records the inverse of that
+    observation directly, since capwater is exactly the sensor behind the reservoir indicator.
+  - On normal completion (`"done"` or `"done because empty"`), this mode performs no I2C write at
+    all on exit -- unlike plain `frozen-prime-opensleep-init`, which still performs an emergency
+    reset write on a pump fault using the shared, hardcoded-0xFF `assert_reset`, this mode's own
+    emergency path (`assert_release_only_emergency_reset`) uses the same narrow, bit-1-only
+    read-modify-write as the release itself.
+  - `--dry-run --release-frozen-only` runs end to end against a mocked I2C expander and a new
+    proactive mock Frozen device (`mock::spawn_mock_frozen_device_release_only`) that pushes
+    priming-completion messages on its own short timer rather than piggybacked on
+    `GetTemperatures` polls (the existing shared mock's design, built for `frozen-prime-test`'s
+    tick-based active loop) -- because this mode never polls `GetTemperatures` at all, matching
+    real Frozen firmware's own unsolicited push behavior over UART.
+  - 13 new tests (158 total in this directory, up from 145): 5 in `i2c.rs`, 8 in
+    `prime_opensleep_init.rs::tests::release_frozen_only` (dry-run end-to-end via the public `run()`
+    entry point, the reservoir-phrase requirement, the bootloader-to-firmware jump path, the
+    capwater-unavailable refusal, the done-vs-done-because-empty distinction, the I2C-read-failure
+    abort path, and a full-run assertion that only register `0x02` is ever written and only its bit
+    1 ever changes). Smoke-tested against the actual cross-compiled binary via qemu-aarch64-static:
+    `--help` output, a full dry-run to `"[priming] done"` with JSON output verified field-by-field,
+    and the reservoir-phrase-mismatch refusal path (exit code 30).
 
 The first attempt at this revision's build failed its own QEMU test run: two new tests
 (`obsolete_devkit_uart_paths_are_never_hardcoded_anywhere` and
@@ -264,13 +319,10 @@ Tests:       cargo test --locked (run under the image's built-in QEMU test runne
 Test results (this build, inside the builder image)
 -----------------------------------------------------
 opensleep (lib) unit tests:               51 passed, 0 failed
-opensleep-diagnostic (bin) unit tests:    145 passed, 0 failed
+opensleep-diagnostic (bin) unit tests:    158 passed, 0 failed
 Doc-tests:                                 0 (none defined)
 
-This revision's first build attempt failed its own QEMU test run (two self-matching guardrail
-tests -- see "What changed in revision 8" above); the fix was verified locally (both fixed tests
-plus the full `prime_opensleep_init::`/`guardrail_tests::` modules, 17 tests) before this
-successful rebuild.
+This revision's build succeeded on the first attempt.
 
 See TEST_RESULTS.md for the full breakdown against the safety spec's checklists (30-item for the
 original redesign, 28-item for frozen-prime-test), plus the "New tests added" sections for each
@@ -282,27 +334,30 @@ file:      dist/opensleep-diagnostic-aarch64-static: ELF 64-bit LSB executable, 
            version 1 (SYSV), statically linked, stripped
 readelf -l: 6 program headers (LOAD x2, TLS, GNU_EH_FRAME, GNU_STACK, GNU_RELRO); no
            PT_INTERP segment -- confirms no dynamic program interpreter, i.e. truly static.
-sha256sum: 79a6a2c7b2819bb2d15d3b582fcc480224458f8e241082bcd8bcf9216c466692  opensleep-diagnostic-aarch64-static
-           (2,430,184 bytes)
+sha256sum: 2ed12183fe93843668e752e97792ac2873cd904832806d48499b6e5db5c7c5ec  opensleep-diagnostic-aarch64-static
+           (2,495,752 bytes)
            Verified against the .sha256 file written by the same build: OK
+readelf -l (this build): 6 program headers (LOAD x2, TLS, GNU_EH_FRAME, GNU_STACK, GNU_RELRO); no
+           PT_INTERP segment -- confirms no dynamic program interpreter, i.e. truly static.
 Smoke test: qemu-aarch64-static (user-mode emulation) was used to actually run the built ARM64
-           binary on the x86-64 build host: `--help` (confirms `frozen-prime-opensleep-init` is
-           still spelled correctly), `frozen-prime-opensleep-init --help`,
-           `frozen-prime-opensleep-init --dry-run` (with `--json-output`: confirmed `exit_code: 0`
-           and that the file was written), `frozen-passive --dry-run`, `frozen-prime-test
-           --dry-run`, and `emergency-stop --dry-run` all ran successfully (hidden --assume-* test
-           flags or a non-TTY stdin stood in for the interactive phrases) and produced the expected
-           JSON reports and log output, with no regressions in the four subcommands this revision
-           did not otherwise change.
+           binary on the x86-64 build host: `--help` and `frozen-prime-opensleep-init --help`
+           (confirms `--release-frozen-only` is present with its full help text);
+           `frozen-prime-opensleep-init --release-frozen-only --dry-run` with `--json-output` ran
+           end to end against the mocked I2C expander and the new proactive mock Frozen device,
+           through register-0x02 release (`0xFF -> 0xFD`, readback verified), Ping/Pong(true),
+           `Prime`, and `"[priming] done"`, with `exit_code: 0` and every
+           `release_frozen_only_results` JSON field checked by hand against expected values; the
+           reservoir-phrase-mismatch refusal path was also exercised and correctly returned
+           `exit_code: 30` with `prime_sent: false`. No regressions observed in the other
+           subcommands (unchanged by this revision).
 
-           KNOWN COSMETIC GAP (not a correctness issue): in `--dry-run`'s JSON output, the
-           top-level `frozen_port` field correctly reports `/dev/ttyS1`, but the nested
+           KNOWN COSMETIC GAP (carried over from revision 8, not a correctness issue): in plain
+           `frozen-prime-opensleep-init --dry-run`'s JSON output (without `--release-frozen-only`),
+           the top-level `frozen_port` field correctly reports `/dev/ttyS1`, but the nested
            `opensleep_init_results.frozen_uart_requested` field is empty (`dry_run_report` builds
-           `OpenSleepInitResults` via `::default()` without populating it, since dry-run never
-           reaches the code that would set it from the real, non-dry-run path). Does not affect the
-           real (non-dry-run) path, which was the actual subject of this revision's fix. Left
-           unfixed to avoid a fourth rebuild cycle for a cosmetic-only field; note this for a future
-           revision.
+           `OpenSleepInitResults` via `::default()` without populating it). Does not affect
+           `--release-frozen-only`'s own `--dry-run`, which populates its result block fully (see
+           smoke test above), nor either mode's real (non-dry-run) path.
 
 Deliverables
 ------------
