@@ -108,6 +108,66 @@ behavior rather than this binary's own reimplemented transport — e.g. after `f
 reports `[capwater]`/`[flowrate]` unavailable and you want to rule out that reimplementation as the
 cause.
 
+### `--release-frozen-only`: minimal startup, no global reset
+
+`frozen-prime-opensleep-init --release-frozen-only` is a third, even narrower safety model. It
+**replaces both** the full upstream reset (`opensleep::reset::ResetController`, used by
+`frozen-prime-opensleep-init` above) **and** the earlier `--preserve-boot-state` flag (removed).
+Real hardware evidence drove this: after a normal boot, the reservoir-fill indicator works but
+Frozen doesn't answer `Ping`; running the full reset sequence *does* release Frozen (it answers
+`Ping` afterward), but it also turns the reservoir indicator off and leaves it unresponsive —
+firmware then reports `[fdc1004] failed to write config` and `[capwater] sensor unavailable`. The
+full reset sequence writes four I2C registers on the `0x20` expander (`0x06`, `0x07`, then `0x02`
+twice); tracing which single write actually releases Frozen showed it is the *last* one, which
+changes register `0x02` from `0xFF` to `0xFD` — clearing bit 1 and nothing else. Registers `0x06`
+and `0x07` (port direction/config) are never involved in releasing Frozen at all; changing them is
+suspected to be what disturbs the reservoir indicator.
+
+**What this mode does, in order:**
+
+1. Opens `/dev/i2c-1` and reads the PCAL6416A (`0x20`) register `0x02` — never registers `0x06` or
+   `0x07`, and never `opensleep::reset::ResetController`.
+2. Computes `released = original & !0x02` (clears bit 1, preserves every other bit exactly as
+   read) and writes it back, then reads register `0x02` again to verify. Original, released,
+   changed-bit mask, and the readback are all logged. **If the readback doesn't match what was
+   written, or if any bit other than bit 1 differs from the original, the run aborts before ever
+   touching the Frozen UART.**
+3. After a brief settle, opens Frozen on `/dev/ttyS1` at 38400 baud and sends `Ping`. `Pong(false)`
+   (bootloader) is followed by `JumpToFirmware` and re-Pinging until `Pong(true)`; `Pong(true)`
+   directly means firmware was already running. If Frozen never reaches firmware, the run aborts.
+4. Observes startup messages for a few seconds. **If `[capwater] sensor unavailable` is observed,
+   `Prime` is never sent** — same rule as the mode above, and the report's
+   `reservoir_sensor_operational_after_release` field records whether the indicator this mode
+   exists to protect actually stayed working.
+5. Requires typing `RESERVOIR INDICATOR IS STILL WORKING` — a **third** confirmation phrase,
+   distinct from the two `frozen-prime-opensleep-init` already requires, asked immediately before
+   `Prime` (not at the start of the run) — before sending `Prime`.
+6. Sends `Prime` exactly once, through this binary's own audited `FrozenLink`/`AuditedTransport`
+   (`Mode::PrimeTest` — the same runtime mode `frozen-prime-test` uses, not the real upstream
+   scheduler this file's `frozen-prime-opensleep-init` section above uses). Distinguishes
+   `"[priming] done"` from `"[priming] done because empty"` exactly as every other priming mode
+   does, over the firmware's up-to-600000ms observation window.
+7. **On normal completion (or "done because empty"), performs no I2C write at all** — it does not
+   restore register `0x02`, does not re-run any reset, and does not touch the port in any way.
+   Frozen is left released and running.
+8. **The only exception:** a genuine firmware-reported pump fault re-asserts *only* bit 1 of
+   register `0x02` via another narrow read-modify-write (`asserted = current | 0x02`, preserving
+   every other bit) — never the four-register full reset, and never registers `0x06`/`0x07`.
+
+Because this mode uses this binary's own `AuditedTransport` (unlike the rest of
+`frozen-prime-opensleep-init`, which never touches it — see "Command whitelist" below), `Prime` is
+still reachable at most once per run, enforced at the transport layer exactly as in
+`frozen-prime-test`. Everything else about the section above still applies unless contradicted
+here: the same five `--confirm-*` flags and the same two typed confirmation phrases are required
+first (this mode's own reservoir phrase is a fourth check, on top of those, not a replacement for
+them); the firmware priming window and the exact-match done/done-because-empty distinction are
+unchanged.
+
+`--dry-run --release-frozen-only` *can* run end to end against a mocked I2C expander and a mocked
+Frozen device (unlike plain `frozen-prime-opensleep-init --dry-run`, which only validates
+confirmations/arguments) — because, unlike the rest of this mode's sibling above, it never calls
+into code that hardcodes real serial ports or I2C devices.
+
 ## Hazards specific to this hardware
 
 * The Hub's case may contain energized areas once the cover is connected and a cooling channel or
@@ -116,16 +176,20 @@ cause.
 * Keep a way to physically disconnect Hub power available at all times during an active test —
   don't rely on software alone.
 * **This binary's own audited command whitelist (`safety::AuditedTransport`) permits `Prime` in
-  exactly one mode: `frozen-prime-test`.** It cannot be constructed, whitelisted, or transmitted
-  from `frozen-passive`, `frozen-cool-test`, or `emergency-stop`, under any flag combination — see
-  PROTOCOL_AUDIT.md for the structural proof (a closed `FrozenAction` enum gated by the runtime
-  whitelist, plus an opcode backstop). Within `frozen-prime-test` itself, `Prime` can be sent at
-  most once per invocation; a second attempt is refused at the transport layer, not merely avoided
-  by this binary's own control flow. `frozen-prime-opensleep-init` reaches `Prime` through a
-  structurally separate path that never touches `AuditedTransport` at all: it steers the real
-  upstream Frozen scheduler (by constructing an in-memory configuration) into sending its own,
-  real `FrozenCommand::Prime` -- this binary never constructs or transmits that command itself in
-  that mode. See its own section above and `prime_opensleep_init.rs`'s module docs.
+  exactly one runtime mode: `Mode::PrimeTest`.** It cannot be constructed, whitelisted, or
+  transmitted from `frozen-passive`, `frozen-cool-test`, or `emergency-stop`, under any flag
+  combination — see PROTOCOL_AUDIT.md for the structural proof (a closed `FrozenAction` enum gated
+  by the runtime whitelist, plus an opcode backstop). Two call sites construct `Mode::PrimeTest`:
+  the `frozen-prime-test` subcommand, and `frozen-prime-opensleep-init --release-frozen-only`
+  (source-level guardrail: `FrozenAction::Prime`/`FrozenAction::prime()` may only appear in
+  `safety.rs`, `prime_test.rs`, or `prime_opensleep_init.rs`). At either call site, `Prime` can be
+  sent at most once per invocation; a second attempt is refused at the transport layer, not merely
+  avoided by this binary's own control flow. Plain `frozen-prime-opensleep-init` (without
+  `--release-frozen-only`) reaches `Prime` through a structurally separate path that never touches
+  `AuditedTransport` at all: it steers the real upstream Frozen scheduler (by constructing an
+  in-memory configuration) into sending its own, real `FrozenCommand::Prime` -- this binary never
+  constructs or transmits that command itself in that mode. See its own section above,
+  `--release-frozen-only`'s own section above, and `prime_opensleep_init.rs`'s module docs.
 * `Random` is never reachable in any mode: this binary's own command type cannot represent it.
 * Test **only one side per invocation** in `frozen-cool-test`. `frozen-cool-test --side left` can
   never also enable `right` in the same run — see "Command whitelist" below. `Prime` itself has no
@@ -137,26 +201,28 @@ cause.
 ## Command whitelist — the complete list of commands this binary's audited transport can ever send
 
 Every outgoing Frozen command sent by `frozen-passive`, `frozen-cool-test`, `frozen-prime-test`,
-and `emergency-stop` passes through `safety::AuditedTransport::check`, which enforces a fixed
-per-mode whitelist (see `src/bin/opensleep-diagnostic/safety.rs`). `frozen-prime-opensleep-init` is
-the one exception -- it never uses `AuditedTransport` at all; see its own section above for what
-governs it instead. The full command, opcode, and evidence table for the audited modes is in
-`PROTOCOL_AUDIT.md`; in summary:
+`frozen-prime-opensleep-init --release-frozen-only`, and `emergency-stop` passes through
+`safety::AuditedTransport::check`, which enforces a fixed per-mode whitelist (see
+`src/bin/opensleep-diagnostic/safety.rs`). Plain `frozen-prime-opensleep-init` (without
+`--release-frozen-only`) is the one exception -- it never uses `AuditedTransport` at all; see its
+own section above for what governs it instead. The full command, opcode, and evidence table for
+the audited modes is in `PROTOCOL_AUDIT.md`; in summary:
 
 | Mode | Permitted commands |
 |---|---|
 | `frozen-passive` | `Ping`, `GetHardwareInfo`, `GetFirmware`, `JumpToFirmware`, `GetTemperatures`, `SetTargetTemperature(enabled=false)` for either side |
 | `frozen-cool-test` | everything `frozen-passive` permits, **plus** `SetTargetTemperature(enabled=true)` for exactly the one side selected at the CLI (fixed for the whole run; the other side can only ever be sent `enabled=false`) |
-| `frozen-prime-test` | everything `frozen-passive` permits, **plus** `Prime`, at most once per run |
+| `frozen-prime-test`, `--release-frozen-only` (both run as `Mode::PrimeTest`) | everything `frozen-passive` permits, **plus** `Prime`, at most once per run |
 | `emergency-stop` | `SetTargetTemperature(enabled=false)` for LEFT and RIGHT, and the `0x20` reset-assert write only |
 
-**Never reachable through `AuditedTransport`, in any of the four audited modes:** `Random(_)`, any
+**Never reachable through `AuditedTransport`, in any of the five audited modes:** `Random(_)`, any
 raw/undocumented opcode, an absolute (non-derived) temperature target, or a simultaneously-enabled
 left+right target.
-**`Prime` (`0x52`)** is reachable through `AuditedTransport` in exactly one mode
-(`frozen-prime-test`, at most once per run) — never in `frozen-passive`, `frozen-cool-test`, or
-`emergency-stop`. This is enforced structurally in two independent layers (a closed `FrozenAction`
-enum, plus the runtime whitelist gate with its own at-most-once check for `Prime`), not by
+**`Prime` (`0x52`)** is reachable through `AuditedTransport` in exactly one runtime mode
+(`Mode::PrimeTest`, constructed by `frozen-prime-test` and by `--release-frozen-only`, at most once
+per run either way) — never in `frozen-passive`, `frozen-cool-test`, or `emergency-stop`. This is
+enforced structurally in two independent layers (a closed `FrozenAction` enum, plus the runtime
+whitelist gate with its own at-most-once check for `Prime`), not by
 convention — see `safety::tests` and
 PROTOCOL_AUDIT.md.
 

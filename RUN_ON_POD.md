@@ -13,7 +13,9 @@ Five subcommands:
   SAFETY.md before running this.**
 * `opensleep-diagnostic frozen-prime-opensleep-init` — the same Prime-once operation, but through
   the real, unmodified upstream OpenSleep initialization and Frozen manager code instead. **Read
-  SAFETY.md before running this.**
+  SAFETY.md before running this.** Add `--release-frozen-only` for a third, narrower startup mode
+  that releases Frozen from reset with a single-bit I2C write instead of the full upstream reset
+  sequence — see that flag's own section below and in SAFETY.md.
 * `opensleep-diagnostic frozen-cool-test` — intentionally activates one cooling channel; requires
   a connected, *already-filled* hydraulic loop and multiple explicit confirmations. **Read
   SAFETY.md before running this.**
@@ -291,6 +293,74 @@ before touching I2C at all -- if `/dev/ttyS1` does not exist.
 `--dry-run` modes, it cannot run the real upstream code against a mock, because that code hardcodes
 real serial ports and I2C devices and has no mock transport to substitute one into.
 
+### `--release-frozen-only`: minimal startup, no global reset
+
+Add `--release-frozen-only` to `frozen-prime-opensleep-init` when you specifically want to release
+Frozen from reset **without** running the full upstream I2C reset sequence and **without** the
+earlier `--preserve-boot-state` flag (removed; this flag replaces it). Real hardware evidence: the
+full reset does release Frozen, but it also reconfigures I2C expander registers `0x06`/`0x07` and
+leaves the reservoir-fill indicator off and unresponsive afterward. This mode instead flips only
+bit 1 of register `0x02` (`released = original & !0x02`), verifies the readback, and never touches
+`0x06`/`0x07` at all. **Read the `--release-frozen-only` section of SAFETY.md before using this —
+it is a third, narrower safety model, not a relaxed one.**
+
+```sh
+/persistent/tools/opensleep-diagnostic frozen-prime-opensleep-init \
+    --release-frozen-only \
+    --confirm-cover-hydraulics-connected \
+    --confirm-reservoir-filled \
+    --confirm-cover-loop-needs-priming \
+    --confirm-no-visible-leaks \
+    --confirm-active-test \
+    --json-output /persistent/frozen-release-frozen-only.json \
+    --verbose
+```
+
+You'll be prompted for the same two typed phrases as plain `frozen-prime-opensleep-init`, and then
+— immediately before `Prime` is sent, once Frozen has reached application firmware and startup
+messages have been observed — a **third** phrase:
+
+```
+Type RESERVOIR INDICATOR IS STILL WORKING to continue:
+```
+
+Only type this if the reservoir-fill indicator is genuinely still responding after Frozen was
+released. This mode's own report includes a
+`reservoir_sensor_operational_after_release` field recording what was actually observed.
+
+* On normal completion (`"done"` or `"done because empty"`), this mode performs **no I2C write at
+  all** on exit — it does not restore register `0x02` and does not run any reset. Frozen is left
+  released and running. If priming does not visibly stop, reboot the Hub or disconnect Hub power.
+* The only exception is a genuine firmware-reported pump fault, which re-asserts bit 1 of register
+  `0x02` only (never the full four-register reset, never `0x06`/`0x07`).
+* Unlike plain `frozen-prime-opensleep-init --dry-run` above, `--release-frozen-only --dry-run`
+  *can* run end to end against a mocked I2C expander and a mocked Frozen device — it never calls
+  into code that hardcodes real serial ports or I2C devices:
+
+  ```sh
+  opensleep-diagnostic frozen-prime-opensleep-init --release-frozen-only --dry-run \
+      --confirm-cover-hydraulics-connected --confirm-reservoir-filled \
+      --confirm-cover-loop-needs-priming --confirm-no-visible-leaks --confirm-active-test \
+      --json-output /tmp/dryrun-release-frozen-only.json
+  ```
+
+* The printed/JSON summary reports its own result block instead of `opensleep_init_results`:
+
+  ```
+  Register 0x02: original=0b11111111 released=0b11111101 changed_mask=0b00000010 readback=0b11111101
+  Readback matches / only bit 1 changed: true/true
+  Frozen UART opened:              true/false
+  Frozen reached firmware:         true/false
+  [capwater] unavailable observed: true/false
+  [flowrate] unavailable observed: true/false
+  Reservoir sensor operational after release: true/false
+  Prime outcome:                   success / incomplete (done because empty) / not observed within window / not sent
+  Prime sent:                      true/false
+  Normal done observed:            true/false
+  Done because empty observed:     true/false
+  Emergency reset asserted:        true/false
+  ```
+
 ## 7. Once the loop is confirmed filled: run a 10-second cooling test on one side
 
 Only proceed here once you've confirmed water movement and a stable reservoir level from step 6
@@ -399,7 +469,8 @@ mode would.
 See SAFETY.md and PROTOCOL_AUDIT.md for the full accounting. In short: no subcommand ever loads
 your saved `config.ron`, runs the Home Assistant integration, starts a profile or temperature
 schedule outside its own bounded active phase, opens the Sensor subsystem, or sends `Prime` outside
-`frozen-prime-test`/`frozen-prime-opensleep-init` (always sent at most once per invocation, always
+`frozen-prime-test`/`frozen-prime-opensleep-init` (including its `--release-frozen-only` mode;
+always sent at most once per invocation, always
 manually confirmed, never scheduled or repeated automatically) or an arbitrary/undocumented
 command. Every subcommand except `frozen-prime-opensleep-init` also never connects to MQTT and
 never writes to `0x53` beyond a nonfatal probe -- `frozen-prime-opensleep-init` is the one

@@ -90,12 +90,16 @@ fork's own `prime_test::tests::prime_action_serializes_to_the_exact_source_evide
 ### Why `Random` is unreachable, and `Prime` is reachable in exactly one *audited* mode
 
 This section is entirely about `safety::AuditedTransport`, the whitelist used by `frozen-passive`,
-`frozen-cool-test`, `frozen-prime-test`, and `emergency-stop`. `frozen-prime-opensleep-init` reaches
+`frozen-cool-test`, `frozen-prime-test`, `frozen-prime-opensleep-init --release-frozen-only`, and
+`emergency-stop`. Plain `frozen-prime-opensleep-init` (without `--release-frozen-only`) reaches
 `Prime` through a structurally separate path that never touches `AuditedTransport` at all -- it
 steers the real, unmodified upstream Frozen scheduler (by constructing an in-memory configuration)
 into sending its own real `FrozenCommand::Prime`; this binary never constructs or transmits that
-command itself in that mode. See SAFETY.md and `prime_opensleep_init.rs`'s module docs for that
-mode's own analysis and guardrails.
+command itself in that mode. `--release-frozen-only`, in contrast, drives Frozen through this
+binary's own `FrozenLink`/`AuditedTransport` (`Mode::PrimeTest` -- the same runtime mode
+`frozen-prime-test` uses) and so is fully covered by the two mechanisms below, exactly like
+`frozen-prime-test`. See SAFETY.md and `prime_opensleep_init.rs`'s module docs for both modes'
+own analysis and guardrails.
 
 `src/bin/opensleep-diagnostic/safety.rs`'s `FrozenAction` enum has exactly eight variants: `Ping`,
 `GetHardwareInfo`, `GetFirmware`, `JumpToFirmware`, `GetTemperatures`, `SafetyOff`, `EnableCooling`,
@@ -103,8 +107,9 @@ and `Prime`. There is no `Random` variant, no CLI flag, and no conversion path a
 binary's source that produces `opensleep::frozen::FrozenCommand::Random(_)` and hands it to the
 transport.
 
-`Prime` **is** representable, because `frozen-prime-test` needs to send it, but two independent
-mechanisms keep it out of every other mode and bound to at most one send per run:
+`Prime` **is** representable, because `frozen-prime-test` (and, via the same runtime mode,
+`--release-frozen-only`) needs to send it, but two independent mechanisms keep it out of every
+other mode and bound to at most one send per run:
 
 1. `AuditedTransport::check`'s per-mode whitelist (`safety::allowed_in_mode`) only returns `true`
    for `FrozenAction::Prime` when `self.mode == Mode::PrimeTest`. `Mode::Passive`,
@@ -120,9 +125,9 @@ mechanisms keep it out of every other mode and bound to at most one send per run
 `safety::tests::prime_is_refused_outside_prime_test_mode`,
 `prime_test_mode_allows_prime_exactly_once`, `every_frozen_command_variant_is_accounted_for_by_mode`,
 and `main.rs`'s `guardrail_tests::frozen_action_prime_is_referenced_only_in_safety_and_prime_test`
-(source-level: `FrozenAction::Prime`/`FrozenAction::prime()` never appears outside `safety.rs`/
-`prime_test.rs`) together make this an executable, falsifiable claim rather than a design
-intention.
+(source-level: `FrozenAction::Prime`/`FrozenAction::prime()` never appears outside `safety.rs`,
+`prime_test.rs`, or `prime_opensleep_init.rs`'s `--release-frozen-only` code) together make this an
+executable, falsifiable claim rather than a design intention.
 
 As defense in depth, `AuditedTransport::check` *also* checks the serialized opcode byte against a
 fixed allowed set (`0x01, 0x02, 0x04, 0x10, 0x40, 0x41, 0x52`) before any frame is transmitted --
