@@ -109,10 +109,10 @@ index 0000000..dcd3e78
 +}
 diff --git a/src/bin/opensleep-diagnostic/cli.rs b/src/bin/opensleep-diagnostic/cli.rs
 new file mode 100644
-index 0000000..4000a16
+index 0000000..01caac0
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/cli.rs
-@@ -0,0 +1,162 @@
+@@ -0,0 +1,219 @@
 +//! CLI surface. Every flag here maps to a fixed, validated field -- there is no flag that accepts
 +//! a raw opcode, a raw frame, or an arbitrary absolute temperature target. Side selection is a
 +//! closed `ValueEnum`; the cooling delta and duration are validated in `cool_test.rs` against
@@ -138,6 +138,9 @@ index 0000000..4000a16
 +    FrozenCoolTest(CoolTestArgs),
 +    /// Independent fast-path: disable both sides and assert subsystem reset, then exit.
 +    EmergencyStop(EmergencyArgs),
++    /// Intentionally fills an empty hydraulic loop by sending Prime exactly once. Requires a
++    /// connected cover with an empty/partially-filled reservoir topped up with water.
++    FrozenPrimeTest(PrimeTestArgs),
 +}
 +
 +#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -261,6 +264,60 @@ index 0000000..4000a16
 +}
 +
 +#[derive(clap::Args, Debug, Clone)]
++pub struct PrimeTestArgs {
++    #[arg(long, default_value = "/dev/i2c-1")]
++    pub i2c_device: String,
++
++    #[arg(long, default_value = "/dev/ttyS1")]
++    pub frozen_port: String,
++
++    /// Maximum supervised observation window in seconds. Minimum 5, hard-capped at 60 -- no flag
++    /// can raise that cap. If firmware reports priming completed earlier, the test stops early.
++    #[arg(long, default_value_t = 30)]
++    pub duration_seconds: u64,
++
++    /// Required: operator declares the hydraulic cover is connected
++    #[arg(long, default_value_t = false)]
++    pub confirm_cover_hydraulics_connected: bool,
++
++    /// Required: operator declares the reservoir has been filled (or topped up) with water
++    #[arg(long, default_value_t = false)]
++    pub confirm_reservoir_filled: bool,
++
++    /// Required: operator declares the cover's hydraulic loop is empty or needs priming
++    #[arg(long, default_value_t = false)]
++    pub confirm_cover_loop_needs_priming: bool,
++
++    /// Required: operator declares there are no visible leaks
++    #[arg(long, default_value_t = false)]
++    pub confirm_no_visible_leaks: bool,
++
++    /// Required: operator explicitly confirms this is an active (actuating) test
++    #[arg(long, default_value_t = false)]
++    pub confirm_active_test: bool,
++
++    #[arg(long, value_name = "PATH")]
++    pub json_output: Option<String>,
++
++    #[arg(long, default_value_t = false)]
++    pub verbose: bool,
++
++    /// Perform no I2C or UART writes; run the full preflight/confirmation/reporting logic against
++    /// a mocked Frozen device instead. The interactive typed-phrase confirmations are still
++    /// required unless stdin is not a TTY.
++    #[arg(long, default_value_t = false)]
++    pub dry_run: bool,
++
++    /// Testing/CI escape hatch only: skips the interactive typed-phrase confirmations even when
++    /// stdin is a TTY, by supplying the phrases directly. Never documented as a normal operator
++    /// flag in RUN_ON_POD.md.
++    #[arg(long, hide = true)]
++    pub assume_interactive_phrase: Option<String>,
++    #[arg(long, hide = true)]
++    pub assume_start_phrase: Option<String>,
++}
++
++#[derive(clap::Args, Debug, Clone)]
 +pub struct EmergencyArgs {
 +    #[arg(long, default_value = "/dev/i2c-1")]
 +    pub i2c_device: String,
@@ -277,10 +334,10 @@ index 0000000..4000a16
 +}
 diff --git a/src/bin/opensleep-diagnostic/cool_test.rs b/src/bin/opensleep-diagnostic/cool_test.rs
 new file mode 100644
-index 0000000..36efafb
+index 0000000..58a42bf
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/cool_test.rs
-@@ -0,0 +1,1512 @@
+@@ -0,0 +1,1539 @@
 +//! `frozen-cool-test`: the one subcommand that intentionally activates a cooling channel. Every
 +//! hard limit here (max delta, max duration, baseline range, heatsink ceiling) is a compile-time
 +//! constant; no CLI flag can raise any of them. See SAFETY.md for the operator-facing version of
@@ -566,6 +623,7 @@ index 0000000..36efafb
 +        let safe_stop = run_safe_stop::<T, P>(None, &mut audit, Some(i2c)).await;
 +        return finish(
 +            args, dry_run, &audit, &stats, samples, cr, safe_stop, StopReason::PreflightRefused, false,
++            &expander, &led, subsystem_reset_ok, false, false,
 +        );
 +    };
 +
@@ -586,6 +644,7 @@ index 0000000..36efafb
 +        let safe_stop = run_safe_stop(Some(link), &mut audit, Some(i2c)).await;
 +        return finish(
 +            args, dry_run, &audit, &stats, samples, cr, safe_stop, StopReason::PreflightRefused, false,
++            &expander, &led, subsystem_reset_ok, true, reached_firmware,
 +        );
 +    }
 +
@@ -650,6 +709,7 @@ index 0000000..36efafb
 +            let safe_stop = run_safe_stop(Some(link), &mut audit, Some(i2c)).await;
 +            return finish(
 +                args, dry_run, &audit, &stats, samples, cr, safe_stop, StopReason::PreflightRefused, false,
++                &expander, &led, subsystem_reset_ok, true, reached_firmware,
 +            );
 +        }
 +    };
@@ -662,6 +722,7 @@ index 0000000..36efafb
 +            let safe_stop = run_safe_stop(Some(link), &mut audit, Some(i2c)).await;
 +            return finish(
 +                args, dry_run, &audit, &stats, samples, cr, safe_stop, StopReason::PreflightRefused, false,
++                &expander, &led, subsystem_reset_ok, true, reached_firmware,
 +            );
 +        }
 +    };
@@ -679,6 +740,7 @@ index 0000000..36efafb
 +        let safe_stop = run_safe_stop(Some(link), &mut audit, Some(i2c)).await;
 +        return finish(
 +            args, dry_run, &audit, &stats, samples, cr, safe_stop, StopReason::PreflightRefused, false,
++            &expander, &led, subsystem_reset_ok, true, reached_firmware,
 +        );
 +    }
 +
@@ -905,17 +967,10 @@ index 0000000..36efafb
 +
 +    let overall_pass = cr.overall_selected_side_result == Verdict::Pass;
 +
-+    let mut result = finish(
++    finish(
 +        args, dry_run, &audit, &stats, samples, cr, safe_stop, stop_reason, overall_pass,
-+    );
-+    result.0.reset_expander_probe_ok = expander.success;
-+    result.0.reset_expander_value = expander.value;
-+    result.0.led_controller_probe_ok = led.success;
-+    result.0.subsystem_reset_ok = subsystem_reset_ok;
-+    result.0.i2c_bus_open = true;
-+    result.0.frozen_uart_opened = true;
-+    result.0.frozen_firmware_ping = Some(reached_firmware);
-+    result
++        &expander, &led, subsystem_reset_ok, true, reached_firmware,
++    )
 +}
 +
 +/// Pure, panic-free-by-design per-tick range/plausibility check, isolated so it can be run behind
@@ -1040,6 +1095,11 @@ index 0000000..36efafb
 +    safe_stop: crate::safe_stop::SafeStopResult,
 +    stop_reason: StopReason,
 +    overall_pass: bool,
++    expander: &crate::i2c::ProbeResult,
++    led: &crate::i2c::ProbeResult,
++    subsystem_reset_ok: bool,
++    frozen_uart_opened: bool,
++    reached_firmware: bool,
 +) -> (Report, u8) {
 +    let side: BedSide = args.side.into();
 +    let mut report = Report {
@@ -1059,16 +1119,16 @@ index 0000000..36efafb
 +            final_start_phrase_confirmed: Some(cr.frozen_command_accepted != Verdict::Unknown),
 +        },
 +        i2c_device: args.i2c_device.clone(),
-+        i2c_bus_open: false,
-+        reset_expander_probe_ok: false,
-+        reset_expander_value: None,
-+        led_controller_probe_ok: false,
++        i2c_bus_open: true,
++        reset_expander_probe_ok: expander.success,
++        reset_expander_value: expander.value,
++        led_controller_probe_ok: led.success,
 +        subsystem_reset_performed: true,
-+        subsystem_reset_ok: false,
++        subsystem_reset_ok,
 +        frozen_port: args.frozen_port.clone(),
-+        frozen_uart_opened: false,
++        frozen_uart_opened,
 +        frozen_bootloader_ping: None,
-+        frozen_firmware_ping: None,
++        frozen_firmware_ping: Some(reached_firmware),
 +        frozen_hardware_info: None,
 +        firmware_version_or_hash: None,
 +        frozen_firmware_probed: false,
@@ -1079,16 +1139,28 @@ index 0000000..36efafb
 +        prime_command_count: audit.prime_count(),
 +        random_command_count: audit.random_count(),
 +        safety_off_commands_sent: audit.entries().iter().filter(|e| e.enabled == Some(false)).count() as u32,
++        rejected_command_count: audit.rejected_command_count(),
++        prime_frame_hex: None,
 +        telemetry_samples: samples,
 +        raw_packets_decoded: stats.raw_packets_decoded,
 +        malformed_windows: stats.malformed_windows,
 +        communication_timeouts: stats.timeouts,
 +        unsolicited_telemetry_seen: stats.unsolicited_telemetry_seen,
 +        firmware_messages: stats.messages.clone(),
++        pump_samples: Vec::new(),
++        solenoid_valve_messages: Vec::new(),
++        reservoir_transition_messages: Vec::new(),
++        other_decoded_packets: Vec::new(),
++        raw_io_events: Vec::new(),
++        priming_start_observed: false,
++        priming_done_observed: false,
++        priming_done_because_empty: false,
 +        operator_observations: prompt_observations(),
++        prime_operator_observations: None,
 +        stop_reason: stop_reason.to_string(),
 +        safe_stop: Some((&safe_stop).into()),
 +        component_results: Some(cr),
++        prime_results: None,
 +        overall_pass,
 +        exit_code: 0,
 +    };
@@ -1169,16 +1241,28 @@ index 0000000..36efafb
 +        prime_command_count: 0,
 +        random_command_count: 0,
 +        safety_off_commands_sent: 0,
++        rejected_command_count: 0,
++        prime_frame_hex: None,
 +        telemetry_samples: Vec::new(),
 +        raw_packets_decoded: 0,
 +        malformed_windows: 0,
 +        communication_timeouts: 0,
 +        unsolicited_telemetry_seen: false,
 +        firmware_messages: Vec::new(),
++        pump_samples: Vec::new(),
++        solenoid_valve_messages: Vec::new(),
++        reservoir_transition_messages: Vec::new(),
++        other_decoded_packets: Vec::new(),
++        raw_io_events: Vec::new(),
++        priming_start_observed: false,
++        priming_done_observed: false,
++        priming_done_because_empty: false,
 +        operator_observations: None,
++        prime_operator_observations: None,
 +        stop_reason: reason.to_string(),
 +        safe_stop: None,
 +        component_results: None,
++        prime_results: None,
 +        overall_pass: false,
 +        exit_code: 30,
 +    }
@@ -2423,27 +2507,58 @@ index 0000000..fcf4032
 +}
 diff --git a/src/bin/opensleep-diagnostic/io_logging.rs b/src/bin/opensleep-diagnostic/io_logging.rs
 new file mode 100644
-index 0000000..00f7d23
+index 0000000..8c89366
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/io_logging.rs
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,94 @@
 +//! Transparent `AsyncRead + AsyncWrite` wrapper that logs every raw byte chunk that crosses it,
 +//! so raw TX/RX frames can be logged in hex without touching the shared `PacketCodec` (which is
 +//! also used, unmodified, by normal OpenSleep).
++//!
++//! Optionally also retains those same chunks in a shared, lock-protected list (`with_capture`),
++//! for callers (`frozen-prime-test`) that want raw I/O evidence in their JSON report, not just the
++//! log stream. This is a raw byte-chunk log, not a per-frame log: `Framed`/`PacketCodec` do not
++//! expose frame boundaries alongside a decoded packet through the `Stream` API this binary uses,
++//! so a captured chunk may contain part of a frame, a whole frame, or several -- documented as
++//! such in PROTOCOL_AUDIT.md and in the JSON field itself.
 +
 +use std::io;
 +use std::pin::Pin;
++use std::sync::{Arc, Mutex};
 +use std::task::{Context, Poll};
 +use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
++
++#[derive(Debug, Clone)]
++pub struct RawIoEvent {
++    pub direction: &'static str, // "rx" | "tx"
++    pub hex: String,
++    pub timestamp: String,
++}
++
++pub type RawIoCapture = Arc<Mutex<Vec<RawIoEvent>>>;
 +
 +pub struct LoggingIo<T> {
 +    inner: T,
 +    label: &'static str,
++    capture: Option<RawIoCapture>,
 +}
 +
 +impl<T> LoggingIo<T> {
 +    pub fn new(inner: T, label: &'static str) -> Self {
-+        Self { inner, label }
++        Self { inner, label, capture: None }
++    }
++
++    pub fn with_capture(inner: T, label: &'static str, capture: RawIoCapture) -> Self {
++        Self { inner, label, capture: Some(capture) }
++    }
++}
++
++fn record(capture: &Option<RawIoCapture>, direction: &'static str, data: &[u8]) {
++    let Some(capture) = capture else { return };
++    let hex = data.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
++    let event = RawIoEvent { direction, hex, timestamp: jiff::Timestamp::now().to_string() };
++    if let Ok(mut log) = capture.lock() {
++        log.push(event);
 +    }
 +}
 +
@@ -2460,6 +2575,7 @@ index 0000000..00f7d23
 +            let data = &buf.filled()[before..];
 +            if !data.is_empty() {
 +                log::debug!("{} RX raw ({} bytes): {:02X?}", this.label, data.len(), data);
++                record(&this.capture, "rx", data);
 +            }
 +        }
 +        poll
@@ -2476,6 +2592,7 @@ index 0000000..00f7d23
 +        let poll = Pin::new(&mut this.inner).poll_write(cx, buf);
 +        if let Poll::Ready(Ok(n)) = &poll {
 +            log::debug!("{} TX raw ({} bytes): {:02X?}", this.label, n, &buf[..*n]);
++            record(&this.capture, "tx", &buf[..*n]);
 +        }
 +        poll
 +    }
@@ -2490,10 +2607,10 @@ index 0000000..00f7d23
 +}
 diff --git a/src/bin/opensleep-diagnostic/link.rs b/src/bin/opensleep-diagnostic/link.rs
 new file mode 100644
-index 0000000..5ced463
+index 0000000..5d6a0d1
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/link.rs
-@@ -0,0 +1,288 @@
+@@ -0,0 +1,297 @@
 +//! Frozen UART transport: every send goes through [`AuditedTransport::check`] first, and the wire
 +//! framing itself is entirely `opensleep::common::codec::PacketCodec` / `FrozenPacket` -- nothing
 +//! here reimplements packet encoding or decoding. Generic over the underlying I/O so the exact
@@ -2561,6 +2678,15 @@ index 0000000..5ced463
 +    pub fn wrap(inner: T, label: &'static str) -> Self {
 +        Self {
 +            framed: Framed::new(LoggingIo::new(inner, label), PacketCodec::new()),
++        }
++    }
++
++    /// Same as [`Self::wrap`], but also retains every raw RX/TX byte chunk in `capture` -- used
++    /// by `frozen-prime-test` to include raw I/O evidence in its JSON report. See `io_logging.rs`
++    /// module docs for exactly what "raw" means here.
++    pub fn wrap_capturing(inner: T, label: &'static str, capture: crate::io_logging::RawIoCapture) -> Self {
++        Self {
++            framed: Framed::new(LoggingIo::with_capture(inner, label, capture), PacketCodec::new()),
 +        }
 +    }
 +
@@ -2784,17 +2910,20 @@ index 0000000..5ced463
 +}
 diff --git a/src/bin/opensleep-diagnostic/main.rs b/src/bin/opensleep-diagnostic/main.rs
 new file mode 100644
-index 0000000..92894ec
+index 0000000..5495c78
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/main.rs
-@@ -0,0 +1,163 @@
+@@ -0,0 +1,205 @@
 +//! opensleep-diagnostic: a staged, Frozen-only hardware diagnostic for an Eight Sleep Pod 3 Hub.
 +//!
-+//! Three subcommands, each with its own fixed command whitelist (see `safety.rs`):
-+//!   - `frozen-passive`:   safe with the cover disconnected and no water.
-+//!   - `frozen-cool-test`: intentionally activates one cooling channel; requires a filled,
++//! Four subcommands, each with its own fixed command whitelist (see `safety.rs`):
++//!   - `frozen-passive`:    safe with the cover disconnected and no water.
++//!   - `frozen-cool-test`:  intentionally activates one cooling channel; requires a filled,
 +//!     connected hydraulic loop and multiple explicit confirmations.
-+//!   - `emergency-stop`:   independent fast-path disable + reset-assert command.
++//!   - `frozen-prime-test`: intentionally sends Prime, exactly once, to fill an empty hydraulic
++//!     loop; requires a connected cover and multiple explicit confirmations. `Prime` is permitted
++//!     only in this mode -- see safety.rs.
++//!   - `emergency-stop`:    independent fast-path disable + reset-assert command.
 +//!
 +//! This binary never runs `opensleep::frozen::manager::run` (which schedules temperature targets
 +//! and priming on its own), never loads `config.ron`, never connects to MQTT, and never opens the
@@ -2811,6 +2940,7 @@ index 0000000..92894ec
 +mod mock;
 +mod ownership;
 +mod passive;
++mod prime_test;
 +mod report;
 +mod safe_stop;
 +mod safety;
@@ -2827,6 +2957,7 @@ index 0000000..92894ec
 +        Commands::FrozenPassive(a) => a.verbose,
 +        Commands::FrozenCoolTest(a) => a.verbose,
 +        Commands::EmergencyStop(a) => a.verbose,
++        Commands::FrozenPrimeTest(a) => a.verbose,
 +    };
 +    buildinfo::init_logging(verbose);
 +    signals::install_panic_hook();
@@ -2854,6 +2985,10 @@ index 0000000..92894ec
 +                code
 +            }
 +            Commands::EmergencyStop(args) => emergency_stop::run(&args).await,
++            Commands::FrozenPrimeTest(args) => {
++                let (_, code) = prime_test::run(&args).await;
++                code
++            }
 +        }
 +    });
 +
@@ -2929,10 +3064,15 @@ index 0000000..92894ec
 +
 +    #[test]
 +    fn prime_and_random_frozen_command_variants_are_never_referenced_as_constructors() {
-+        // `FrozenCommand::Prime`/`FrozenCommand::Random` only ever appear inside `safety.rs`'s own
-+        // negative tests (which construct the *library's* type directly to prove the audit
-+        // rejects it) -- never as something this binary's own `FrozenAction` can produce. This
-+        // scans every other diagnostic source file for the two variant names.
++        // `FrozenCommand::Prime`/`FrozenCommand::Random` (the *library's* raw command type, as
++        // opposed to this binary's own `FrozenAction`) only ever appear inside `safety.rs` -- its
++        // `to_command()` mapping (the one place `FrozenAction::Prime` becomes a real
++        // `FrozenCommand::Prime`) and its own negative tests (which construct the library type
++        // directly to prove the audit rejects it). No other file may ever reference the raw
++        // library variant by name, `frozen-prime-test` included: that mode only ever calls
++        // `FrozenAction::prime()`, never `FrozenCommand::Prime` directly -- see
++        // `frozen_action_prime_is_referenced_only_in_safety_and_prime_test` below for the
++        // complementary check on `FrozenAction::Prime`/`FrozenAction::prime()` itself.
 +        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/bin/opensleep-diagnostic");
 +        let needle_prime = format!("{}{}{}", "FrozenCommand", "::", "Prime");
 +        let needle_random = format!("{}{}{}", "FrozenCommand", "::", "Random");
@@ -2950,13 +3090,41 @@ index 0000000..92894ec
 +            }
 +        }
 +    }
++
++    #[test]
++    fn frozen_action_prime_is_referenced_only_in_safety_and_prime_test() {
++        // `FrozenAction::Prime`/`FrozenAction::prime()` -- this binary's own, closed command type
++        // -- must never appear in `passive.rs`, `cool_test.rs`, or `emergency_stop.rs` (or any
++        // other file besides `safety.rs`, where the variant and its constructor are defined, and
++        // `prime_test.rs`, the only mode permitted to call `FrozenAction::prime()`). This is the
++        // source-level complement to the runtime whitelist tests in `safety.rs`
++        // (`prime_is_refused_outside_prime_test_mode` etc.) and to
++        // `prime_and_random_frozen_command_variants_are_never_referenced_as_constructors` above.
++        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/bin/opensleep-diagnostic");
++        let needle_variant = format!("{}{}{}", "FrozenAction", "::", "Prime");
++        let needle_ctor = format!("{}{}{}", "FrozenAction", "::", "prime()");
++        for entry in std::fs::read_dir(dir).expect("diagnostic source dir must exist") {
++            let entry = entry.expect("readable dir entry");
++            let path = entry.path();
++            let name = path.file_name().and_then(|n| n.to_str());
++            if name == Some("safety.rs") || name == Some("main.rs") || name == Some("prime_test.rs") {
++                continue; // safety.rs defines it, prime_test.rs is the one mode allowed to use it,
++                          // main.rs's own explanatory prose (this comment) would self-match
++            }
++            if path.extension().is_some_and(|e| e == "rs") {
++                let src = std::fs::read_to_string(&path).expect("readable .rs file");
++                assert!(!src.contains(&needle_variant), "{path:?} must not reference FrozenAction::Prime");
++                assert!(!src.contains(&needle_ctor), "{path:?} must not call FrozenAction::prime()");
++            }
++        }
++    }
 +}
 diff --git a/src/bin/opensleep-diagnostic/mock.rs b/src/bin/opensleep-diagnostic/mock.rs
 new file mode 100644
-index 0000000..6cdfce6
+index 0000000..e2da2e2
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/mock.rs
-@@ -0,0 +1,139 @@
+@@ -0,0 +1,180 @@
 +//! Mock Frozen device used by `--dry-run` (so dry-run is testable on a normal development
 +//! computer with no real hardware attached) and reused directly by integration tests. Speaks the
 +//! exact real wire framing (`opensleep::common::codec::command`) on one end of a
@@ -3010,6 +3178,21 @@ index 0000000..6cdfce6
 +    opensleep::common::codec::command(vec![0xC0, 0x00, side, enabled as u8, t[0], t[1]])
 +}
 +
++/// `FrozenPacket::parse_priming_started`'s exact layout: opcode 0xD2 + one value byte (0 =
++/// no unexpected value, per source). Sent by real Frozen firmware as the direct acknowledgment
++/// that priming has started -- see PROTOCOL_AUDIT.md.
++fn mock_priming_started_frame() -> Vec<u8> {
++    opensleep::common::codec::command(vec![0xD2, 0x00])
++}
++
++/// A `Message` (opcode 0x07) frame carrying `text`, matching `common::packet::parse_message`'s
++/// layout (2 header bytes the parser skips, then UTF-8 text).
++fn mock_message_frame(text: &str) -> Vec<u8> {
++    let mut payload = vec![0x07u8, 0x00];
++    payload.extend_from_slice(text.as_bytes());
++    opensleep::common::codec::command(payload)
++}
++
 +/// Matches `FrozenPacket::parse_temperature_update`'s exact layout (opcode + 8 bytes: left/
 +/// right/heatsink as big-endian u16, then a one-byte control-error term, then a one-byte
 +/// wrapping counter). Real hardware pushes this unsolicited, on its own schedule, using the same
@@ -3028,11 +3211,19 @@ index 0000000..6cdfce6
 +/// `cool_test.rs`, which relies on the unsolicited push, not the solicited reply, for safety
 +/// monitoring), SetTargetTemperature -> an echoing TargetUpdate ack. Runs until the client side
 +/// closes.
++///
++/// Prime (0x52) -> the real `PrimingStarted` (0xD2) ack plus a `"FW: [priming] start"` message
++/// immediately, then -- paced across the next few `GetTemperatures` requests that follow, so
++/// `frozen-prime-test`'s dry-run/tests see a realistic multi-tick sequence rather than everything
++/// at once -- a pump `Message` for each side and finally `"FW: [priming] done"`. All four message
++/// strings are exactly as captured in `frozen/state.rs`'s source (see PROTOCOL_AUDIT.md).
 +pub fn spawn_mock_frozen_device(mut device_side: DuplexStream) -> tokio::task::JoinHandle<()> {
 +    tokio::spawn(async move {
 +        let mut acc = BytesMut::new();
 +        let mut read_buf = [0u8; 256];
 +        let mut temperature_update_count: u8 = 0;
++        let mut primed = false;
++        let mut post_prime_ticks: u32 = 0;
 +        loop {
 +            if acc.len() >= 2 {
 +                let len = acc[1] as usize;
@@ -3055,6 +3246,24 @@ index 0000000..6cdfce6
 +                            9,
 +                            temperature_update_count,
 +                        ));
++                        if primed {
++                            post_prime_ticks += 1;
++                            if post_prime_ticks == 1 {
++                                combined.extend(mock_message_frame("FW: pump[left] slow @ 6.030475V 0.169202A"));
++                                combined.extend(mock_message_frame("FW: pump[right] slow @ 6.044009V 0.161510A"));
++                            } else if post_prime_ticks == 3 {
++                                combined.extend(mock_message_frame("FW: [priming] done"));
++                            }
++                        }
++                        if device_side.write_all(&combined).await.is_err() {
++                            break;
++                        }
++                        continue;
++                    }
++                    if opcode == 0x52 {
++                        primed = true;
++                        let mut combined = mock_priming_started_frame();
++                        combined.extend(mock_message_frame("FW: [priming] start"));
 +                        if device_side.write_all(&combined).await.is_err() {
 +                            break;
 +                        }
@@ -3098,10 +3307,10 @@ index 0000000..6cdfce6
 +}
 diff --git a/src/bin/opensleep-diagnostic/ownership.rs b/src/bin/opensleep-diagnostic/ownership.rs
 new file mode 100644
-index 0000000..ef41752
+index 0000000..910d8c6
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/ownership.rs
-@@ -0,0 +1,118 @@
+@@ -0,0 +1,121 @@
 +//! Best-effort checks that stock OpenSleep-family services aren't running and that no other
 +//! process already holds `/dev/i2c-1` or the Frozen UART open. Both checks are advisory when
 +//! inconclusive (e.g. `systemctl` isn't present on a development machine) but refuse to proceed
@@ -3117,6 +3326,9 @@ index 0000000..ef41752
 +    "frank.service",
 +    "frankenfirmware.service",
 +    "opensleep.service",
++    // Added for frozen-prime-test; harmless to also check from frozen-passive/frozen-cool-test,
++    // since `systemctl is-active` on a unit that doesn't exist on this Hub just reports inactive.
++    "opensleep-manual-ui.service",
 +];
 +
 +#[derive(Debug, Clone)]
@@ -3222,10 +3434,10 @@ index 0000000..ef41752
 +}
 diff --git a/src/bin/opensleep-diagnostic/passive.rs b/src/bin/opensleep-diagnostic/passive.rs
 new file mode 100644
-index 0000000..986af26
+index 0000000..448c1ac
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/passive.rs
-@@ -0,0 +1,428 @@
+@@ -0,0 +1,440 @@
 +//! `frozen-passive`: safe with the cover disconnected and no water. Never constructs an enabled
 +//! `SetTargetTemperature`; the only actuator-shaped command it can ever send is the disabled
 +//! (`enabled=false`) safety-off, which both `AuditedTransport` and the closed `FrozenAction` enum
@@ -3588,16 +3800,28 @@ index 0000000..986af26
 +        prime_command_count: 0,
 +        random_command_count: 0,
 +        safety_off_commands_sent: 0,
++        rejected_command_count: 0,
++        prime_frame_hex: None,
 +        telemetry_samples: Vec::new(),
 +        raw_packets_decoded: 0,
 +        malformed_windows: 0,
 +        communication_timeouts: 0,
 +        unsolicited_telemetry_seen: false,
 +        firmware_messages: Vec::new(),
++        pump_samples: Vec::new(),
++        solenoid_valve_messages: Vec::new(),
++        reservoir_transition_messages: Vec::new(),
++        other_decoded_packets: Vec::new(),
++        raw_io_events: Vec::new(),
++        priming_start_observed: false,
++        priming_done_observed: false,
++        priming_done_because_empty: false,
 +        operator_observations: None,
++        prime_operator_observations: None,
 +        stop_reason: stop_reason.to_string(),
 +        safe_stop: None,
 +        component_results: None,
++        prime_results: None,
 +        overall_pass: false,
 +        exit_code: exit_code_override.unwrap_or(30),
 +    }
@@ -3654,12 +3878,1532 @@ index 0000000..986af26
 +        assert!(sides.contains(&"right".to_string()));
 +    }
 +}
+diff --git a/src/bin/opensleep-diagnostic/prime_test.rs b/src/bin/opensleep-diagnostic/prime_test.rs
+new file mode 100644
+index 0000000..0980014
+--- /dev/null
++++ b/src/bin/opensleep-diagnostic/prime_test.rs
+@@ -0,0 +1,1514 @@
++//! `frozen-prime-test`: the one subcommand that intentionally sends `Prime` (opcode 0x52) to fill
++//! an empty or partially-filled Eight Sleep Pod 3 hydraulic loop. See SAFETY.md for the
++//! operator-facing guarantees and PROTOCOL_AUDIT.md for the full source audit behind every claim
++//! in this file's doc comments.
++//!
++//! Key facts established by that audit, load-bearing for this file's design:
++//! - `Prime` takes no arguments and applies to both sides in one shot -- there is no per-side
++//!   Prime, so (unlike `frozen-cool-test`) this mode has no `--side` flag.
++//! - The only direct start evidence is the `PrimingStarted` packet (opcode 0xD2) and/or a
++//!   `"FW: [priming] start"` message. The only completion evidence is a `"FW: [priming] done"` or
++//!   `"...done because empty"` message -- there is no binary "priming complete" packet.
++//! - No Prime-cancellation command exists anywhere in the reused protocol. Subsystem reset (I2C
++//!   0x20) is therefore the only forced-stop mechanism, exactly as for every other mode's
++//!   safe-stop, and is asserted on every exit path regardless of whether "done" was ever observed.
++//! - The firmware does not expose a reliable reservoir-empty signal on this hardware (`capwater`
++//!   is reported unavailable). The operator, watching the reservoir, is the primary safety
++//!   interlock -- this tool cannot substitute for that.
++
++use std::io::IsTerminal;
++use std::sync::{Arc, Mutex};
++use std::time::Duration;
++
++use opensleep::common::codec::CommandTrait;
++use opensleep::common::packet::BedSide;
++use opensleep::frozen::FrozenPacket;
++use tokio::io::{AsyncRead, AsyncWrite};
++use tokio::time::Instant;
++
++use crate::buildinfo::{DIAGNOSTIC_VERSION, kernel_release, source_commit};
++use crate::cli::PrimeTestArgs;
++use crate::cool_test::{MAX_HEATSINK_CENTIDEG, MAX_WATER_CENTIDEG, MIN_WATER_CENTIDEG, STALE_TELEMETRY_LIMIT};
++use crate::i2c::{I2cPort, MockI2c, RealI2c, probe_address, run_reset_sequence};
++use crate::link::{FrozenLink, LinkError, PacketOutcome};
++use crate::mock::mock_frozen_link_pair;
++use crate::ownership;
++use crate::report::{
++    AuditEntryJson, Confirmations, PrimeOperatorObservations, PrimeResults, PumpSampleJson, Report,
++    TemperatureSampleJson, Verdict,
++};
++use crate::safe_stop::run_safe_stop;
++use crate::safety::{AuditedTransport, FrozenAction, Mode};
++use crate::signals::{StopReason, wait_for_termination_signal};
++use crate::telemetry::{PacketStats, sample_from_get_temperature, sample_from_temperature_update};
++
++const COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
++
++/// Hard, non-overridable maximum observation window.
++pub const HARD_MAX_DURATION_SECONDS: u64 = 60;
++/// Hard, non-overridable minimum -- a shorter window cannot meaningfully observe anything.
++pub const MIN_DURATION_SECONDS: u64 = 5;
++pub const BASELINE_MIN_SAMPLES: usize = 3;
++pub const BASELINE_WINDOW: Duration = Duration::from_secs(3);
++/// Length of each drain window within one ~1-second active-phase tick.
++const TICK_DRAIN_WINDOW: Duration = Duration::from_millis(900);
++/// How often a Ping is sent during the active phase solely to detect an unexpected fallback to
++/// bootloader mode. Same interference caution as above.
++const BOOTLOADER_CHECK_EVERY_N_TICKS: u32 = 5;
++/// How often the 0x20 reset/enable expander is re-probed during the active phase.
++const I2C_CHECK_EVERY_N_TICKS: u32 = 5;
++
++const INTERACTIVE_PHRASE: &str = "I CONFIRM THE RESERVOIR IS FILLED AND THE COVER IS CONNECTED";
++const FINAL_PHRASE: &str = "START SUPERVISED PRIMING";
++
++pub async fn run(args: &PrimeTestArgs) -> (Report, u8) {
++    if args.duration_seconds > HARD_MAX_DURATION_SECONDS {
++        log::error!(
++            "refusing to run: --duration-seconds {} exceeds the hard maximum of {} (no option can raise this)",
++            args.duration_seconds, HARD_MAX_DURATION_SECONDS
++        );
++        return (refused_report(args, false, "duration exceeds hard maximum"), 30);
++    }
++    if args.duration_seconds < MIN_DURATION_SECONDS {
++        log::error!(
++            "refusing to run: --duration-seconds {} is below the minimum of {}",
++            args.duration_seconds, MIN_DURATION_SECONDS
++        );
++        return (refused_report(args, false, "duration below minimum"), 30);
++    }
++
++    if !(args.confirm_cover_hydraulics_connected
++        && args.confirm_reservoir_filled
++        && args.confirm_cover_loop_needs_priming
++        && args.confirm_no_visible_leaks
++        && args.confirm_active_test)
++    {
++        log::error!("refusing to run: all five --confirm-* flags are required");
++        return (refused_report(args, false, "missing required confirmation flags"), 30);
++    }
++
++    let interactive_ok = confirm_phrase(
++        args.assume_interactive_phrase.clone(),
++        INTERACTIVE_PHRASE,
++        "Type I CONFIRM THE RESERVOIR IS FILLED AND THE COVER IS CONNECTED to continue: ",
++    );
++    if !interactive_ok {
++        log::error!("refusing to run: interactive confirmation phrase was not matched exactly");
++        return (refused_report(args, false, "interactive confirmation phrase mismatch"), 30);
++    }
++
++    let capture: crate::io_logging::RawIoCapture = Arc::new(Mutex::new(Vec::new()));
++
++    if args.dry_run {
++        log::warn!("--dry-run: no I2C or UART writes will be performed; using a mocked Frozen device");
++        let mut i2c = MockI2c::always_succeed();
++        let (client, task) = mock_frozen_link_pair();
++        let mut link = FrozenLink::wrap_capturing(client, "dry-run", capture.clone());
++        let result = run_core(args, &mut i2c, Some(&mut link), true, &capture).await;
++        drop(link);
++        task.abort();
++        return result;
++    }
++
++    if let Some(early) = refuse_if_owned(args) {
++        return early;
++    }
++
++    let mut i2c = match RealI2c::open(&args.i2c_device) {
++        Ok(dev) => dev,
++        Err(e) => {
++            log::error!("failed to open I2C device {}: {e}", args.i2c_device);
++            return (refused_report(args, false, "I2C bus failed to open"), 20);
++        }
++    };
++
++    let mut link = match opensleep::common::serial::create_port(&args.frozen_port, crate::link::BAUD) {
++        Ok(raw) => {
++            log::info!("Frozen UART opened: {} @ {} baud, 8N1, no flow control", args.frozen_port, crate::link::BAUD);
++            Some(FrozenLink::wrap_capturing(raw, "Frozen", capture.clone()))
++        }
++        Err(e) => {
++            log::error!("failed to open Frozen UART {}: {e}", args.frozen_port);
++            None
++        }
++    };
++
++    run_core(args, &mut i2c, link.as_mut(), false, &capture).await
++}
++
++fn refuse_if_owned(args: &PrimeTestArgs) -> Option<(Report, u8)> {
++    let services = ownership::check_stock_services();
++    let active: Vec<_> = services.iter().filter(|s| s.active).map(|s| s.name.clone()).collect();
++    if !active.is_empty() {
++        log::error!("refusing to run: stock service(s) active: {active:?}");
++        return Some((refused_report(args, false, "stock service(s) active; refusing to run"), 40));
++    }
++    if ownership::device_exists(&args.i2c_device) && ownership::device_is_open_elsewhere(&args.i2c_device) {
++        log::error!("refusing to run: {} appears to be open in another process", args.i2c_device);
++        return Some((refused_report(args, false, "I2C device already open elsewhere"), 40));
++    }
++    if ownership::device_exists(&args.frozen_port) && ownership::device_is_open_elsewhere(&args.frozen_port) {
++        log::error!("refusing to run: {} appears to be open in another process", args.frozen_port);
++        return Some((refused_report(args, false, "Frozen UART already open elsewhere"), 40));
++    }
++    None
++}
++
++/// Reads and exactly matches a confirmation phrase. `assume` (test/CI only, hidden CLI flag)
++/// bypasses the actual stdin read but not the exact-match check itself. Per spec, the check is
++/// skipped entirely (treated as satisfied) when stdin is not a TTY.
++fn confirm_phrase(assume: Option<String>, expected: &str, prompt: &str) -> bool {
++    if let Some(supplied) = assume {
++        return supplied == expected;
++    }
++    if !std::io::stdin().is_terminal() {
++        log::info!("stdin is not a TTY; skipping interactive confirmation for: {prompt}");
++        return true;
++    }
++    eprint!("{prompt}");
++    let mut line = String::new();
++    if std::io::stdin().read_line(&mut line).is_err() {
++        return false;
++    }
++    line.trim_end_matches(['\n', '\r']) == expected
++}
++
++/// Parses a firmware pump message (e.g. `FW: pump[left] slow @ 6.030475V 0.169202A`) into
++/// `(side, voltage, current)`. Returns `None` if `msg` isn't a pump message at all.
++fn parse_pump_telemetry(msg: &str) -> Option<(&'static str, Option<f64>, Option<f64>)> {
++    let lower = msg.to_lowercase();
++    let side = if lower.contains("pump[left]") {
++        "left"
++    } else if lower.contains("pump[right]") {
++        "right"
++    } else {
++        return None;
++    };
++    let at = lower.find('@');
++    let (voltage, current) = match at {
++        Some(at_pos) => {
++            let rest = &lower[at_pos + 1..];
++            let voltage = rest
++                .find('v')
++                .and_then(|vpos| rest[..vpos].trim().parse::<f64>().ok());
++            let current = rest.find('v').and_then(|vpos| {
++                let after_v = &rest[vpos + 1..];
++                after_v.find('a').and_then(|apos| after_v[..apos].trim().parse::<f64>().ok())
++            });
++            (voltage, current)
++        }
++        None => (None, None),
++    };
++    Some((side, voltage, current))
++}
++
++/// True if `msg` names a pump fault (narrow match: "pump" plus a fault word), distinct from a
++/// normal `pump[<side>] ... @ V A` telemetry line.
++fn is_pump_fault_message(msg: &str) -> bool {
++    let lower = msg.to_lowercase();
++    lower.contains("pump") && (lower.contains("fault") || lower.contains("locked")) && !lower.contains('@')
++}
++
++/// No "solenoid" or "valve" message has ever been observed in the pinned source or captured logs
++/// (see PROTOCOL_AUDIT.md) -- this is a forward-compatible keyword scan, not a confirmed protocol
++/// feature. Absence of a match is not evidence that no such message exists on real hardware.
++fn is_solenoid_or_valve_message(msg: &str) -> bool {
++    let lower = msg.to_lowercase();
++    lower.contains("solenoid") || lower.contains("valve")
++}
++
++/// `"FW: water empty -> full"` / `"FW: water full -> empty"` -- real, evidenced messages
++/// (`frozen/state.rs`) about a reservoir-level transition, distinct from the `[capwater] sensor
++/// unavailable` warning. May never fire if that sensor stays unavailable on this hardware.
++fn is_reservoir_transition_message(msg: &str) -> bool {
++    msg == "FW: water empty -> full" || msg == "FW: water full -> empty"
++}
++
++/// Strips the `"FW: [priming] "` prefix used by every priming-stage message (source: real
++/// captured firmware log strings in `frozen/state.rs`), or `None` if `msg` isn't one.
++fn priming_stage_text(msg: &str) -> Option<&str> {
++    msg.strip_prefix("FW: [priming] ")
++}
++
++const FAULT_KEYWORDS: [&str; 6] = ["overtemperature", "overcurrent", "shutdown", "fault", "failed", "locked"];
++
++/// Generic firmware-fault keyword scan for messages that are *not* a cataloged `[priming]`-stage
++/// message (those are handled separately -- see module docs: real evidence shows "failed" appears
++/// in routine purge-retry accounting there, e.g. "%u consecutive failed purges", which is not by
++/// itself a fatal condition; the firmware's own "done"/"done because empty" messages are the
++/// authoritative completion signals). Excludes "flash locked" -- a captured, evidenced, benign
++/// firmware boot-time message unrelated to any actuator or safety fault.
++fn is_generic_fault_message(msg: &str) -> bool {
++    let lower = msg.to_lowercase();
++    if lower.contains("flash locked") {
++        return false;
++    }
++    FAULT_KEYWORDS.iter().any(|kw| lower.contains(kw))
++}
++
++/// True if a firmware message about the water/heatsink sensor is the known, non-fatal "sensor
++/// unavailable" notice observed with the cover connected and the reservoir filled.
++fn is_known_nonfatal_sensor_message(msg: &str) -> bool {
++    msg.to_lowercase().contains("sensor unavailable")
++}
++
++/// Pure, panic-free-by-design range/plausibility check for both sides at once (Prime affects both
++/// sides in a single command, unlike `frozen-cool-test`'s single selected side).
++fn evaluate_temperatures(left_centideg: u16, right_centideg: u16, heatsink_centideg: u16) -> Result<(), StopReason> {
++    for v in [left_centideg as i32, right_centideg as i32] {
++        if !(MIN_WATER_CENTIDEG..=MAX_WATER_CENTIDEG).contains(&v) {
++            return Err(StopReason::TemperatureRangeExceeded);
++        }
++    }
++    if heatsink_centideg as i32 > MAX_HEATSINK_CENTIDEG {
++        return Err(StopReason::HeatsinkLimitExceeded);
++    }
++    Ok(())
++}
++
++#[allow(clippy::too_many_arguments)]
++fn print_live_summary(
++    elapsed: Duration,
++    prime_sent: bool,
++    start_observed: bool,
++    done_observed: bool,
++    left_pump: Option<(f64, f64)>,
++    right_pump: Option<(f64, f64)>,
++    solenoid_seen: bool,
++    last_flow_message: &Option<String>,
++    left_water_c: Option<f64>,
++    right_water_c: Option<f64>,
++    heatsink_c: Option<f64>,
++    last_telemetry_age: Option<Duration>,
++) {
++    eprintln!("---- frozen-prime-test: {:.0}s elapsed ----", elapsed.as_secs_f64());
++    eprintln!("Prime command sent:        {}", prime_sent);
++    eprintln!("Prime start observed:      {}", start_observed);
++    eprintln!("Prime completion observed: {}", done_observed);
++    eprintln!(
++        "Left pump voltage/current:  {}",
++        left_pump.map(|(v, a)| format!("{v:.3}V {a:.3}A")).unwrap_or_else(|| "unknown".to_string())
++    );
++    eprintln!(
++        "Right pump voltage/current: {}",
++        right_pump.map(|(v, a)| format!("{v:.3}V {a:.3}A")).unwrap_or_else(|| "unknown".to_string())
++    );
++    eprintln!("Solenoid state:            {}", if solenoid_seen { "message observed" } else { "no message observed" });
++    eprintln!("Flow message:              {}", last_flow_message.as_deref().unwrap_or("none"));
++    eprintln!(
++        "Left water temperature:    {}",
++        left_water_c.map(|v| format!("{v:.2}C")).unwrap_or_else(|| "unknown".to_string())
++    );
++    eprintln!(
++        "Right water temperature:   {}",
++        right_water_c.map(|v| format!("{v:.2}C")).unwrap_or_else(|| "unknown".to_string())
++    );
++    eprintln!(
++        "Heatsink temperature:      {}",
++        heatsink_c.map(|v| format!("{v:.2}C")).unwrap_or_else(|| "unknown".to_string())
++    );
++    eprintln!(
++        "Last telemetry age:        {}",
++        last_telemetry_age.map(|d| format!("{:.1}s", d.as_secs_f64())).unwrap_or_else(|| "never".to_string())
++    );
++    eprintln!("WATCH THE RESERVOIR. Press Ctrl+C immediately if it approaches empty.");
++}
++
++#[allow(clippy::too_many_arguments)]
++async fn run_core<T, P>(
++    args: &PrimeTestArgs,
++    i2c: &mut P,
++    mut link: Option<&mut FrozenLink<T>>,
++    dry_run: bool,
++    capture: &crate::io_logging::RawIoCapture,
++) -> (Report, u8)
++where
++    T: AsyncRead + AsyncWrite + Unpin,
++    P: I2cPort,
++{
++    let mut audit = AuditedTransport::new(Mode::PrimeTest);
++    let mut stats = PacketStats::default();
++    let mut samples: Vec<TemperatureSampleJson> = Vec::new();
++    let mut pump_samples: Vec<PumpSampleJson> = Vec::new();
++    let mut solenoid_valve_messages: Vec<String> = Vec::new();
++    let mut reservoir_transition_messages: Vec<String> = Vec::new();
++    let mut other_decoded_packets: Vec<String> = Vec::new();
++    let mut pr = PrimeResults::default();
++
++    let expander = probe_address(i2c, crate::i2c::RESET_EXPANDER_ADDR);
++    let led = probe_address(i2c, crate::i2c::LED_CONTROLLER_ADDR);
++    if !led.success {
++        log::info!("LED controller unavailable; continuing diagnostic ({})", led.describe());
++    }
++    let (reset_steps, _release) = run_reset_sequence(i2c).await;
++    let subsystem_reset_ok = reset_steps.iter().all(|s| s.success);
++
++    let Some(link) = link.as_deref_mut() else {
++        log::error!("refusing to run active test: Frozen UART is not open");
++        let safe_stop = run_safe_stop::<T, P>(None, &mut audit, Some(i2c)).await;
++        return finish(
++            args, dry_run, &audit, &stats, samples, pump_samples, solenoid_valve_messages,
++            reservoir_transition_messages, other_decoded_packets, pr, false, false, false, None,
++            safe_stop, StopReason::PreflightRefused, false, capture,
++            &expander, &led, subsystem_reset_ok, false, false, None, false, None,
++        );
++    };
++
++    let (ping_ok, mode) = crate::frozen_ops::ping(link, &mut audit, COMMAND_TIMEOUT).await;
++    let mut reached_firmware = mode == crate::frozen_ops::DeviceMode::Firmware;
++    if !reached_firmware && mode == crate::frozen_ops::DeviceMode::Bootloader {
++        reached_firmware = crate::frozen_ops::jump_to_firmware_and_wait(link, &mut audit, COMMAND_TIMEOUT).await;
++    }
++
++    let mut hardware_info_str = None;
++    let mut firmware_probed = false;
++    if ping_ok
++        && let Some(hw) = crate::frozen_ops::get_hardware_info(link, &mut audit, COMMAND_TIMEOUT).await
++    {
++        hardware_info_str = Some(hw.to_string());
++    }
++    if reached_firmware {
++        match link.send(&mut audit, FrozenAction::get_firmware(), COMMAND_TIMEOUT).await {
++            Ok(PacketOutcome::Received(_)) => firmware_probed = true,
++            Ok(_) => log::debug!("Frozen did not respond to GetFirmware within {COMMAND_TIMEOUT:?}"),
++            Err(e) => log::debug!("Frozen GetFirmware failed (non-fatal): {e}"),
++        }
++    }
++
++    // Step 12: explicitly disable both sides, and confirm from the acks that neither is enabled
++    // (step 14) before proceeding any further.
++    let mut left_enabled_after_disable = None;
++    let mut right_enabled_after_disable = None;
++    for side in [BedSide::Left, BedSide::Right] {
++        match link.send(&mut audit, FrozenAction::safety_off(side), COMMAND_TIMEOUT).await {
++            Ok(PacketOutcome::Received(FrozenPacket::TargetUpdate((s, t)))) => match s {
++                BedSide::Left => left_enabled_after_disable = Some(t.enabled),
++                BedSide::Right => right_enabled_after_disable = Some(t.enabled),
++            },
++            Ok(_) => {}
++            Err(e) => log::error!("safety-off for {side:?} failed: {e}"),
++        }
++    }
++
++    pr.frozen_application_firmware = if reached_firmware { Verdict::Pass } else { Verdict::Fail };
++
++    if !ping_ok || !reached_firmware {
++        log::error!("refusing to run active test: Frozen did not reach application firmware");
++        let safe_stop = run_safe_stop(Some(link), &mut audit, Some(i2c)).await;
++        return finish(
++            args, dry_run, &audit, &stats, samples, pump_samples, solenoid_valve_messages,
++            reservoir_transition_messages, other_decoded_packets, pr, false, false, false, None,
++            safe_stop, StopReason::PreflightRefused, false, capture,
++            &expander, &led, subsystem_reset_ok, true, reached_firmware, hardware_info_str, firmware_probed, None,
++        );
++    }
++
++    if left_enabled_after_disable == Some(true) || right_enabled_after_disable == Some(true) {
++        log::error!("refusing to run active test: an enabled target is still active after safety-off");
++        let safe_stop = run_safe_stop(Some(link), &mut audit, Some(i2c)).await;
++        return finish(
++            args, dry_run, &audit, &stats, samples, pump_samples, solenoid_valve_messages,
++            reservoir_transition_messages, other_decoded_packets, pr, false, false, false, None,
++            safe_stop, StopReason::PreflightRefused, false, capture,
++            &expander, &led, subsystem_reset_ok, true, reached_firmware, hardware_info_str, firmware_probed, None,
++        );
++    }
++
++    // Step 13: fresh baseline telemetry, from unsolicited TemperatureUpdate pushes (see
++    // cool_test.rs's module docs for why the solicited 0xC1 reply is not relied on).
++    let baseline_start = Instant::now();
++    let mut baseline_samples = 0usize;
++    while baseline_samples < BASELINE_MIN_SAMPLES || baseline_start.elapsed() < BASELINE_WINDOW {
++        if let Err(e) = link.send_only(&mut audit, FrozenAction::get_temperatures()).await {
++            log::error!("failed to send GetTemperatures during baseline collection: {e}");
++            stats.record_timeout();
++        }
++        let drain_deadline = Instant::now() + TICK_DRAIN_WINDOW;
++        loop {
++            let remaining = drain_deadline.saturating_duration_since(Instant::now());
++            if remaining.is_zero() {
++                break;
++            }
++            match link.recv(remaining).await {
++                Ok(PacketOutcome::Received(pkt)) => {
++                    stats.record(&pkt);
++                    let elapsed_ms = baseline_start.elapsed().as_millis() as u64;
++                    match pkt {
++                        FrozenPacket::TemperatureUpdate(u) => {
++                            samples.push(
++                                (&sample_from_temperature_update(elapsed_ms, jiff::Timestamp::now().to_string(), &u))
++                                    .into(),
++                            );
++                            baseline_samples += 1;
++                        }
++                        FrozenPacket::GetTemperature(g) => {
++                            samples.push(
++                                (&sample_from_get_temperature(elapsed_ms, jiff::Timestamp::now().to_string(), &g))
++                                    .into(),
++                            );
++                        }
++                        _ => {}
++                    }
++                }
++                Ok(PacketOutcome::TimedOut) | Ok(PacketOutcome::Closed) => break,
++                Err(_) => break,
++            }
++        }
++        if baseline_start.elapsed() > BASELINE_WINDOW * 4 {
++            break; // hard backstop
++        }
++    }
++
++    // Mandatory warning and final confirmation, now that preflight has established firmware is
++    // reached, no target is enabled, and baseline telemetry is flowing.
++    eprintln!("WARNING: Priming may rapidly lower the reservoir water level.");
++    eprintln!("Watch the reservoir continuously.");
++    eprintln!("Stop immediately if the reservoir approaches empty.");
++    eprintln!("Keep access to disconnect Hub power.");
++    eprintln!("Do not touch the open electronics while powered.");
++    let start_ok = confirm_phrase(
++        args.assume_start_phrase.clone(),
++        FINAL_PHRASE,
++        &format!("Type {FINAL_PHRASE} to continue: "),
++    );
++    if !start_ok {
++        log::error!("refusing to run active test: final start phrase was not matched exactly");
++        let safe_stop = run_safe_stop(Some(link), &mut audit, Some(i2c)).await;
++        return finish(
++            args, dry_run, &audit, &stats, samples, pump_samples, solenoid_valve_messages,
++            reservoir_transition_messages, other_decoded_packets, pr, false, false, false, None,
++            safe_stop, StopReason::PreflightRefused, false, capture,
++            &expander, &led, subsystem_reset_ok, true, reached_firmware, hardware_info_str, firmware_probed, None,
++        );
++    }
++
++    // Step 16: send Prime exactly once. AuditedTransport::check additionally enforces this
++    // structurally (see safety.rs) -- this call site is simply the only place in this binary that
++    // ever attempts it.
++    let prime_frame_hex = FrozenAction::prime().to_command().to_bytes().iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
++    let send_result = link.send(&mut audit, FrozenAction::prime(), COMMAND_TIMEOUT).await;
++    pr.prime_command_transmitted = match &send_result {
++        Ok(_) => Verdict::Pass,
++        Err(_) => Verdict::Fail,
++    };
++
++    let mut priming_start_observed = false;
++    let mut priming_done_observed = false;
++    let mut priming_done_because_empty = false;
++    let mut stop_reason;
++    let mut telemetry_ok = true;
++
++    match &send_result {
++        Ok(PacketOutcome::Received(FrozenPacket::PrimingStarted)) => {
++            priming_start_observed = true;
++            pr.prime_acknowledgment = Verdict::Pass;
++        }
++        Ok(PacketOutcome::Received(other)) => {
++            other_decoded_packets.push(format!("{other:?}"));
++            pr.prime_acknowledgment = Verdict::Unverified;
++        }
++        Ok(_) => pr.prime_acknowledgment = Verdict::Unverified,
++        Err(_) => pr.prime_acknowledgment = Verdict::Unverified,
++    }
++
++    if send_result.is_err() {
++        stop_reason = StopReason::UartWriteFailure;
++        telemetry_ok = false;
++    } else {
++        stop_reason = StopReason::Normal;
++    }
++
++    let active_start = Instant::now();
++    let duration = Duration::from_secs(args.duration_seconds.min(HARD_MAX_DURATION_SECONDS));
++    let mut last_valid_at = Instant::now();
++    let mut last_flow_message: Option<String> = None;
++    let mut left_water_c: Option<f64> = None;
++    let mut right_water_c: Option<f64> = None;
++    let mut heatsink_c: Option<f64> = None;
++    let mut left_pump_last: Option<(f64, f64)> = None;
++    let mut right_pump_last: Option<(f64, f64)> = None;
++    let mut left_pump_confirmed_running = false;
++    let mut right_pump_confirmed_running = false;
++    let mut tick_count: u32 = 0;
++
++    if send_result.is_ok() {
++        'active: loop {
++            if active_start.elapsed() >= duration {
++                stop_reason = StopReason::DurationExpired;
++                break;
++            }
++            if priming_done_observed {
++                stop_reason = StopReason::PrimingCompleted;
++                break;
++            }
++
++            tick_count += 1;
++
++            // Polled every tick (~1/s), matching frozen-cool-test's proven cadence: Frozen has
++            // only ever been observed pushing a fresh TemperatureUpdate in response to being
++            // polled (see mock.rs/PROTOCOL_AUDIT.md), so throttling this specific request would
++            // make the staleness check below fire on every tick it's skipped, regardless of
++            // whether Prime is actually progressing normally.
++            if let Err(e) = link.send_only(&mut audit, FrozenAction::get_temperatures()).await {
++                log::error!("UART write failure during active phase: {e}");
++                stop_reason = StopReason::UartWriteFailure;
++                telemetry_ok = false;
++                break 'active;
++            }
++            if tick_count % BOOTLOADER_CHECK_EVERY_N_TICKS == 0
++                && let Err(e) = link.send_only(&mut audit, FrozenAction::ping()).await
++            {
++                log::error!("UART write failure during active phase: {e}");
++                stop_reason = StopReason::UartWriteFailure;
++                telemetry_ok = false;
++                break 'active;
++            }
++            if tick_count % I2C_CHECK_EVERY_N_TICKS == 0 {
++                let probe = probe_address(i2c, crate::i2c::RESET_EXPANDER_ADDR);
++                if !probe.success {
++                    log::error!("I2C re-probe of 0x20 failed during active phase: {}", probe.describe());
++                    stop_reason = StopReason::I2cFailureDuringPriming;
++                    telemetry_ok = false;
++                    break 'active;
++                }
++            }
++
++            let drain_deadline = Instant::now() + TICK_DRAIN_WINDOW;
++            loop {
++                let remaining = drain_deadline.saturating_duration_since(Instant::now());
++                if remaining.is_zero() {
++                    break;
++                }
++                tokio::select! {
++                    biased;
++                    reason = wait_for_termination_signal() => {
++                        stop_reason = reason;
++                        break 'active;
++                    }
++                    outcome = link.recv(remaining) => {
++                        match outcome {
++                            Ok(PacketOutcome::Received(FrozenPacket::TemperatureUpdate(u))) => {
++                                stats.record(&FrozenPacket::TemperatureUpdate(u.clone()));
++                                last_valid_at = Instant::now();
++                                let elapsed_ms = active_start.elapsed().as_millis() as u64;
++                                samples.push((&sample_from_temperature_update(elapsed_ms, jiff::Timestamp::now().to_string(), &u)).into());
++                                left_water_c = Some(crate::telemetry::centideg_to_celsius(u.left_temp));
++                                right_water_c = Some(crate::telemetry::centideg_to_celsius(u.right_temp));
++                                heatsink_c = Some(crate::telemetry::centideg_to_celsius(u.heatsink_temp));
++
++                                match std::panic::catch_unwind(|| evaluate_temperatures(u.left_temp, u.right_temp, u.heatsink_temp)) {
++                                    Ok(Ok(())) => {}
++                                    Ok(Err(reason)) => {
++                                        stop_reason = reason;
++                                        telemetry_ok = false;
++                                        break 'active;
++                                    }
++                                    Err(_panic) => {
++                                        log::error!("panic while evaluating a temperature sample; stopping safely");
++                                        stop_reason = StopReason::Panic;
++                                        telemetry_ok = false;
++                                        break 'active;
++                                    }
++                                }
++                            }
++                            Ok(PacketOutcome::Received(FrozenPacket::GetTemperature(g))) => {
++                                stats.record(&FrozenPacket::GetTemperature(g.clone()));
++                                let elapsed_ms = active_start.elapsed().as_millis() as u64;
++                                samples.push((&sample_from_get_temperature(elapsed_ms, jiff::Timestamp::now().to_string(), &g)).into());
++                            }
++                            Ok(PacketOutcome::Received(FrozenPacket::PrimingStarted)) => {
++                                stats.record(&FrozenPacket::PrimingStarted);
++                                priming_start_observed = true;
++                            }
++                            Ok(PacketOutcome::Received(FrozenPacket::Message(m))) => {
++                                stats.record(&FrozenPacket::Message(m.clone()));
++                                last_flow_message = Some(m.clone());
++
++                                if let Some(stage) = priming_stage_text(&m) {
++                                    match stage {
++                                        "start" => priming_start_observed = true,
++                                        "done" => priming_done_observed = true,
++                                        "done because empty" => {
++                                            priming_done_observed = true;
++                                            priming_done_because_empty = true;
++                                            log::warn!("firmware reports priming stopped because the reservoir is empty");
++                                        }
++                                        _ => {}
++                                    }
++                                    // Cataloged priming-stage text (including routine purge-retry
++                                    // "failed" counts) is informational, never auto-abort -- see
++                                    // module docs.
++                                } else if let Some((side, voltage, current)) = parse_pump_telemetry(&m) {
++                                    let elapsed_ms = active_start.elapsed().as_millis() as u64;
++                                    pump_samples.push(PumpSampleJson {
++                                        elapsed_ms,
++                                        timestamp: jiff::Timestamp::now().to_string(),
++                                        side: side.to_string(),
++                                        voltage,
++                                        current,
++                                        raw_message: m.clone(),
++                                    });
++                                    let running = voltage.is_some_and(|v| v > 0.0005);
++                                    match side {
++                                        "left" => left_pump_last = voltage.zip(current).or(left_pump_last),
++                                        _ => right_pump_last = voltage.zip(current).or(right_pump_last),
++                                    }
++                                    if running {
++                                        match side {
++                                            "left" => left_pump_confirmed_running = true,
++                                            _ => right_pump_confirmed_running = true,
++                                        }
++                                    }
++                                    if is_pump_fault_message(&m) {
++                                        stop_reason = StopReason::PumpFault;
++                                        telemetry_ok = false;
++                                        break 'active;
++                                    }
++                                } else if is_pump_fault_message(&m) {
++                                    stop_reason = StopReason::PumpFault;
++                                    telemetry_ok = false;
++                                    break 'active;
++                                } else if is_solenoid_or_valve_message(&m) {
++                                    solenoid_valve_messages.push(m.clone());
++                                } else if is_reservoir_transition_message(&m) {
++                                    reservoir_transition_messages.push(m.clone());
++                                } else if is_known_nonfatal_sensor_message(&m) {
++                                    log::warn!("firmware sensor-unavailable message (non-fatal): {m:?}");
++                                } else if is_generic_fault_message(&m) {
++                                    log::error!("firmware fault message during active phase: {m:?}");
++                                    stop_reason = StopReason::FirmwareFaultMessage;
++                                    telemetry_ok = false;
++                                    break 'active;
++                                }
++                            }
++                            Ok(PacketOutcome::Received(FrozenPacket::TargetUpdate((_, target)))) => {
++                                if target.enabled {
++                                    log::error!("an unexpected enabled target appeared during frozen-prime-test");
++                                    stop_reason = StopReason::TargetEnabledUnexpectedly;
++                                    telemetry_ok = false;
++                                    break 'active;
++                                }
++                            }
++                            Ok(PacketOutcome::Received(FrozenPacket::Pong(in_firmware))) => {
++                                if !in_firmware {
++                                    log::error!("Frozen returned to bootloader mode during frozen-prime-test");
++                                    stop_reason = StopReason::FrozenReturnedToBootloader;
++                                    telemetry_ok = false;
++                                    break 'active;
++                                }
++                            }
++                            Ok(PacketOutcome::Received(other)) => {
++                                stats.record(&other);
++                                other_decoded_packets.push(format!("{other:?}"));
++                            }
++                            Ok(PacketOutcome::TimedOut) => break,
++                            Ok(PacketOutcome::Closed) => {
++                                stop_reason = StopReason::TelemetryLost;
++                                telemetry_ok = false;
++                                break 'active;
++                            }
++                            Err(LinkError::ReadIo(e)) => {
++                                log::error!("UART read failure during active phase: {e}");
++                                stop_reason = StopReason::UartReadFailure;
++                                telemetry_ok = false;
++                                break 'active;
++                            }
++                            Err(e) => {
++                                log::error!("unexpected error draining telemetry: {e}");
++                            }
++                        }
++                    }
++                }
++            }
++
++            print_live_summary(
++                active_start.elapsed(),
++                true,
++                priming_start_observed,
++                priming_done_observed,
++                left_pump_last,
++                right_pump_last,
++                !solenoid_valve_messages.is_empty(),
++                &last_flow_message,
++                left_water_c,
++                right_water_c,
++                heatsink_c,
++                Some(last_valid_at.elapsed()),
++            );
++
++            if last_valid_at.elapsed() > STALE_TELEMETRY_LIMIT {
++                stop_reason = StopReason::TelemetryStale;
++                telemetry_ok = false;
++                break 'active;
++            }
++        }
++    }
++
++    pr.prime_start_observed = if priming_start_observed { Verdict::Pass } else { Verdict::Unverified };
++    pr.prime_completion_observed = if priming_done_observed { Verdict::Pass } else { Verdict::Unverified };
++    pr.left_pump_telemetry = if left_pump_confirmed_running {
++        Verdict::Pass
++    } else if left_pump_last.is_some() {
++        Verdict::Fail
++    } else {
++        Verdict::Unverified
++    };
++    pr.right_pump_telemetry = if right_pump_confirmed_running {
++        Verdict::Pass
++    } else if right_pump_last.is_some() {
++        Verdict::Fail
++    } else {
++        Verdict::Unverified
++    };
++    pr.solenoid_operation = if solenoid_valve_messages.iter().any(|m| {
++        let l = m.to_lowercase();
++        l.contains("fault") || l.contains("fail") || l.contains("stuck")
++    }) {
++        Verdict::Fail
++    } else if !solenoid_valve_messages.is_empty() {
++        Verdict::Pass
++    } else {
++        Verdict::Unverified
++    };
++
++    let safe_stop = run_safe_stop(Some(link), &mut audit, Some(i2c)).await;
++    pr.safe_stop_and_reset = if safe_stop.fully_succeeded() { Verdict::Pass } else { Verdict::Fail };
++
++    let observations = prompt_prime_observations();
++    pr.left_pump_operator_observation = observation_verdict(observations.as_ref().and_then(|o| o.left_pump_heard_or_felt.as_deref()));
++    pr.right_pump_operator_observation = observation_verdict(observations.as_ref().and_then(|o| o.right_pump_heard_or_felt.as_deref()));
++
++    let operator_water_movement = observations.as_ref().and_then(|o| o.water_movement_or_bubbles_observed.as_deref());
++    let operator_reservoir_dropped = observations.as_ref().and_then(|o| o.reservoir_level_dropped.as_deref());
++    let forced_fail = observations.as_ref().is_some_and(|o| {
++        o.leak_observed == Some(true) || o.abnormal_noise == Some(true) || o.burning_smell == Some(true)
++    });
++
++    pr.water_movement_observed = if !reservoir_transition_messages.is_empty() || operator_water_movement == Some("yes") {
++        Verdict::Pass
++    } else if operator_water_movement == Some("no") {
++        Verdict::Fail
++    } else {
++        Verdict::Unverified
++    };
++
++    // Never PASS from the command/ack/voltage/"done" alone -- requires either (operator evidence
++    // of both water movement AND reservoir-level change) OR a direct firmware circulation proof.
++    let water_circulation_proven = !reservoir_transition_messages.is_empty()
++        || (operator_water_movement == Some("yes") && operator_reservoir_dropped == Some("yes"));
++
++    pr.overall_result = if forced_fail
++        || pr.frozen_application_firmware == Verdict::Fail
++        || pr.prime_command_transmitted == Verdict::Fail
++        || pr.safe_stop_and_reset == Verdict::Fail
++        || pr.left_pump_telemetry == Verdict::Fail && pr.right_pump_telemetry == Verdict::Fail
++        || pr.solenoid_operation == Verdict::Fail
++    {
++        Verdict::Fail
++    } else if water_circulation_proven {
++        Verdict::Pass
++    } else {
++        Verdict::Inconclusive
++    };
++
++    let overall_pass = pr.overall_result == Verdict::Pass;
++
++    let _ = telemetry_ok;
++    finish(
++        args, dry_run, &audit, &stats, samples, pump_samples, solenoid_valve_messages,
++        reservoir_transition_messages, other_decoded_packets, pr, priming_start_observed,
++        priming_done_observed, priming_done_because_empty, observations, safe_stop, stop_reason,
++        overall_pass, capture, &expander, &led, subsystem_reset_ok, true, reached_firmware,
++        hardware_info_str, firmware_probed, Some(prime_frame_hex),
++    )
++}
++
++fn observation_verdict(answer: Option<&str>) -> Verdict {
++    match answer {
++        Some("yes") => Verdict::Pass,
++        Some("no") => Verdict::Fail,
++        _ => Verdict::Unverified,
++    }
++}
++
++fn prompt_prime_observations() -> Option<PrimeOperatorObservations> {
++    if !std::io::stdin().is_terminal() {
++        return None;
++    }
++    let ask = |prompt: &str| -> String {
++        eprint!("{prompt}");
++        let mut line = String::new();
++        let _ = std::io::stdin().read_line(&mut line);
++        line.trim().to_string()
++    };
++    Some(PrimeOperatorObservations {
++        left_pump_heard_or_felt: Some(ask("Left pump heard/felt? (yes/no/unsure): ")),
++        right_pump_heard_or_felt: Some(ask("Right pump heard/felt? (yes/no/unsure): ")),
++        water_movement_or_bubbles_observed: Some(ask("Water movement or bubbles observed? (yes/no/unsure): ")),
++        reservoir_level_dropped: Some(ask("Reservoir level dropped? (yes/no/unsure): ")),
++        reservoir_topped_up: Some(ask("Reservoir was topped up? (yes/no): ").eq_ignore_ascii_case("yes")),
++        leak_observed: Some(ask("Leak observed? (yes/no): ").eq_ignore_ascii_case("yes")),
++        abnormal_noise: Some(ask("Abnormal noise? (yes/no): ").eq_ignore_ascii_case("yes")),
++        burning_smell: Some(ask("Burning smell? (yes/no): ").eq_ignore_ascii_case("yes")),
++        notes: Some(ask("Notes (optional): ")),
++    })
++}
++
++#[allow(clippy::too_many_arguments)]
++fn finish(
++    args: &PrimeTestArgs,
++    dry_run: bool,
++    audit: &AuditedTransport,
++    stats: &PacketStats,
++    samples: Vec<TemperatureSampleJson>,
++    pump_samples: Vec<PumpSampleJson>,
++    solenoid_valve_messages: Vec<String>,
++    reservoir_transition_messages: Vec<String>,
++    other_decoded_packets: Vec<String>,
++    pr: PrimeResults,
++    priming_start_observed: bool,
++    priming_done_observed: bool,
++    priming_done_because_empty: bool,
++    observations: Option<PrimeOperatorObservations>,
++    safe_stop: crate::safe_stop::SafeStopResult,
++    stop_reason: StopReason,
++    overall_pass: bool,
++    capture: &crate::io_logging::RawIoCapture,
++    expander: &crate::i2c::ProbeResult,
++    led: &crate::i2c::ProbeResult,
++    subsystem_reset_ok: bool,
++    frozen_uart_opened: bool,
++    reached_firmware: bool,
++    hardware_info_str: Option<String>,
++    firmware_probed: bool,
++    prime_frame_hex: Option<String>,
++) -> (Report, u8) {
++    let raw_io_events = capture
++        .lock()
++        .map(|log| log.iter().map(crate::report::RawIoEventJson::from).collect())
++        .unwrap_or_default();
++
++    let mut report = Report {
++        program_version: DIAGNOSTIC_VERSION.to_string(),
++        opensleep_base_version: opensleep::VERSION.to_string(),
++        opensleep_source_commit: source_commit().to_string(),
++        kernel: kernel_release(),
++        arch: std::env::consts::ARCH.to_string(),
++        mode: audit.mode().label().to_string(),
++        dry_run,
++        confirmations: Confirmations {
++            cover_hydraulics_connected_declared: Some(args.confirm_cover_hydraulics_connected),
++            water_loop_filled_declared: Some(args.confirm_reservoir_filled),
++            no_visible_leaks_declared: Some(args.confirm_no_visible_leaks),
++            active_test_confirmed_flag: Some(args.confirm_active_test),
++            interactive_phrase_confirmed: Some(true),
++            final_start_phrase_confirmed: Some(pr.prime_command_transmitted != Verdict::Unknown),
++        },
++        i2c_device: args.i2c_device.clone(),
++        i2c_bus_open: true,
++        reset_expander_probe_ok: expander.success,
++        reset_expander_value: expander.value,
++        led_controller_probe_ok: led.success,
++        subsystem_reset_performed: true,
++        subsystem_reset_ok,
++        frozen_port: args.frozen_port.clone(),
++        frozen_uart_opened,
++        frozen_bootloader_ping: None,
++        frozen_firmware_ping: Some(reached_firmware),
++        frozen_hardware_info: hardware_info_str,
++        firmware_version_or_hash: None,
++        frozen_firmware_probed: firmware_probed,
++        detected_initial_mode: None,
++        firmware_jump_sent: false,
++        outgoing_commands: audit.entries().iter().map(AuditEntryJson::from).collect(),
++        enabled_target_command_count: audit.enabled_target_count(),
++        prime_command_count: audit.prime_count(),
++        random_command_count: audit.random_count(),
++        safety_off_commands_sent: audit.entries().iter().filter(|e| e.enabled == Some(false)).count() as u32,
++        rejected_command_count: audit.rejected_command_count(),
++        prime_frame_hex,
++        telemetry_samples: samples,
++        raw_packets_decoded: stats.raw_packets_decoded,
++        malformed_windows: stats.malformed_windows,
++        communication_timeouts: stats.timeouts,
++        unsolicited_telemetry_seen: stats.unsolicited_telemetry_seen,
++        firmware_messages: stats.messages.clone(),
++        pump_samples,
++        solenoid_valve_messages,
++        reservoir_transition_messages,
++        other_decoded_packets,
++        raw_io_events,
++        priming_start_observed,
++        priming_done_observed,
++        priming_done_because_empty,
++        operator_observations: None,
++        prime_operator_observations: observations,
++        stop_reason: stop_reason.to_string(),
++        safe_stop: Some((&safe_stop).into()),
++        component_results: None,
++        prime_results: Some(pr),
++        overall_pass,
++        exit_code: 0,
++    };
++    report.exit_code = if overall_pass { 0 } else if !safe_stop.fully_succeeded() { 21 } else { 1 };
++
++    if let Some(path) = &args.json_output
++        && let Err(e) = report.write_json(path)
++    {
++        log::error!("failed to write JSON output to {path}: {e}");
++    }
++    report.print_table();
++
++    let code = report.exit_code;
++    (report, code)
++}
++
++fn refused_report(args: &PrimeTestArgs, dry_run: bool, reason: &str) -> Report {
++    Report {
++        program_version: DIAGNOSTIC_VERSION.to_string(),
++        opensleep_base_version: opensleep::VERSION.to_string(),
++        opensleep_source_commit: source_commit().to_string(),
++        kernel: kernel_release(),
++        arch: std::env::consts::ARCH.to_string(),
++        mode: "frozen-prime-test".to_string(),
++        dry_run,
++        confirmations: Confirmations {
++            cover_hydraulics_connected_declared: Some(args.confirm_cover_hydraulics_connected),
++            water_loop_filled_declared: Some(args.confirm_reservoir_filled),
++            no_visible_leaks_declared: Some(args.confirm_no_visible_leaks),
++            active_test_confirmed_flag: Some(args.confirm_active_test),
++            interactive_phrase_confirmed: Some(false),
++            final_start_phrase_confirmed: Some(false),
++        },
++        i2c_device: args.i2c_device.clone(),
++        i2c_bus_open: false,
++        reset_expander_probe_ok: false,
++        reset_expander_value: None,
++        led_controller_probe_ok: false,
++        subsystem_reset_performed: false,
++        subsystem_reset_ok: false,
++        frozen_port: args.frozen_port.clone(),
++        frozen_uart_opened: false,
++        frozen_bootloader_ping: None,
++        frozen_firmware_ping: None,
++        frozen_hardware_info: None,
++        firmware_version_or_hash: None,
++        frozen_firmware_probed: false,
++        detected_initial_mode: None,
++        firmware_jump_sent: false,
++        outgoing_commands: Vec::new(),
++        enabled_target_command_count: 0,
++        prime_command_count: 0,
++        random_command_count: 0,
++        safety_off_commands_sent: 0,
++        rejected_command_count: 0,
++        prime_frame_hex: None,
++        telemetry_samples: Vec::new(),
++        raw_packets_decoded: 0,
++        malformed_windows: 0,
++        communication_timeouts: 0,
++        unsolicited_telemetry_seen: false,
++        firmware_messages: Vec::new(),
++        pump_samples: Vec::new(),
++        solenoid_valve_messages: Vec::new(),
++        reservoir_transition_messages: Vec::new(),
++        other_decoded_packets: Vec::new(),
++        raw_io_events: Vec::new(),
++        priming_start_observed: false,
++        priming_done_observed: false,
++        priming_done_because_empty: false,
++        operator_observations: None,
++        prime_operator_observations: None,
++        stop_reason: reason.to_string(),
++        safe_stop: None,
++        component_results: None,
++        prime_results: None,
++        overall_pass: false,
++        exit_code: 30,
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::report::Verdict;
++    use opensleep::frozen::packet::TemperatureUpdate;
++
++    fn args(dry_run: bool) -> PrimeTestArgs {
++        PrimeTestArgs {
++            i2c_device: "/dev/i2c-1".into(),
++            frozen_port: "/dev/ttyS1".into(),
++            duration_seconds: 8,
++            confirm_cover_hydraulics_connected: true,
++            confirm_reservoir_filled: true,
++            confirm_cover_loop_needs_priming: true,
++            confirm_no_visible_leaks: true,
++            confirm_active_test: true,
++            json_output: None,
++            verbose: false,
++            dry_run,
++            assume_interactive_phrase: Some(INTERACTIVE_PHRASE.to_string()),
++            assume_start_phrase: Some(FINAL_PHRASE.to_string()),
++        }
++    }
++
++    // ---- 1-4: Prime is allowed only in frozen-prime-test (already proven at the transport
++    // layer by safety::tests::prime_is_refused_outside_prime_test_mode /
++    // prime_test_mode_allows_prime_exactly_once / prime_test_mode_never_allows_an_enabled_target,
++    // and at the source level by guardrail_tests::frozen_action_prime_is_referenced_only_in_safety_and_prime_test). ----
++
++    #[test]
++    fn prime_action_serializes_to_the_exact_source_evidenced_frame() {
++        // Ties this file directly to frozen/command.rs's own test_prime fixture: 7E 01 52 B6 2B.
++        let bytes = FrozenAction::prime().to_command().to_bytes();
++        assert_eq!(bytes, vec![0x7E, 0x01, 0x52, 0xB6, 0x2B]);
++    }
++
++    // ---- 5-6: Prime sent at most once; no automatic retry. ----
++
++    #[tokio::test]
++    async fn dry_run_sends_prime_exactly_once() {
++        let (report, _code) = run(&args(true)).await;
++        assert_eq!(report.prime_command_count, 1);
++    }
++
++    // ---- 7: enabled temperature targets cannot be constructed in prime mode (also see
++    // safety::tests::prime_test_mode_never_allows_an_enabled_target at the transport layer). ----
++
++    #[tokio::test]
++    async fn dry_run_never_enables_a_target() {
++        let (report, _code) = run(&args(true)).await;
++        assert_eq!(report.enabled_target_command_count, 0);
++        assert!(report.outgoing_commands.iter().all(|c| c.enabled != Some(true)));
++    }
++
++    // ---- 8: all confirmation flags are mandatory. ----
++
++    #[tokio::test]
++    async fn refuses_without_all_confirmation_flags() {
++        let mut a = args(true);
++        a.confirm_no_visible_leaks = false;
++        let (report, code) = run(&a).await;
++        assert_eq!(code, 30);
++        assert!(!report.overall_pass);
++        assert_eq!(report.prime_command_count, 0);
++    }
++
++    // ---- 9: incorrect interactive confirmation is rejected. ----
++
++    #[tokio::test]
++    async fn refuses_when_interactive_phrase_is_wrong() {
++        let mut a = args(true);
++        a.assume_interactive_phrase = Some("nope".to_string());
++        let (report, code) = run(&a).await;
++        assert_eq!(code, 30);
++        assert!(!report.overall_pass);
++    }
++
++    // ---- 10: duration cannot exceed 60 seconds, and cannot go below 5. ----
++
++    #[tokio::test]
++    async fn refuses_when_duration_exceeds_hard_maximum() {
++        let mut a = args(true);
++        a.duration_seconds = 61;
++        let (_, code) = run(&a).await;
++        assert_eq!(code, 30);
++    }
++
++    #[tokio::test]
++    async fn refuses_when_duration_is_below_minimum() {
++        let mut a = args(true);
++        a.duration_seconds = 4;
++        let (_, code) = run(&a).await;
++        assert_eq!(code, 30);
++    }
++
++    #[test]
++    fn duration_bounds_match_spec() {
++        assert_eq!(HARD_MAX_DURATION_SECONDS, 60);
++        assert_eq!(MIN_DURATION_SECONDS, 5);
++    }
++
++    // ---- 11: Ctrl+C triggers safe-stop (mechanism shared with frozen-cool-test; see that
++    // module's docs for why real signal delivery isn't exercised in this suite). ----
++
++    #[tokio::test]
++    async fn termination_signal_future_does_not_resolve_spuriously() {
++        let result = tokio::time::timeout(Duration::from_millis(150), wait_for_termination_signal()).await;
++        assert!(result.is_err(), "must not resolve without a real signal");
++    }
++
++    // ---- 12: timeout (duration expiry) triggers safe-stop. ----
++
++    #[tokio::test]
++    async fn active_phase_stops_at_duration_expired_and_still_runs_safe_stop() {
++        let mut a = args(true);
++        a.duration_seconds = MIN_DURATION_SECONDS;
++        let (report, _) = run(&a).await;
++        assert!(
++            report.stop_reason.contains("duration")
++                || report.stop_reason == StopReason::DurationExpired.to_string()
++                || report.stop_reason == StopReason::PrimingCompleted.to_string()
++        );
++        assert!(report.safe_stop.is_some());
++        assert!(report.safe_stop.unwrap().i2c_reset_asserted);
++    }
++
++    /// A fake device that acks Ping/JumpToFirmware/GetHardwareInfo/GetFirmware/SetTargetTemperature
++    /// and always pushes an unsolicited TemperatureUpdate for GetTemperatures requests (so
++    /// staleness never fires on its own), acks Prime with PrimingStarted, and then -- once primed
++    /// -- goes completely silent (closes nothing, just stops answering), simulating a UART/
++    /// telemetry failure during the active phase.
++    fn spawn_device_that_goes_silent_after_prime(mut device_side: tokio::io::DuplexStream) -> tokio::task::JoinHandle<()> {
++        use bytes::{Buf, BytesMut};
++        use tokio::io::{AsyncReadExt, AsyncWriteExt};
++        tokio::spawn(async move {
++            let mut acc = BytesMut::new();
++            let mut read_buf = [0u8; 256];
++            let mut primed = false;
++            let mut count: u8 = 0;
++            loop {
++                if acc.len() >= 2 {
++                    let len = acc[1] as usize;
++                    let total = 1 + 1 + len + 2;
++                    if acc.len() >= total {
++                        let opcode = acc[2];
++                        let payload = acc[2..2 + len].to_vec();
++                        acc.advance(total);
++                        if primed {
++                            // Silent: acknowledge nothing further, simulating a dead link.
++                            continue;
++                        }
++                        let response = match opcode {
++                            0x01 => Some(opensleep::common::codec::command(vec![0x81, 0x00, 0b0100_0110])),
++                            0x02 => None,
++                            0x04 => Some(opensleep::common::codec::command(vec![0x84])),
++                            0x10 => Some(opensleep::common::codec::command(vec![0x90, 0x00])),
++                            0x41 => {
++                                count = count.wrapping_add(1);
++                                Some(opensleep::common::codec::command(vec![
++                                    0x41, 0x09, 0x9A, 0x09, 0xA4, 0x0A, 0x28, 9, count,
++                                ]))
++                            }
++                            0x40 if payload.len() == 5 => Some(opensleep::common::codec::command(vec![
++                                0xC0, 0x00, payload[1], payload[2], payload[3], payload[4],
++                            ])),
++                            0x52 => {
++                                primed = true;
++                                Some(opensleep::common::codec::command(vec![0xD2, 0x00]))
++                            }
++                            _ => None,
++                        };
++                        if let Some(resp) = response
++                            && device_side.write_all(&resp).await.is_err()
++                        {
++                            break;
++                        }
++                        continue;
++                    }
++                }
++                match device_side.read(&mut read_buf).await {
++                    Ok(0) | Err(_) => break,
++                    Ok(n) => acc.extend_from_slice(&read_buf[..n]),
++                }
++            }
++        })
++    }
++
++    // ---- 13: UART failure triggers safe-stop. ----
++
++    #[tokio::test]
++    async fn going_silent_after_prime_triggers_safe_stop() {
++        let (client, device) = tokio::io::duplex(8192);
++        let device_task = spawn_device_that_goes_silent_after_prime(device);
++        let mut link = FrozenLink::wrap(client, "test");
++        let mut i2c = MockI2c::always_succeed();
++        let capture: crate::io_logging::RawIoCapture = Arc::new(Mutex::new(Vec::new()));
++
++        let mut a = args(false);
++        a.duration_seconds = 10;
++        let (report, _code) = run_core(&a, &mut i2c, Some(&mut link), false, &capture).await;
++
++        assert_eq!(report.prime_command_count, 1);
++        assert!(
++            report.stop_reason == StopReason::TelemetryStale.to_string()
++                || report.stop_reason == StopReason::TelemetryLost.to_string()
++                || report.stop_reason == StopReason::UartReadFailure.to_string()
++        );
++        assert!(report.safe_stop.unwrap().i2c_reset_asserted);
++
++        drop(link);
++        device_task.abort();
++    }
++
++    // ---- 14: internal task failure triggers safe-stop -- practical limitation matches
++    // frozen-cool-test's: no panic-injection hook exists to force a real panic safely from a
++    // test. evaluate_temperatures itself is covered directly below as the thing catch_unwind
++    // wraps. ----
++
++    #[test]
++    fn evaluate_temperatures_accepts_plausible_values() {
++        assert!(evaluate_temperatures(2450, 2460, 2600).is_ok());
++    }
++
++    #[test]
++    fn evaluate_temperatures_rejects_out_of_range_water() {
++        assert_eq!(evaluate_temperatures(100, 2460, 2600), Err(StopReason::TemperatureRangeExceeded));
++        assert_eq!(evaluate_temperatures(2450, 100, 2600), Err(StopReason::TemperatureRangeExceeded));
++    }
++
++    #[test]
++    fn evaluate_temperatures_rejects_heatsink_over_limit() {
++        assert_eq!(evaluate_temperatures(2450, 2460, 5000), Err(StopReason::HeatsinkLimitExceeded));
++    }
++
++    // ---- 15-17: safe-stop disables both targets three times and asserts 0x20 reset (mode-
++    // agnostic mechanism, already proven in safe_stop::tests); failed reset causes a nonzero exit. ----
++
++    #[tokio::test]
++    async fn failed_i2c_reset_causes_a_nonzero_exit_code() {
++        let (client, task) = mock_frozen_link_pair();
++        let mut link = FrozenLink::wrap(client, "test");
++        let mut i2c = MockI2c { fail_all_writes: true, ..MockI2c::always_succeed() };
++        let capture: crate::io_logging::RawIoCapture = Arc::new(Mutex::new(Vec::new()));
++
++        let mut a = args(false);
++        a.duration_seconds = MIN_DURATION_SECONDS;
++        let (report, code) = run_core(&a, &mut i2c, Some(&mut link), false, &capture).await;
++
++        assert_ne!(code, 0);
++        assert!(!report.safe_stop.unwrap().i2c_reset_asserted);
++
++        drop(link);
++        task.abort();
++    }
++
++    // ---- 18-20: 0x53 failure remains nonfatal; the Sensor UART, MQTT, and the normal config file
++    // are never referenced -- covered by i2c::tests and guardrail_tests (which scan this file too). ----
++
++    #[tokio::test]
++    async fn dry_run_completes_despite_the_led_controller_probe_failing() {
++        // MockI2c::always_succeed deliberately fails the 0x53 read (ENXIO), mirroring confirmed
++        // hardware; this proves it doesn't block frozen-prime-test either.
++        let (report, _code) = run(&args(true)).await;
++        assert!(!report.led_controller_probe_ok);
++        assert!(report.reset_expander_probe_ok);
++    }
++
++    // ---- 21-22: capwater/flowrate unavailable are recognized as warnings, not preflight failures. ----
++
++    #[test]
++    fn capwater_and_flowrate_unavailable_are_recognized_as_nonfatal_sensor_messages() {
++        assert!(is_known_nonfatal_sensor_message("FW: [capwater] sensor unavailable"));
++        assert!(is_known_nonfatal_sensor_message("FW: [flowrate] sensor unavailable"));
++    }
++
++    // ---- 23: control_error_c does not cause an automatic abort. ----
++
++    #[test]
++    fn evaluate_temperatures_has_no_control_error_parameter_to_gate_on() {
++        // Same structural proof as cool_test.rs: evaluate_temperatures doesn't even take this
++        // field, which is itself the proof it can never gate a decision.
++        assert!(evaluate_temperatures(2450, 2460, 2600).is_ok());
++    }
++
++    #[tokio::test]
++    async fn control_error_c_is_reported_but_never_gates_the_run() {
++        let (report, _code) = run(&args(true)).await;
++        // Real captured evidence: this control-loop error term is consistently 9 during normal
++        // operation (see telemetry.rs/mock.rs docs) -- present in samples, never causing a FAIL.
++        assert!(report.telemetry_samples.iter().any(|s| s.control_error_c == Some(9)));
++        assert_ne!(report.stop_reason, StopReason::TemperatureRangeExceeded.to_string());
++    }
++
++    // ---- 24: machine evidence and operator observations remain separate. ----
++
++    #[tokio::test]
++    async fn operator_observations_field_is_never_used_by_this_mode() {
++        let (report, _code) = run(&args(true)).await;
++        // frozen-prime-test uses its own, distinctly-typed prime_operator_observations field --
++        // the shared operator_observations field (used by frozen-cool-test) always stays None.
++        assert!(report.operator_observations.is_none());
++    }
++
++    // ---- 25: writing Prime alone (plus ack, plus pump voltage, plus "done") cannot produce a
++    // PASS without water-movement/reservoir-level evidence. ----
++
++    #[tokio::test]
++    async fn overall_result_is_inconclusive_not_pass_from_command_and_pumps_alone() {
++        // dry-run against the shared mock: Prime is sent and acked, pump telemetry and "done" are
++        // observed (see mock.rs), but stdin isn't a TTY so no operator observations exist and the
++        // mock never emits a reservoir-transition message -- exactly the "insufficient evidence"
++        // case the spec requires INCONCLUSIVE for for, not PASS.
++        let mut a = args(true);
++        a.duration_seconds = 10;
++        let (report, _code) = run(&a).await;
++        let pr = report.prime_results.expect("prime_results must be set");
++        assert_eq!(pr.prime_command_transmitted, Verdict::Pass);
++        assert_ne!(pr.overall_result, Verdict::Pass, "must never PASS from command/ack/pump/done alone");
++        assert_eq!(pr.overall_result, Verdict::Inconclusive);
++        assert!(!report.overall_pass);
++    }
++
++    /// A fake device identical in spirit to the shared mock's Prime handling, but which also
++    /// emits `"FW: water empty -> full"` shortly after priming starts -- the one kind of firmware
++    /// evidence this binary treats as sufficient, on its own, to prove water circulation.
++    fn spawn_device_with_reservoir_transition_evidence(mut device_side: tokio::io::DuplexStream) -> tokio::task::JoinHandle<()> {
++        use bytes::{Buf, BytesMut};
++        use tokio::io::{AsyncReadExt, AsyncWriteExt};
++        tokio::spawn(async move {
++            let mut acc = BytesMut::new();
++            let mut read_buf = [0u8; 256];
++            let mut primed = false;
++            let mut post_prime_ticks = 0u32;
++            let mut count: u8 = 0;
++            loop {
++                if acc.len() >= 2 {
++                    let len = acc[1] as usize;
++                    let total = 1 + 1 + len + 2;
++                    if acc.len() >= total {
++                        let opcode = acc[2];
++                        let payload = acc[2..2 + len].to_vec();
++                        acc.advance(total);
++                        let mut frames: Vec<Vec<u8>> = Vec::new();
++                        match opcode {
++                            0x01 => frames.push(opensleep::common::codec::command(vec![0x81, 0x00, 0b0100_0110])),
++                            0x04 => frames.push(opensleep::common::codec::command(vec![0x84])),
++                            0x10 => frames.push(opensleep::common::codec::command(vec![0x90, 0x00])),
++                            0x40 if payload.len() == 5 => frames.push(opensleep::common::codec::command(vec![
++                                0xC0, 0x00, payload[1], payload[2], payload[3], payload[4],
++                            ])),
++                            0x52 => {
++                                primed = true;
++                                frames.push(opensleep::common::codec::command(vec![0xD2, 0x00]));
++                            }
++                            0x41 => {
++                                count = count.wrapping_add(1);
++                                frames.push(opensleep::common::codec::command(vec![
++                                    0x41, 0x09, 0x9A, 0x09, 0xA4, 0x0A, 0x28, 9, count,
++                                ]));
++                                if primed {
++                                    post_prime_ticks += 1;
++                                    if post_prime_ticks == 1 {
++                                        let mut p = vec![0x07u8, 0x00];
++                                        p.extend_from_slice(b"FW: water empty -> full");
++                                        frames.push(opensleep::common::codec::command(p));
++                                    }
++                                }
++                            }
++                            _ => {}
++                        }
++                        for f in frames {
++                            if device_side.write_all(&f).await.is_err() {
++                                return;
++                            }
++                        }
++                        continue;
++                    }
++                }
++                match device_side.read(&mut read_buf).await {
++                    Ok(0) | Err(_) => break,
++                    Ok(n) => acc.extend_from_slice(&read_buf[..n]),
++                }
++            }
++        })
++    }
++
++    #[tokio::test]
++    async fn direct_firmware_circulation_evidence_produces_overall_pass() {
++        let (client, device) = tokio::io::duplex(8192);
++        let device_task = spawn_device_with_reservoir_transition_evidence(device);
++        let mut link = FrozenLink::wrap(client, "test");
++        let mut i2c = MockI2c::always_succeed();
++        let capture: crate::io_logging::RawIoCapture = Arc::new(Mutex::new(Vec::new()));
++
++        let mut a = args(false);
++        a.duration_seconds = 6;
++        let (report, _code) = run_core(&a, &mut i2c, Some(&mut link), false, &capture).await;
++
++        assert!(!report.reservoir_transition_messages.is_empty());
++        let pr = report.prime_results.expect("prime_results must be set");
++        assert_eq!(pr.overall_result, Verdict::Pass);
++        assert!(report.overall_pass);
++
++        drop(link);
++        device_task.abort();
++    }
++
++    // ---- 26: dry-run performs no hardware writes. ----
++
++    #[tokio::test]
++    async fn dry_run_never_touches_real_devices() {
++        let (report, _code) = run(&args(true)).await;
++        assert!(report.dry_run);
++        assert_eq!(report.prime_command_count, 1);
++        assert_eq!(report.enabled_target_command_count, 0);
++    }
++
++    // ---- 27-28: Prime-command count exactly one; enabled-target count always zero (see also
++    // dry_run_sends_prime_exactly_once / dry_run_never_enables_a_target above). ----
++
++    #[tokio::test]
++    async fn rejected_command_count_is_zero_on_a_clean_run() {
++        let (report, _code) = run(&args(true)).await;
++        assert_eq!(report.rejected_command_count, 0);
++    }
++
++    // ---- Helper-function unit tests (parsing/classification logic). ----
++
++    #[test]
++    fn pump_telemetry_parses_voltage_and_current() {
++        assert_eq!(
++            parse_pump_telemetry("FW: pump[left] slow @ 6.030475V 0.169202A"),
++            Some(("left", Some(6.030475), Some(0.169202)))
++        );
++        assert_eq!(
++            parse_pump_telemetry("FW: pump[right] slow @ 6.044009V 0.161510A"),
++            Some(("right", Some(6.044009), Some(0.161510)))
++        );
++    }
++
++    #[test]
++    fn pump_telemetry_ignores_unrelated_messages() {
++        assert_eq!(parse_pump_telemetry("FW: [priming] start"), None);
++    }
++
++    #[test]
++    fn pump_fault_message_is_detected_narrowly() {
++        assert!(is_pump_fault_message("FW: pump[left] fault"));
++        assert!(!is_pump_fault_message("FW: pump[left] slow @ 6.03V 0.17A"));
++    }
++
++    #[test]
++    fn solenoid_and_valve_messages_are_detected() {
++        assert!(is_solenoid_or_valve_message("FW: solenoid[left] open"));
++        assert!(is_solenoid_or_valve_message("FW: valve stuck"));
++        assert!(!is_solenoid_or_valve_message("FW: pump[left] slow @ 6.03V 0.17A"));
++    }
++
++    #[test]
++    fn reservoir_transition_messages_are_detected() {
++        assert!(is_reservoir_transition_message("FW: water empty -> full"));
++        assert!(is_reservoir_transition_message("FW: water full -> empty"));
++        assert!(!is_reservoir_transition_message("FW: [capwater] sensor unavailable"));
++    }
++
++    #[test]
++    fn priming_stage_text_strips_the_known_prefix() {
++        assert_eq!(priming_stage_text("FW: [priming] done"), Some("done"));
++        assert_eq!(priming_stage_text("FW: [priming] done because empty"), Some("done because empty"));
++        assert_eq!(priming_stage_text("FW: pump[left] slow @ 6.03V 0.17A"), None);
++    }
++
++    #[test]
++    fn flash_locked_is_excluded_from_the_generic_fault_scan() {
++        assert!(!is_generic_fault_message("FW: flash locked"));
++        assert!(is_generic_fault_message("FW: overcurrent shutdown"));
++    }
++
++    #[test]
++    fn temperature_update_constructor_used_by_this_suite_is_well_formed() {
++        let u = TemperatureUpdate { left_temp: 2450, right_temp: 2460, heatsink_temp: 2600, error: 9, count: 1 };
++        assert!(evaluate_temperatures(u.left_temp, u.right_temp, u.heatsink_temp).is_ok());
++    }
++}
 diff --git a/src/bin/opensleep-diagnostic/report.rs b/src/bin/opensleep-diagnostic/report.rs
 new file mode 100644
-index 0000000..280409c
+index 0000000..0fa85a0
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/report.rs
-@@ -0,0 +1,317 @@
+@@ -0,0 +1,442 @@
 +//! Structured JSON/CSV/text reporting shared by all three subcommands. Machine evidence (audit
 +//! log, decoded telemetry) is always kept in separate fields from operator-entered observations,
 +//! per the safety model: a component may only be marked PASS from decoded evidence or an explicit
@@ -3787,6 +5531,23 @@ index 0000000..280409c
 +    pub notes: Option<String>,
 +}
 +
++/// `frozen-prime-test`'s operator-entered observations, kept as a distinct type (not reused from
++/// `OperatorObservations`) since the questions asked are different, and separate from every
++/// machine-decoded field per the safety model's evidentiary-separation requirement.
++#[derive(Debug, Clone, Serialize, Default)]
++pub struct PrimeOperatorObservations {
++    /// "yes" | "no" | "unsure"
++    pub left_pump_heard_or_felt: Option<String>,
++    pub right_pump_heard_or_felt: Option<String>,
++    pub water_movement_or_bubbles_observed: Option<String>,
++    pub reservoir_level_dropped: Option<String>,
++    pub reservoir_topped_up: Option<bool>,
++    pub leak_observed: Option<bool>,
++    pub abnormal_noise: Option<bool>,
++    pub burning_smell: Option<bool>,
++    pub notes: Option<String>,
++}
++
 +#[derive(Debug, Clone, Serialize, Default)]
 +pub struct ComponentResults {
 +    pub frozen_command_accepted: Verdict,
@@ -3796,6 +5557,58 @@ index 0000000..280409c
 +    pub telemetry_remained_valid: Verdict,
 +    pub emergency_shutdown: Verdict,
 +    pub overall_selected_side_result: Verdict,
++}
++
++/// `frozen-prime-test`'s per-run result line, reported independently per the safety model: never
++/// collapsed into one pass/fail, and never PASS merely because the command was accepted, the
++/// firmware acknowledged it, a pump received voltage, or "priming done" was printed. See
++/// PROTOCOL_AUDIT.md.
++#[derive(Debug, Clone, Serialize, Default)]
++pub struct PrimeResults {
++    pub frozen_application_firmware: Verdict,
++    pub prime_command_transmitted: Verdict,
++    pub prime_acknowledgment: Verdict,
++    pub prime_start_observed: Verdict,
++    pub left_pump_telemetry: Verdict,
++    pub right_pump_telemetry: Verdict,
++    pub left_pump_operator_observation: Verdict,
++    pub right_pump_operator_observation: Verdict,
++    pub solenoid_operation: Verdict,
++    pub water_movement_observed: Verdict,
++    pub prime_completion_observed: Verdict,
++    pub safe_stop_and_reset: Verdict,
++    pub overall_result: Verdict,
++}
++
++/// One decoded firmware pump message (`FW: pump[<side>] ... @ <V>V <A>A`), kept separate from
++/// `telemetry_samples` since it is not a temperature reading.
++#[derive(Debug, Clone, Serialize)]
++pub struct PumpSampleJson {
++    pub elapsed_ms: u64,
++    pub timestamp: String,
++    pub side: String,
++    pub voltage: Option<f64>,
++    pub current: Option<f64>,
++    pub raw_message: String,
++}
++
++/// Raw RX/TX byte chunks captured by `io_logging::LoggingIo`'s optional capture sink. See that
++/// module's docs: this is a byte-chunk log, not a per-frame log.
++#[derive(Debug, Clone, Serialize)]
++pub struct RawIoEventJson {
++    pub direction: String,
++    pub hex: String,
++    pub timestamp: String,
++}
++
++impl From<&crate::io_logging::RawIoEvent> for RawIoEventJson {
++    fn from(e: &crate::io_logging::RawIoEvent) -> Self {
++        Self {
++            direction: e.direction.to_string(),
++            hex: e.hex.clone(),
++            timestamp: e.timestamp.clone(),
++        }
++    }
 +}
 +
 +#[derive(Debug, Clone, Serialize)]
@@ -3868,6 +5681,13 @@ index 0000000..280409c
 +    pub prime_command_count: u32,
 +    pub random_command_count: u32,
 +    pub safety_off_commands_sent: u32,
++    /// Every command `AuditedTransport::check` refused, for any reason -- the audited "unknown
++    /// commands attempted" counter. Always 0 outside `frozen-prime-test`.
++    pub rejected_command_count: u32,
++    /// The exact bytes of the single `Prime` frame, if it was sent (or, in `--dry-run`, the bytes
++    /// that would have been sent) -- derived from the real, unmodified `FrozenCommand::to_bytes`
++    /// encoder, never reconstructed. `None` outside `frozen-prime-test`.
++    pub prime_frame_hex: Option<String>,
 +
 +    pub telemetry_samples: Vec<TemperatureSampleJson>,
 +    pub raw_packets_decoded: u64,
@@ -3875,11 +5695,44 @@ index 0000000..280409c
 +    pub communication_timeouts: u64,
 +    pub unsolicited_telemetry_seen: bool,
 +    pub firmware_messages: Vec<String>,
++    /// Decoded firmware pump messages (`frozen-prime-test` only; always empty otherwise).
++    pub pump_samples: Vec<PumpSampleJson>,
++    /// Firmware messages mentioning "solenoid" or "valve" (`frozen-prime-test` only). No such
++    /// message has ever been observed in the pinned source or captured logs -- see
++    /// PROTOCOL_AUDIT.md -- so this is a forward-compatible keyword scan, not a confirmed protocol
++    /// feature; absence is not evidence of anything.
++    pub solenoid_valve_messages: Vec<String>,
++    /// `"FW: water empty -> full"` / `"FW: water full -> empty"` messages, if observed
++    /// (`frozen/state.rs` source evidence). May never fire on hardware where the capwater sensor
++    /// is unavailable; absence is not evidence of failure.
++    pub reservoir_transition_messages: Vec<String>,
++    /// Every decoded packet not already specifically interpreted above, preserved rather than
++    /// discarded (`frozen-prime-test` only).
++    pub other_decoded_packets: Vec<String>,
++    /// Raw RX/TX byte chunks, if raw-frame capture was enabled (`frozen-prime-test` only). See
++    /// `io_logging.rs` module docs for exactly what "raw" means here.
++    pub raw_io_events: Vec<RawIoEventJson>,
++    /// Set as soon as either the `PrimingStarted` (0xD2) packet or a `"FW: [priming] start"`
++    /// message is observed. `frozen-prime-test` only.
++    pub priming_start_observed: bool,
++    /// Set as soon as a `"FW: [priming] done"` or `"FW: [priming] done because empty"` message is
++    /// observed -- the only completion signal that exists in the reused protocol; there is no
++    /// binary "priming complete" packet. `frozen-prime-test` only.
++    pub priming_done_observed: bool,
++    /// True specifically for `"FW: [priming] done because empty"`: the firmware's own account
++    /// that it stopped because the reservoir ran dry. `frozen-prime-test` only.
++    pub priming_done_because_empty: bool,
 +
 +    pub operator_observations: Option<OperatorObservations>,
++    /// `frozen-prime-test`'s own operator observations (distinct type/questions) -- always `None`
++    /// outside that mode, exactly as `operator_observations` is always `None` inside it.
++    pub prime_operator_observations: Option<PrimeOperatorObservations>,
 +    pub stop_reason: String,
 +    pub safe_stop: Option<SafeStopJson>,
 +    pub component_results: Option<ComponentResults>,
++    /// `frozen-prime-test`'s own result line -- always `None` outside that mode, exactly as
++    /// `component_results` is always `None` inside it.
++    pub prime_results: Option<PrimeResults>,
 +    pub overall_pass: bool,
 +    pub exit_code: u8,
 +}
@@ -3946,6 +5799,22 @@ index 0000000..280409c
 +            log::info!("  Telemetry remained valid:     {}", cr.telemetry_remained_valid);
 +            log::info!("  Emergency shutdown:           {}", cr.emergency_shutdown);
 +            log::info!("  Overall selected-side result: {}", cr.overall_selected_side_result);
++        }
++        if let Some(pr) = &self.prime_results {
++            log::info!("-- prime results --");
++            log::info!("  Frozen application firmware:     {}", pr.frozen_application_firmware);
++            log::info!("  Prime command transmitted:       {}", pr.prime_command_transmitted);
++            log::info!("  Prime acknowledgment:            {}", pr.prime_acknowledgment);
++            log::info!("  Prime start observed:            {}", pr.prime_start_observed);
++            log::info!("  Left pump telemetry:             {}", pr.left_pump_telemetry);
++            log::info!("  Right pump telemetry:            {}", pr.right_pump_telemetry);
++            log::info!("  Left pump operator observation:  {}", pr.left_pump_operator_observation);
++            log::info!("  Right pump operator observation: {}", pr.right_pump_operator_observation);
++            log::info!("  Solenoid operation:               {}", pr.solenoid_operation);
++            log::info!("  Water movement observed:         {}", pr.water_movement_observed);
++            log::info!("  Prime completion observed:       {}", pr.prime_completion_observed);
++            log::info!("  Safe-stop and reset:             {}", pr.safe_stop_and_reset);
++            log::info!("  Overall result:                  {}", pr.overall_result);
 +        }
 +        log::info!("stop reason: {}", self.stop_reason);
 +        if let Some(ss) = &self.safe_stop {
@@ -4190,30 +6059,36 @@ index 0000000..ee0673a
 +}
 diff --git a/src/bin/opensleep-diagnostic/safety.rs b/src/bin/opensleep-diagnostic/safety.rs
 new file mode 100644
-index 0000000..c11963b
+index 0000000..a2a5a23
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/safety.rs
-@@ -0,0 +1,510 @@
+@@ -0,0 +1,648 @@
 +//! Structural enforcement of the per-mode Frozen command whitelist.
 +//!
 +//! Three independent layers keep everything except the documented command set unreachable:
 +//!
 +//! 1. [`FrozenAction`] is a closed enum with private fields. The *only* way to build one is
-+//!    through its constructor functions (`ping`, `get_hardware_info`, ..., `enable_cooling`),
-+//!    which validate side/delta/limits before a value can exist at all. There is no `Prime` or
-+//!    `Random` variant anywhere in this enum, so those two `FrozenCommand` variants are not just
-+//!    disallowed, they are unrepresentable in this binary's own command type.
++//!    through its constructor functions (`ping`, `get_hardware_info`, ..., `enable_cooling`,
++//!    `prime`), which validate side/delta/limits before a value can exist at all. There is no
++//!    `Random` variant anywhere in this enum, so that `FrozenCommand` variant is not just
++//!    disallowed, it is unrepresentable in this binary's own command type. `Prime` *is*
++//!    representable (`frozen-prime-test` needs to send it) but is gated entirely by layer 2 below
++//!    plus the at-most-once enforcement in [`AuditedTransport::check`] -- see that method's docs.
 +//! 2. [`AuditedTransport::check`] additionally gates every `FrozenAction` against the current
 +//!    [`Mode`]'s whitelist before it is allowed to become bytes. `frozen-passive` never permits
-+//!    an enabled `SetTargetTemperature`; `frozen-cool-test` permits it for exactly the one side
-+//!    selected when the transport was constructed; `emergency-stop` permits only the two disable
-+//!    commands.
++//!    an enabled `SetTargetTemperature` or `Prime`; `frozen-cool-test` permits an enabled target
++//!    for exactly the one side selected when the transport was constructed, never `Prime`;
++//!    `emergency-stop` permits only the two disable commands; `frozen-prime-test` permits `Prime`
++//!    (at most once per run -- enforced here, not just by caller discipline) but never an enabled
++//!    `SetTargetTemperature`.
 +//! 3. As defense in depth, `check` also inspects the serialized opcode byte and refuses anything
 +//!    outside a fixed allowed-opcode set, so even a future bug in (1)/(2) fails closed.
 +//!
 +//! Every accepted command is recorded in [`AuditedTransport::entries`] with its name, side,
 +//! enabled state, target, serialized bytes, timestamp, and mode -- this is the "central audited
-+//! transport" the safety model requires, and the JSON report is built directly from it.
++//! transport" the safety model requires, and the JSON report is built directly from it. Every
++//! rejected attempt (wrong mode, or a repeated `Prime`) increments
++//! [`AuditedTransport::rejected_command_count`], the audited "unknown commands attempted" counter.
 +
 +use std::fmt;
 +
@@ -4241,9 +6116,11 @@ index 0000000..c11963b
 +
 +/// Opcode-level defense in depth: the only Frozen opcodes this binary will ever serialize,
 +/// regardless of mode. `0x40` (`SetTargetTemperature`) is included because both the disable and
-+/// (mode-gated) enable commands use it; `0x52` (`Prime`) and any other value are refused even if
-+/// some future change to `FrozenAction` accidentally reached this layer.
-+const ALLOWED_OPCODES: &[u8] = &[0x01, 0x02, 0x04, 0x10, 0x40, 0x41];
++/// (mode-gated) enable commands use it. `0x52` (`Prime`) is included because `frozen-prime-test`
++/// needs to send it -- this opcode check runs *after* the mode/at-most-once checks in
++/// `AuditedTransport::check`, so it does not by itself grant Prime to any other mode. Any other
++/// opcode is refused even if some future change to `FrozenAction` accidentally reached this layer.
++const ALLOWED_OPCODES: &[u8] = &[0x01, 0x02, 0x04, 0x10, 0x40, 0x41, 0x52];
 +
 +/// Which diagnostic subcommand is currently running. Determines the whitelist `AuditedTransport`
 +/// enforces; see module docs.
@@ -4254,6 +6131,10 @@ index 0000000..c11963b
 +    /// transport -- there is no way to change it after construction.
 +    CoolTest { side: BedSide },
 +    EmergencyStop,
++    /// Permits `Prime` (at most once -- see `AuditedTransport::check`) in addition to everything
++    /// `Passive` permits. Never permits an enabled `SetTargetTemperature`: this mode primes the
++    /// hydraulic loop, it does not run a cooling/heating test.
++    PrimeTest,
 +}
 +
 +impl Mode {
@@ -4262,6 +6143,7 @@ index 0000000..c11963b
 +            Mode::Passive => "frozen-passive",
 +            Mode::CoolTest { .. } => "frozen-cool-test",
 +            Mode::EmergencyStop => "emergency-stop",
++            Mode::PrimeTest => "frozen-prime-test",
 +        }
 +    }
 +}
@@ -4283,6 +6165,13 @@ index 0000000..c11963b
 +        side: BedSide,
 +        target_centideg: u16,
 +    },
++    /// `FrozenCommand::Prime` (opcode 0x52), reused unmodified -- see PROTOCOL_AUDIT.md for the
++    /// full source audit. Takes no arguments: the upstream command applies to both sides in one
++    /// shot: there is no per-side Prime. Only ever constructible via `FrozenAction::prime()`
++    /// (this variant has no fields, but there is still exactly one path to it, matching every
++    /// other variant's convention); only ever permitted by `AuditedTransport::check` in
++    /// `Mode::PrimeTest`, and only once per run -- see that method.
++    Prime,
 +}
 +
 +/// Returned by [`FrozenAction::enable_cooling`] when the requested delta exceeds the hard limit,
@@ -4317,6 +6206,9 @@ index 0000000..c11963b
 +    }
 +    pub fn safety_off(side: BedSide) -> Self {
 +        FrozenAction::SafetyOff { side }
++    }
++    pub fn prime() -> Self {
++        FrozenAction::Prime
 +    }
 +
 +    /// Validates and builds the single enabled `SetTargetTemperature` this binary can ever send.
@@ -4379,6 +6271,7 @@ index 0000000..c11963b
 +                    temp: *target_centideg,
 +                },
 +            },
++            FrozenAction::Prime => FrozenCommand::Prime,
 +        }
 +    }
 +
@@ -4391,6 +6284,7 @@ index 0000000..c11963b
 +            FrozenAction::GetTemperatures => "GetTemperatures",
 +            FrozenAction::SafetyOff { .. } => "SetTargetTemperature(disable)",
 +            FrozenAction::EnableCooling { .. } => "SetTargetTemperature(enable)",
++            FrozenAction::Prime => "Prime",
 +        }
 +    }
 +
@@ -4432,8 +6326,15 @@ index 0000000..c11963b
 +            Ping | GetHardwareInfo | GetFirmware | JumpToFirmware | GetTemperatures
 +            | SafetyOff { .. } => true,
 +            EnableCooling { side, .. } => *side == allowed_side,
++            Prime => false,
 +        },
 +        Mode::EmergencyStop => matches!(action, SafetyOff { .. }),
++        // Never EnableCooling: frozen-prime-test fills the loop, it does not run a cooling test.
++        // Prime's at-most-once enforcement lives in AuditedTransport::check, not here.
++        Mode::PrimeTest => matches!(
++            action,
++            Ping | GetHardwareInfo | GetFirmware | JumpToFirmware | GetTemperatures | SafetyOff { .. } | Prime
++        ),
 +    }
 +}
 +
@@ -4475,6 +6376,8 @@ index 0000000..c11963b
 +    mode: Mode,
 +    log: Vec<AuditEntry>,
 +    enabled_target_count: u32,
++    prime_count: u32,
++    rejected_command_count: u32,
 +}
 +
 +impl AuditedTransport {
@@ -4483,6 +6386,8 @@ index 0000000..c11963b
 +            mode,
 +            log: Vec::new(),
 +            enabled_target_count: 0,
++            prime_count: 0,
++            rejected_command_count: 0,
 +        }
 +    }
 +
@@ -4490,13 +6395,27 @@ index 0000000..c11963b
 +        self.mode
 +    }
 +
-+    /// Validates `action` against the mode whitelist and the opcode backstop, and -- only if both
-+    /// pass -- serializes it, records the audit entry, and returns the frame bytes to send.
++    /// Validates `action` against the mode whitelist, the Prime-at-most-once rule, and the opcode
++    /// backstop, and -- only if all three pass -- serializes it, records the audit entry, and
++    /// returns the frame bytes to send. Every rejection (any reason) increments
++    /// `rejected_command_count`, the audited "unknown commands attempted" counter.
 +    pub fn check(&mut self, action: &FrozenAction) -> Result<Vec<u8>, SafetyViolation> {
 +        if !allowed_in_mode(self.mode, action) {
++            self.rejected_command_count += 1;
 +            return Err(SafetyViolation {
 +                action_name: action.name(),
 +                reason: format!("not permitted in mode {}", self.mode.label()),
++            });
++        }
++
++        // Structural "Prime at most once per run" enforcement -- not just a matter of this
++        // binary's own control flow only calling it once, but a hard refusal at the transport
++        // layer if it is ever attempted a second time for any reason (a bug, a retry, anything).
++        if matches!(action, FrozenAction::Prime) && self.prime_count > 0 {
++            self.rejected_command_count += 1;
++            return Err(SafetyViolation {
++                action_name: action.name(),
++                reason: "Prime was already sent once this run; repeated Prime is refused".to_string(),
 +            });
 +        }
 +
@@ -4506,6 +6425,7 @@ index 0000000..c11963b
 +        match opcode {
 +            Some(op) if ALLOWED_OPCODES.contains(&op) => {}
 +            _ => {
++                self.rejected_command_count += 1;
 +                return Err(SafetyViolation {
 +                    action_name: action.name(),
 +                    reason: format!("opcode {opcode:?} outside the fixed allowed set"),
@@ -4515,6 +6435,9 @@ index 0000000..c11963b
 +
 +        if action.enabled() == Some(true) {
 +            self.enabled_target_count += 1;
++        }
++        if matches!(action, FrozenAction::Prime) {
++            self.prime_count += 1;
 +        }
 +
 +        self.log.push(AuditEntry {
@@ -4543,16 +6466,22 @@ index 0000000..c11963b
 +        self.enabled_target_count
 +    }
 +
-+    /// Structurally always zero: `FrozenAction` has no `Prime` variant, so no code path in this
-+    /// binary can ever construct, let alone transmit, one. Kept as a method (rather than a bare
++    /// Real per-run count of accepted `Prime` sends: 0 in every mode except `frozen-prime-test`,
++    /// where `check`'s at-most-once rule caps it at 1. Kept as a method (rather than a bare
 +    /// constant) so the JSON report can cite it next to `enabled_target_count`.
 +    pub fn prime_count(&self) -> u32 {
-+        0
++        self.prime_count
 +    }
 +
 +    /// Structurally always zero: `FrozenAction` has no `Random` variant.
 +    pub fn random_count(&self) -> u32 {
 +        0
++    }
++
++    /// Every command `check` refused, for any reason (wrong mode, repeated Prime, opcode
++    /// backstop) -- the audited "unknown commands attempted" counter.
++    pub fn rejected_command_count(&self) -> u32 {
++        self.rejected_command_count
 +    }
 +}
 +
@@ -4637,10 +6566,77 @@ index 0000000..c11963b
 +    }
 +
 +    #[test]
-+    fn prime_and_random_counts_are_always_zero() {
-+        let audit = AuditedTransport::new(Mode::Passive);
-+        assert_eq!(audit.prime_count(), 0);
++    fn prime_and_random_counts_are_zero_outside_prime_test_mode() {
++        for mode in [
++            Mode::Passive,
++            Mode::CoolTest { side: BedSide::Left },
++            Mode::EmergencyStop,
++        ] {
++            let audit = AuditedTransport::new(mode);
++            assert_eq!(audit.prime_count(), 0);
++            assert_eq!(audit.random_count(), 0);
++        }
++    }
++
++    #[test]
++    fn random_count_is_always_zero() {
++        // FrozenAction has no Random variant at all, in any mode.
++        let audit = AuditedTransport::new(Mode::PrimeTest);
 +        assert_eq!(audit.random_count(), 0);
++    }
++
++    #[test]
++    fn prime_test_mode_allows_prime_exactly_once() {
++        let mut audit = AuditedTransport::new(Mode::PrimeTest);
++        assert!(audit.check(&FrozenAction::prime()).is_ok());
++        assert_eq!(audit.prime_count(), 1);
++        let second = audit.check(&FrozenAction::prime());
++        assert!(second.is_err(), "a second Prime in the same run must be refused");
++        assert_eq!(audit.prime_count(), 1, "the refused second attempt must not increment the count");
++        assert_eq!(audit.rejected_command_count(), 1);
++    }
++
++    #[test]
++    fn prime_test_mode_never_allows_an_enabled_target() {
++        let mut audit = AuditedTransport::new(Mode::PrimeTest);
++        let left = FrozenAction::enable_cooling(BedSide::Left, 2400, 100).unwrap();
++        let right = FrozenAction::enable_cooling(BedSide::Right, 2400, 100).unwrap();
++        assert!(audit.check(&left).is_err());
++        assert!(audit.check(&right).is_err());
++        assert_eq!(audit.enabled_target_count(), 0);
++        assert_eq!(audit.rejected_command_count(), 2);
++    }
++
++    #[test]
++    fn prime_is_refused_outside_prime_test_mode() {
++        for mode in [
++            Mode::Passive,
++            Mode::CoolTest { side: BedSide::Left },
++            Mode::EmergencyStop,
++        ] {
++            let mut audit = AuditedTransport::new(mode);
++            let result = audit.check(&FrozenAction::prime());
++            assert!(result.is_err(), "Prime must be refused in {mode:?}");
++            assert_eq!(audit.prime_count(), 0);
++            assert_eq!(audit.rejected_command_count(), 1);
++        }
++    }
++
++    #[test]
++    fn prime_test_mode_allows_the_documented_non_prime_actions_too() {
++        let mut audit = AuditedTransport::new(Mode::PrimeTest);
++        for action in [
++            FrozenAction::ping(),
++            FrozenAction::get_hardware_info(),
++            FrozenAction::get_firmware(),
++            FrozenAction::jump_to_firmware(),
++            FrozenAction::get_temperatures(),
++            FrozenAction::safety_off(BedSide::Left),
++            FrozenAction::safety_off(BedSide::Right),
++        ] {
++            assert!(audit.check(&action).is_ok(), "{action:?} should be allowed in frozen-prime-test");
++        }
++        assert_eq!(audit.rejected_command_count(), 0);
 +    }
 +
 +    #[test]
@@ -4666,7 +6662,7 @@ index 0000000..c11963b
 +    /// library and proves which modes (if any) can reach it through `FrozenAction`.
 +    #[test]
 +    fn every_frozen_command_variant_is_accounted_for_by_mode() {
-+        // (label, constructible via FrozenAction at all, allowed in passive, allowed in cool-test, allowed in emergency-stop)
++        // (label, constructible via FrozenAction at all, allowed in passive, allowed in cool-test, allowed in emergency-stop, allowed in prime-test)
 +        let cases: Vec<(&str, Option<FrozenAction>)> = vec![
 +            ("Ping", Some(FrozenAction::ping())),
 +            ("GetHardwareInfo", Some(FrozenAction::get_hardware_info())),
@@ -4681,24 +6677,35 @@ index 0000000..c11963b
 +                "SetTargetTemperature(enable)",
 +                FrozenAction::enable_cooling(BedSide::Left, 2400, 100).ok(),
 +            ),
-+            // Prime and Random have no FrozenAction constructor at all: this binary's own
-+            // command type cannot represent them, independent of any whitelist.
-+            ("Prime", None),
++            // Prime is constructible (frozen-prime-test needs to send it) but only ever accepted
++            // by AuditedTransport::check in Mode::PrimeTest -- proven below, not by construction.
++            ("Prime", Some(FrozenAction::prime())),
++            // Random has no FrozenAction constructor at all: this binary's own command type
++            // cannot represent it, independent of any whitelist.
 +            ("Random", None),
 +        ];
 +
 +        let mut passive = AuditedTransport::new(Mode::Passive);
 +        let mut cool_left = AuditedTransport::new(Mode::CoolTest { side: BedSide::Left });
 +        let mut emergency = AuditedTransport::new(Mode::EmergencyStop);
++        let mut prime_test = AuditedTransport::new(Mode::PrimeTest);
 +
 +        for (label, action) in cases {
 +            match action {
-+                None => { /* unreachable by construction: Prime, Random */ }
++                None => { /* unreachable by construction: Random */ }
 +                Some(action) => {
 +                    let p = passive.check(&action).is_ok();
 +                    let c = cool_left.check(&action).is_ok();
 +                    let e = emergency.check(&action).is_ok();
-+                    log::debug!("{label}: passive={p} cool-test(left)={c} emergency-stop={e}");
++                    let pt = prime_test.check(&action).is_ok();
++                    log::debug!("{label}: passive={p} cool-test(left)={c} emergency-stop={e} prime-test={pt}");
++                    if label == "Prime" {
++                        assert!(!p && !c && !e, "Prime must never be accepted outside frozen-prime-test");
++                        assert!(pt, "Prime must be accepted in frozen-prime-test");
++                    }
++                    if label == "SetTargetTemperature(enable)" {
++                        assert!(!pt, "an enabled target must never be accepted in frozen-prime-test");
++                    }
 +                }
 +            }
 +        }
@@ -4706,10 +6713,10 @@ index 0000000..c11963b
 +}
 diff --git a/src/bin/opensleep-diagnostic/signals.rs b/src/bin/opensleep-diagnostic/signals.rs
 new file mode 100644
-index 0000000..7e39199
+index 0000000..5ea81b0
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/signals.rs
-@@ -0,0 +1,163 @@
+@@ -0,0 +1,189 @@
 +//! Everything that can cut an active phase short. `StopReason` is the vocabulary every abort path
 +//! (Ctrl+C, SIGTERM/SIGHUP, timeout, communication/telemetry error, panic, ...) reduces to before
 +//! `safe_stop::run_safe_stop` runs and the report is written.
@@ -4780,6 +6787,22 @@ index 0000000..7e39199
 +    /// The operator typed a report of a leak, burning smell, or abnormal noise (or the literal
 +    /// word ABORT) during the active phase. See `cool_test::spawn_operator_abort_watcher`.
 +    OperatorAbort,
++    /// `frozen-prime-test` only: a firmware message named the pump as faulted (matched narrowly:
++    /// "pump" plus a fault word). See `prime_test::is_pump_fault_message`.
++    PumpFault,
++    /// `frozen-prime-test` only: an unsolicited `TargetUpdate` reported a side enabled -- this
++    /// mode must never have an enabled target at any point.
++    TargetEnabledUnexpectedly,
++    /// `frozen-prime-test` only: a periodic Ping during the active phase got `Pong(false)`
++    /// (bootloader), meaning Frozen reset itself out of application firmware mid-run.
++    FrozenReturnedToBootloader,
++    /// `frozen-prime-test` only: a periodic re-probe of the 0x20 reset/enable expander failed
++    /// after priming had already started.
++    I2cFailureDuringPriming,
++    /// `frozen-prime-test` only: not an error -- the firmware reported priming complete
++    /// (`"FW: [priming] done"` or `"...done because empty"`) before the configured duration
++    /// elapsed, so the test stopped early and ran safe-stop, per spec.
++    PrimingCompleted,
 +}
 +
 +impl StopReason {
@@ -4807,6 +6830,11 @@ index 0000000..7e39199
 +            StopReason::TargetDisabledUnexpectedly => "Frozen disabled the selected target unexpectedly",
 +            StopReason::FirmwareFaultMessage => "firmware reported a fault condition by message",
 +            StopReason::OperatorAbort => "operator reported a leak, smell, or abnormal noise",
++            StopReason::PumpFault => "firmware reported a pump fault",
++            StopReason::TargetEnabledUnexpectedly => "an unexpected enabled target appeared",
++            StopReason::FrozenReturnedToBootloader => "Frozen returned to bootloader mode during the active phase",
++            StopReason::I2cFailureDuringPriming => "I2C access failed after priming started",
++            StopReason::PrimingCompleted => "firmware reported priming complete",
 +        }
 +    }
 +}
@@ -4868,6 +6896,11 @@ index 0000000..7e39199
 +            StopReason::TargetDisabledUnexpectedly,
 +            StopReason::FirmwareFaultMessage,
 +            StopReason::OperatorAbort,
++            StopReason::PumpFault,
++            StopReason::TargetEnabledUnexpectedly,
++            StopReason::FrozenReturnedToBootloader,
++            StopReason::I2cFailureDuringPriming,
++            StopReason::PrimingCompleted,
 +        ] {
 +            assert!(!reason.description().is_empty());
 +        }

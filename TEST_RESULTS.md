@@ -1,11 +1,23 @@
 # TEST_RESULTS.md — opensleep-diagnostic
 
-All 91 unit/integration tests in `src/bin/opensleep-diagnostic/` pass, plus the 51 pre-existing
-`opensleep` library tests (unmodified, reused as-is) and 0 doc-tests — 142 total, 0 failed. This
+All 129 unit/integration tests in `src/bin/opensleep-diagnostic/` pass, plus the 51 pre-existing
+`opensleep` library tests (unmodified, reused as-is) and 0 doc-tests — 180 total, 0 failed. This
 was verified twice: once on the host development machine (native target), and again inside the
 `messense/rust-musl-cross:aarch64-musl` builder image via `cargo test --locked` under its
 built-in QEMU aarch64 runner (the same environment the release binary is built in) — see
 `build-report.txt`.
+
+## Revision note: `frozen-prime-test` added
+
+This revision adds the `frozen-prime-test` subcommand, which sends `Prime` (opcode `0x52`) exactly
+once to fill an empty/partially-filled hydraulic loop. `Prime` is now reachable, but in exactly one
+mode (see PROTOCOL_AUDIT.md for the full source audit and the `Prime`-specific whitelist/at-most-
+once enforcement design). Item 14 below is corrected accordingly, and a new checklist section maps
+`frozen-prime-test`'s own 28-item test requirement to actual tests. 38 new tests were added: 5 net
+new in `safety.rs` (the `Prime`/`Mode::PrimeTest` whitelist and at-most-once enforcement -- one
+existing test was also renamed to reflect that `prime_count` is no longer structurally always
+zero), 1 new guardrail test in `main.rs` (`frozen_action_prime_is_referenced_only_in_safety_and_prime_test`),
+and 32 in the new `prime_test.rs`.
 
 ## Revision note: active-test preflight correction
 
@@ -83,10 +95,18 @@ deliberately *not* exercised (see item 19 below).
     to accept it.
 13. **Active mode never enables both sides.**
     `safety::tests::cool_test_never_allows_both_sides_enabled_in_the_same_run`.
-14. **Prime can never be constructed or transmitted.**
+14. **Prime can never be constructed or transmitted outside `frozen-prime-test`, and at most once
+    within it.** (Corrected from an earlier revision, which predated `frozen-prime-test` and
+    stated Prime could never be constructed at all -- see the revision note above and
+    PROTOCOL_AUDIT.md for the full audit.)
+    `safety::tests::every_frozen_command_variant_is_accounted_for_by_mode`,
+    `prime_is_refused_outside_prime_test_mode`, `prime_test_mode_allows_prime_exactly_once`,
+    `main.rs::guardrail_tests::frozen_action_prime_is_referenced_only_in_safety_and_prime_test`.
+    Within `frozen-prime-test` itself, `Prime`'s reachability is exercised end-to-end by
+    `prime_test::tests::dry_run_sends_prime_exactly_once`.
+15. **Random commands can never be constructed or transmitted.**
     `safety::tests::every_frozen_command_variant_is_accounted_for_by_mode`,
     `main.rs::guardrail_tests::prime_and_random_frozen_command_variants_are_never_referenced_as_constructors`.
-15. **Random commands can never be constructed or transmitted.** Same two tests as #14.
 16. **Unknown commands fail the transport audit.**
     `safety::tests::emergency_stop_allows_only_the_two_disable_commands` (asserts `Ping`/
     `GetHardwareInfo`/an out-of-mode `EnableCooling` are all rejected by `AuditedTransport::check`
@@ -156,15 +176,78 @@ deliberately *not* exercised (see item 19 below).
     `safety::tests::passive_rejects_enabled_cooling_for_either_side`,
     `safety::tests::emergency_stop_allows_only_the_two_disable_commands`.
 
+## `frozen-prime-test` checklist, mapped to actual tests
+
+The safety spec for `frozen-prime-test` gave its own 28-item checklist. Mapped to actual tests
+(all in `prime_test.rs` unless noted):
+
+1-4. **Prime is allowed only in `frozen-prime-test`; prohibited in passive/cooling/emergency-stop.**
+   `safety::tests::prime_is_refused_outside_prime_test_mode` (loops over all three other modes),
+   `prime_test_mode_allows_prime_exactly_once`,
+   `main.rs::guardrail_tests::frozen_action_prime_is_referenced_only_in_safety_and_prime_test`.
+5-6. **Prime sent at most once; no automatic retry.**
+   `safety::tests::prime_test_mode_allows_prime_exactly_once` (transport-layer refusal of a second
+   attempt), `prime_test::tests::dry_run_sends_prime_exactly_once`.
+7. **Enabled temperature targets cannot be constructed in prime mode.**
+   `safety::tests::prime_test_mode_never_allows_an_enabled_target`,
+   `prime_test::tests::dry_run_never_enables_a_target`.
+8. **All confirmation flags are mandatory.** `refuses_without_all_confirmation_flags`.
+9. **Incorrect interactive confirmation is rejected.** `refuses_when_interactive_phrase_is_wrong`.
+10. **Duration cannot exceed 60 seconds** (nor go below 5). `refuses_when_duration_exceeds_hard_maximum`,
+    `refuses_when_duration_is_below_minimum`, `duration_bounds_match_spec`.
+11. **Ctrl+C triggers safe-stop.** `termination_signal_future_does_not_resolve_spuriously` proves
+    the mechanism, same caveat as item 19 above (no real OS signal in this suite).
+12. **Timeout triggers safe-stop.** `active_phase_stops_at_duration_expired_and_still_runs_safe_stop`.
+13. **UART failure triggers safe-stop.** `going_silent_after_prime_triggers_safe_stop` (a fake
+    device that acks `Prime` then goes completely silent).
+14. **Internal task failure triggers safe-stop where testable.** Same practical limitation as
+    `frozen-cool-test` (#21 above): a `catch_unwind` boundary wraps `evaluate_temperatures`, but no
+    panic-injection hook exists to force a real panic from a test. `evaluate_temperatures`'s own
+    logic is covered directly by `evaluate_temperatures_accepts_plausible_values`,
+    `_rejects_out_of_range_water`, `_rejects_heatsink_over_limit`.
+15-16. **Safe-stop disables both targets three times and asserts `0x20` reset.** Mode-agnostic
+    mechanism, already proven in `safe_stop::tests` (reused, not re-tested per mode).
+17. **Failed reset causes a nonzero exit status.** `failed_i2c_reset_causes_a_nonzero_exit_code`.
+18. **`0x53` failure remains nonfatal.** `dry_run_completes_despite_the_led_controller_probe_failing`.
+19-20. **Sensor UART is never opened; MQTT and the normal config file are never used.**
+    `main.rs::guardrail_tests::sensor_subsystem_is_never_referenced` /
+    `mqtt_and_config_ron_are_never_referenced` (both scan `prime_test.rs` too).
+21-22. **`capwater`/`flowrate` unavailable are logged as warnings.**
+    `capwater_and_flowrate_unavailable_are_recognized_as_nonfatal_sensor_messages`.
+23. **`control_error_c` does not cause an automatic abort.**
+    `evaluate_temperatures_has_no_control_error_parameter_to_gate_on` (structural: the function
+    doesn't take the field), `control_error_c_is_reported_but_never_gates_the_run` (end-to-end:
+    present in samples, never causes `TemperatureRangeExceeded`).
+24. **Machine evidence and operator observations remain separate.**
+    `operator_observations_field_is_never_used_by_this_mode`, plus the structural type separation
+    (`PrimeOperatorObservations` is its own type, distinct from every machine-decoded field).
+25. **Writing Prime alone cannot produce a PASS.**
+    `overall_result_is_inconclusive_not_pass_from_command_and_pumps_alone` (dry-run: command sent,
+    acked, pump telemetry and "done" observed, but no circulation evidence -> INCONCLUSIVE, not
+    PASS) and `direct_firmware_circulation_evidence_produces_overall_pass` (the positive case, with
+    a fake device that emits `"FW: water empty -> full"`).
+26. **Dry-run performs no hardware writes.** `dry_run_never_touches_real_devices`.
+27-28. **Prime-command count exactly one; enabled-target count always zero for a completed run.**
+    `dry_run_sends_prime_exactly_once`, `dry_run_never_enables_a_target`,
+    `rejected_command_count_is_zero_on_a_clean_run`.
+
+Plus unit-level coverage of every parsing/classification helper:
+`prime_action_serializes_to_the_exact_source_evidenced_frame` (ties the whole file to the real
+`7E 01 52 B6 2B` frame), `pump_telemetry_parses_voltage_and_current`,
+`pump_telemetry_ignores_unrelated_messages`, `pump_fault_message_is_detected_narrowly`,
+`solenoid_and_valve_messages_are_detected`, `reservoir_transition_messages_are_detected`,
+`priming_stage_text_strips_the_known_prefix`, `flash_locked_is_excluded_from_the_generic_fault_scan`.
+
 ## Command-audit test
 
 `safety::tests::every_frozen_command_variant_is_accounted_for_by_mode` enumerates every
 `FrozenAction` this binary can construct (which stand in one-to-one for the `FrozenCommand`
-variants that are reachable at all — `Prime`/`Random` have no `FrozenAction` counterpart and so
-cannot even appear in the enumeration) and checks which of the three `Mode`s accept each one,
-logging the per-mode result. Combined with the whitelist tests above (#1, #2, #13, #14, #15, #16,
-#30), this gives an executable, falsifiable version of the "which modes permit it" table in
-PROTOCOL_AUDIT.md.
+variants that are reachable at all — `Random` has no `FrozenAction` counterpart and so cannot even
+appear in the enumeration; `Prime` does appear, since `frozen-prime-test` needs to construct it,
+but the same test asserts it is accepted in no mode except `PrimeTest`) and checks which of the
+four `Mode`s accept each one, logging the per-mode result. Combined with the whitelist tests above
+(#1, #2, #13, #14, #15, #16, #30, and the `frozen-prime-test` items 1-7 above), this gives an
+executable, falsifiable version of the "which modes permit it" table in PROTOCOL_AUDIT.md.
 
 ## New tests added for the corrected active-test preflight/monitoring
 
@@ -207,3 +290,11 @@ PROTOCOL_AUDIT.md.
   errors or hardware status byte to this binary — see PROTOCOL_AUDIT.md's "known limitation"
   section. This is a limitation of reusing the upstream codec unmodified (as required), not an
   oversight.
+* `frozen-prime-test`'s solenoid/valve detection has never matched a real firmware message,
+  because no such message has ever been observed in the pinned source or captured logs — see
+  PROTOCOL_AUDIT.md. The test suite only proves the keyword scan itself works
+  (`solenoid_and_valve_messages_are_detected`), not that it has ever fired against a real device.
+* `frozen-prime-test` cannot detect an empty reservoir directly (`capwater` unavailable on this
+  hardware) — this is a real, stated hardware/firmware limitation, not a gap in this tool's own
+  logic, and is why the operator watching the reservoir is documented as the primary interlock
+  (SAFETY.md) rather than this tool inferring emptiness from pump current or any other proxy.

@@ -1,14 +1,18 @@
 # Running opensleep-diagnostic on the Pod 3 Hub
 
 This tool is a diagnostic, not a service. Every subcommand runs once, in the foreground, prints/
-writes a summary, and exits. **Do not install it as a systemd unit.**
+writes a summary, and exits. **Do not install it as a systemd unit.** Priming is always manually
+initiated, every time — this tool never schedules or repeats it automatically.
 
-Three subcommands:
+Four subcommands:
 
 * `opensleep-diagnostic frozen-passive` — safe with the cover disconnected and no water.
+* `opensleep-diagnostic frozen-prime-test` — intentionally sends `Prime` once, to fill an empty or
+  partially-filled hydraulic loop; requires a connected cover with water in the reservoir and
+  multiple explicit confirmations. **Read SAFETY.md before running this.**
 * `opensleep-diagnostic frozen-cool-test` — intentionally activates one cooling channel; requires
-  a connected, filled hydraulic loop and multiple explicit confirmations. **Read SAFETY.md before
-  running this.**
+  a connected, *already-filled* hydraulic loop and multiple explicit confirmations. **Read
+  SAFETY.md before running this.**
 * `opensleep-diagnostic emergency-stop` — independent fast-path disable + reset-assert.
 
 ## 1. Copy the binary to the Pod
@@ -50,6 +54,7 @@ systemctl stop dac.service 2>/dev/null || true
 systemctl stop frank.service 2>/dev/null || true
 systemctl stop frankenfirmware.service 2>/dev/null || true
 systemctl stop opensleep.service 2>/dev/null || true
+systemctl stop opensleep-manual-ui.service 2>/dev/null || true
 ```
 
 Then confirm nothing still holds the devices open:
@@ -88,10 +93,9 @@ printed summary (or the JSON file) for:
 * `overall_pass` — only `true` if application firmware responded and at least one valid telemetry
   sample was decoded.
 
-Do **not** proceed to step 5 until you've reviewed this output. If Frozen never reached
-application firmware, or no telemetry decoded, something more fundamental needs investigating
-first — running the cooling test is unlikely to help and is not safe to attempt yet regardless
-(see below).
+Do **not** proceed until you've reviewed this output. If Frozen never reached application
+firmware, or no telemetry decoded, something more fundamental needs investigating first — priming
+or cooling are unlikely to help and are not safe to attempt yet regardless.
 
 ### Exit codes (`frozen-passive`)
 
@@ -104,22 +108,113 @@ first — running the cooling test is unlikely to help and is not safe to attemp
 | 30 | Invalid CLI arguments (nothing was probed) |
 | 40 | Refused: a stock service was active, or a device was already open elsewhere |
 
-## 5. Only after reviewing valid passive telemetry: prepare for `frozen-cool-test`
+## 5. Only after reviewing valid passive telemetry: prepare the hydraulic loop
 
 Do this only once you've confirmed, from step 4's output, that Frozen reaches application
 firmware and reports valid telemetry.
 
-1. Connect the hydraulic cover to the Hub.
-2. Fill the water loop per the normal Eight Sleep fill procedure.
-3. Visually check every visible fitting and hose run for leaks before proceeding.
-4. **Open a second SSH session** to the Hub and have this ready to run immediately, but do not run
+1. **Connect both hydraulic lines** from the cover to the Hub.
+2. **Fill the reservoir** with water.
+3. **Keep additional water ready** nearby — priming may draw down the reservoir level quickly and
+   you may need to top it up.
+4. **Check for visible leaks** at every fitting and hose run before proceeding.
+5. **Open a second SSH session** to the Hub and have this ready to run immediately, but do not run
    it yet:
    ```sh
    /persistent/tools/opensleep-diagnostic emergency-stop
    ```
-5. Read SAFETY.md in full if you have not already.
+6. Read SAFETY.md in full if you have not already.
 
-## 6. Run a 10-second cooling test on one side
+## 6. If the loop is empty or partially filled: run a supervised priming cycle first
+
+**Skip this step only if you already know the hydraulic loop is fully filled and water has
+previously circulated through it.** If in doubt, run this step — `frozen-prime-test` is the
+correct way to fill an empty loop, not `frozen-cool-test`.
+
+```sh
+/persistent/tools/opensleep-diagnostic frozen-prime-test \
+    --i2c-device /dev/i2c-1 \
+    --frozen-port /dev/ttyS1 \
+    --duration-seconds 30 \
+    --confirm-cover-hydraulics-connected \
+    --confirm-reservoir-filled \
+    --confirm-cover-loop-needs-priming \
+    --confirm-no-visible-leaks \
+    --confirm-active-test \
+    --json-output /persistent/frozen-prime.json \
+    --verbose
+```
+
+You will be asked to type, exactly:
+
+```
+I CONFIRM THE RESERVOIR IS FILLED AND THE COVER IS CONNECTED
+```
+
+The tool will then run preflight (reset, enter firmware, disable both sides, confirm neither is
+enabled, collect fresh baseline telemetry), print a warning, and ask for a second exact phrase:
+
+```
+START SUPERVISED PRIMING
+```
+
+7. **Watch the reservoir continuously** for the entire run. The firmware does not reliably report
+   the reservoir level on this hardware (`capwater` has been observed unavailable) — this tool
+   cannot detect an empty reservoir on your behalf.
+8. **Press Ctrl+C immediately** if the reservoir approaches empty, or if you observe a leak, a
+   burning smell, or abnormal noise. This runs the same safe-stop sequence (disable both sides
+   three times, flush UART, assert the `0x20` subsystem reset) as every other exit path.
+
+   `emergency-stop` from your second session works the same way if this session becomes
+   unresponsive.
+
+This one 30-second (default; 5-60s range) run sends `Prime` **exactly once**, watches decoded
+telemetry and firmware messages the whole time, and stops early — running the same safe-stop — the
+moment firmware reports priming complete. It never repeats or retries automatically.
+
+9. **Refill the reservoir** after the cycle, since priming likely drew it down.
+10. **Inspect for leaks** again before doing anything further.
+11. **Run another separate priming cycle only if needed** — e.g. if the loop still isn't fully
+    primed, or you had to stop early. Each invocation is independent; there is no "resume."
+12. **Do not proceed to step 7 (cooling) until you have observed water movement and the reservoir
+    level has stabilized** (stopped dropping between refills). Read the JSON/printed summary's
+    `prime_results` block — see "Reading the priming result" below — before deciding whether
+    another cycle is needed.
+
+### Reading the priming result
+
+```
+Frozen application firmware:       PASS/FAIL
+Prime command transmitted:         PASS/FAIL
+Prime acknowledgment:              PASS/FAIL/UNVERIFIED
+Prime start observed:              PASS/FAIL/UNVERIFIED
+Left pump telemetry:               PASS/FAIL/UNVERIFIED
+Right pump telemetry:              PASS/FAIL/UNVERIFIED
+Left pump operator observation:    PASS/FAIL/UNVERIFIED
+Right pump operator observation:   PASS/FAIL/UNVERIFIED
+Solenoid operation:                PASS/FAIL/UNVERIFIED
+Water movement observed:           PASS/FAIL/UNVERIFIED
+Prime completion observed:         PASS/FAIL/UNVERIFIED
+Safe-stop and reset:               PASS/FAIL
+Overall result:                    PASS/FAIL/INCONCLUSIVE
+```
+
+At the end you'll be prompted for operator observations (left/right pump heard/felt, water
+movement or bubbles observed, reservoir level dropped, reservoir topped up, leak, abnormal noise,
+burning smell, free-text notes) — stored separately from the machine-decoded evidence in the JSON
+report's `prime_operator_observations` field.
+
+**`Overall result` will not read PASS merely because the command was sent, acknowledged, a pump
+showed voltage, or "priming done" was printed.** It only reads PASS with either direct firmware
+evidence of water circulation, or your own confirmation of *both* water movement *and* a dropped
+reservoir level. If everything ran but circulation wasn't clearly observed, expect
+**INCONCLUSIVE**, not PASS — see PROTOCOL_AUDIT.md for exactly why. An INCONCLUSIVE or FAIL result
+means: inspect, refill, and consider another cycle before moving on to cooling.
+
+## 7. Once the loop is confirmed filled: run a 10-second cooling test on one side
+
+Only proceed here once you've confirmed water movement and a stable reservoir level from step 6
+(or already knew the loop was filled and skipped step 6).
 
 `--delta-c 1.0` and `--duration-seconds 10` are both already the defaults for a first test; they're
 spelled out below for clarity. Only the selected side is ever enabled -- the other side is
@@ -178,7 +273,7 @@ felt, leak observed, unusual smell/noise, free-text notes). These are stored in 
 
 Only test one side per invocation. Repeat with `--side right` as a separate run if desired.
 
-### Reading the result
+### Reading the cooling result
 
 The JSON/text summary reports each component separately — never collapses them into one
 pass/fail:
@@ -203,6 +298,10 @@ the same logic against a mocked Frozen device and a mocked I2C bus:
 
 ```sh
 opensleep-diagnostic frozen-passive --dry-run --json-output /tmp/dryrun-passive.json
+opensleep-diagnostic frozen-prime-test --dry-run \
+    --confirm-cover-hydraulics-connected --confirm-reservoir-filled \
+    --confirm-cover-loop-needs-priming --confirm-no-visible-leaks --confirm-active-test \
+    --json-output /tmp/dryrun-prime.json
 opensleep-diagnostic frozen-cool-test --side left --dry-run \
     --confirm-cover-hydraulics-connected --confirm-water-loop-filled \
     --confirm-no-visible-leaks --confirm-active-test \
@@ -210,13 +309,16 @@ opensleep-diagnostic frozen-cool-test --side left --dry-run \
 opensleep-diagnostic emergency-stop --dry-run
 ```
 
-`frozen-cool-test --dry-run` still requires the interactive typed confirmations unless stdin is
-not a TTY (e.g. when piping input in a script or CI).
+`frozen-prime-test --dry-run` and `frozen-cool-test --dry-run` still require the interactive typed
+confirmations unless stdin is not a TTY (e.g. when piping input in a script or CI). Dry-run never
+silently switches to live mode — if it can't run against the mock, it refuses, the same as live
+mode would.
 
 ## What this tool will never do on the Pod
 
-See SAFETY.md and PROTOCOL_AUDIT.md for the full accounting. In short: it never loads
-`config.ron`, never connects to MQTT, never runs the Home Assistant integration, never starts a
+See SAFETY.md and PROTOCOL_AUDIT.md for the full accounting. In short: it never loads the normal
+config file, never connects to MQTT, never runs the Home Assistant integration, never starts a
 profile or temperature schedule outside its own bounded active phase, never writes to `0x53`, and
-never transmits `Prime` or an arbitrary/undocumented command. It always exits after one bounded
-pass and is never installed as a service.
+never transmits `Prime` outside `frozen-prime-test` (where it is sent at most once per invocation,
+always manually confirmed, never scheduled or repeated automatically) or an arbitrary/undocumented
+command. It always exits after one bounded pass and is never installed as a service.

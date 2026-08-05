@@ -1,10 +1,56 @@
 opensleep-diagnostic — build report
 ====================================
 
-Patch revision: 4 (corrected active-test preflight/monitoring based on real hardware evidence)
-Supersedes revision 3 (staged, Frozen-only diagnostic redesign), revision 2 (sensor-first
-post-reset bootloader retry-probe), and revision 1 (initial diagnostic-only fork). Same upstream
-base commit; only source.patch changed.
+Patch revision: 5 (adds frozen-prime-test: Prime is now reachable in exactly one mode)
+Supersedes revision 4 (corrected active-test preflight/monitoring), revision 3 (staged,
+Frozen-only diagnostic redesign), revision 2 (sensor-first post-reset bootloader retry-probe), and
+revision 1 (initial diagnostic-only fork). Same upstream base commit; only source.patch changed.
+
+What changed in revision 5
+---------------------------
+Added a fourth subcommand, `frozen-prime-test`, which intentionally sends `Prime` (opcode 0x52)
+exactly once to fill an empty or partially-filled hydraulic loop. Full source audit (does Prime
+take arguments, apply to one/both sides, have an acknowledgment/start/completion signal, have a
+cancellation command, or have an assumed duration; what pumps/valves/solenoids are expected to
+operate) is in PROTOCOL_AUDIT.md. Key findings that shaped the implementation:
+
+  - `Prime` takes no arguments and has no per-side field -- it always affects both sides in one
+    frame (`7E 01 52 B6 2B`, asserted byte-for-byte by upstream's own test_prime fixture). This is
+    why frozen-prime-test has no --side flag, unlike frozen-cool-test.
+  - Direct start evidence: the binary `PrimingStarted` packet (0xD2) and/or a decoded
+    "FW: [priming] start" message. The *only* completion evidence that exists anywhere in the
+    protocol is "FW: [priming] done" / "...done because empty" -- there is no binary
+    "priming complete" packet, so this mode's early-stop-on-completion logic is driven entirely by
+    that message text.
+  - No Prime-cancellation command exists anywhere in the reused protocol (confirmed by a full scan
+    of FrozenCommand's variants). Subsystem reset (I2C 0x20) is therefore the only forced-stop
+    mechanism, exactly as for every other mode -- frozen-prime-test runs the same shared safe-stop
+    routine on every exit path, including after "done" was already observed.
+  - Normal OpenSleep's own scheduler does not assume any priming duration: its `prime` config
+    field is a time-of-day, not a duration, and its own source contains a
+    "// TODO verify it actually started priming" comment acknowledging no reliable completion
+    tracking exists upstream either. frozen-prime-test's 5-60s bounds (default 30s) are therefore a
+    deliberately conservative compile-time choice, stated as such rather than presented as
+    spec-derived.
+  - No "solenoid" or "valve" message exists anywhere in the pinned source; that detection is
+    documented as a forward-compatible keyword scan, not a confirmed protocol feature.
+  - `Prime` is gated by two independent mechanisms: the existing per-mode whitelist (extended with
+    a new `Mode::PrimeTest`), and a new at-most-once check inside `AuditedTransport::check` itself
+    -- a second `Prime` attempt in the same run is refused at the transport layer, not merely
+    avoided by this binary's own control flow. A new source-level guardrail test
+    (`frozen_action_prime_is_referenced_only_in_safety_and_prime_test`) proves
+    `FrozenAction::Prime`/`FrozenAction::prime()` is never referenced outside `safety.rs`/
+    `prime_test.rs`.
+  - `frozen-prime-test`'s result reporting never marks the run PASS merely because the command was
+    sent, acknowledged, a pump showed voltage, or "done" was printed -- it requires either a direct
+    firmware reservoir-transition message or the operator confirming both water movement and a
+    dropped reservoir level; otherwise the result is INCONCLUSIVE.
+  - Two bugs were found and fixed during this revision's own smoke-testing (not present in the
+    delivered build): an over-throttled telemetry-polling cadence that was incompatible with the
+    2-second staleness threshold, and a pre-existing bug (also affecting frozen-cool-test, fixed
+    here too) where several JSON report fields were being set on the in-memory Report *after* it
+    had already been written to disk, so the file never reflected them. Both are covered by new
+    automated tests and re-verified against the real cross-compiled binary via qemu-aarch64-static.
 
 What changed in revision 4
 ---------------------------
@@ -97,11 +143,11 @@ Tests:       cargo test --locked (run under the image's built-in QEMU test runne
 Test results (this build, inside the builder image)
 -----------------------------------------------------
 opensleep (lib) unit tests:               51 passed, 0 failed
-opensleep-diagnostic (bin) unit tests:    91 passed, 0 failed
+opensleep-diagnostic (bin) unit tests:    129 passed, 0 failed
 Doc-tests:                                 0 (none defined)
 
-See TEST_RESULTS.md for the full breakdown against the safety spec's 30-item test checklist, plus
-the "New tests added for the corrected active-test preflight/monitoring" section for this
+See TEST_RESULTS.md for the full breakdown against the safety spec's checklists (30-item for the
+original redesign, 28-item for frozen-prime-test), plus the "New tests added" sections for each
 revision's additions.
 
 Artifact validation
@@ -110,20 +156,20 @@ file:      dist/opensleep-diagnostic-aarch64-static: ELF 64-bit LSB executable, 
            version 1 (SYSV), statically linked, stripped
 readelf -l: 6 program headers (LOAD x2, TLS, GNU_EH_FRAME, GNU_STACK, GNU_RELRO); no
            PT_INTERP segment -- confirms no dynamic program interpreter, i.e. truly static.
-sha256sum: 245ec05f1e65711d61400f9d6e7b0f2a8d8babf1b2f83538130742174247a200  opensleep-diagnostic-aarch64-static
-           (2,167,520 bytes)
+sha256sum: 939b73eddf3d65ba8be2e05dcaea5b7227d150c3b9063569d8dbeac34175eee0  opensleep-diagnostic-aarch64-static
+           (2,233,312 bytes)
            Verified against the .sha256 file written by the same build: OK
 Smoke test: qemu-aarch64-static (user-mode emulation) was used to actually run the built ARM64
-           binary on the x86-64 build host: `--help`, `frozen-passive --dry-run`,
-           `frozen-cool-test --dry-run` (with hidden --assume-* test flags standing in for the
-           interactive phrases, --duration-seconds 5), and `emergency-stop --dry-run` all ran
-           successfully and produced the expected JSON reports and log output. The cool-test run
-           decoded both unsolicited TemperatureUpdate samples (error/control_error_c=9, matching
-           the real captured evidence) and solicited GetTemperature samples from the mock, took
-           ~11.5s wall-clock for a 5s active phase plus baseline collection (consistent with ~1
-           request/second pacing, not the runaway-flood bug fixed in the prior revision), and the
-           JSON output confirmed the field is now named `control_error_c` with no remaining
-           `error_deg` references.
+           binary on the x86-64 build host: `--help` (confirms all four subcommands are listed),
+           `frozen-passive --dry-run`, `frozen-cool-test --dry-run`, `frozen-prime-test --dry-run`
+           (all with hidden --assume-* test flags standing in for the interactive phrases), and
+           `emergency-stop --dry-run` all ran successfully and produced the expected JSON reports
+           and log output. The frozen-prime-test run sent Prime exactly once (prime_command_count
+           == 1), decoded the real PrimingStarted ack and "[priming] start"/"[priming] done"
+           messages from the mock, correctly stopped early on the completion message rather than
+           waiting out the full 8-second window, and reported INCONCLUSIVE (not PASS) with no
+           circulation evidence present -- matching the JSON output's prime_frame_hex field
+           ("7E 01 52 B6 2B", the exact source-evidenced frame) and rejected_command_count == 0.
 
 Deliverables
 ------------
@@ -132,6 +178,7 @@ opensleep-diagnostic-aarch64-static.sha256
 Dockerfile
 build.sh
 source.patch
+README.md
 RUN_ON_POD.md
 SAFETY.md
 PROTOCOL_AUDIT.md
