@@ -138,10 +138,10 @@ index 0000000..261be8d
 +}
 diff --git a/src/bin/opensleep-diagnostic/cli.rs b/src/bin/opensleep-diagnostic/cli.rs
 new file mode 100644
-index 0000000..4eeefc0
+index 0000000..ae47e4d
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/cli.rs
-@@ -0,0 +1,273 @@
+@@ -0,0 +1,274 @@
 +//! CLI surface. Every flag here maps to a fixed, validated field -- there is no flag that accepts
 +//! a raw opcode, a raw frame, or an arbitrary absolute temperature target. Side selection is a
 +//! closed `ValueEnum`; the cooling delta and duration are validated in `cool_test.rs` against
@@ -179,6 +179,7 @@ index 0000000..4eeefc0
 +    /// transport). Requires a connected cover with an empty/partially-filled reservoir topped up
 +    /// with water. See `prime_opensleep_init` module docs and SAFETY.md for how this differs from
 +    /// `frozen-prime-test`.
++    #[command(name = "frozen-prime-opensleep-init")]
 +    FrozenPrimeOpenSleepInit(PrimeOpenSleepInitArgs),
 +}
 +
