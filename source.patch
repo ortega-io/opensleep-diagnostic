@@ -3036,10 +3036,10 @@ index 0000000..5d6a0d1
 +}
 diff --git a/src/bin/opensleep-diagnostic/log_tap.rs b/src/bin/opensleep-diagnostic/log_tap.rs
 new file mode 100644
-index 0000000..7c440b1
+index 0000000..216770e
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/log_tap.rs
-@@ -0,0 +1,165 @@
+@@ -0,0 +1,179 @@
 +//! Global, opt-in tap on this process's own log output.
 +//!
 +//! `frozen-prime-opensleep-init` calls into the real, unmodified `reset`/`frozen`/`sensor` modules
@@ -3122,9 +3122,20 @@ index 0000000..7c440b1
 +#[cfg(test)]
 +mod tests {
 +    use super::*;
++    use std::sync::Mutex;
++
++    /// `enable`/`observe`/`checkpoint` share process-global state, but `cargo test` runs tests in
++    /// parallel within one process by default -- without this, two of these tests running at the
++    /// same time can interleave their `observe` calls into each other's `since(checkpoint)` range,
++    /// making exact-count assertions flaky. This lock keeps this module's own tests (the only ones
++    /// that call `observe` -- `prime_opensleep_init`'s tests never reach `log_tap::enable()`, since
++    /// they all exercise the `--dry-run` path, which returns before that call) strictly
++    /// one-at-a-time relative to each other.
++    static TEST_LOCK: Mutex<()> = Mutex::new(());
 +
 +    #[test]
 +    fn capture_records_lines_and_contains_exact_matches_target_and_message() {
++        let _guard = TEST_LOCK.lock().unwrap();
 +        enable();
 +        let before = checkpoint();
 +        observe(
@@ -3148,6 +3159,7 @@ index 0000000..7c440b1
 +
 +    #[test]
 +    fn exact_match_never_confuses_done_with_done_because_empty() {
++        let _guard = TEST_LOCK.lock().unwrap();
 +        enable();
 +        let before = checkpoint();
 +        observe("opensleep::frozen::state", "Priming Message: done");
@@ -3181,6 +3193,7 @@ index 0000000..7c440b1
 +
 +    #[test]
 +    fn checkpoint_excludes_earlier_lines() {
++        let _guard = TEST_LOCK.lock().unwrap();
 +        enable();
 +        observe("some::target", "irrelevant line before checkpoint");
 +        let cp = checkpoint();
@@ -3192,6 +3205,7 @@ index 0000000..7c440b1
 +
 +    #[test]
 +    fn target_prefix_match_does_not_match_an_unrelated_module() {
++        let _guard = TEST_LOCK.lock().unwrap();
 +        enable();
 +        let before = checkpoint();
 +        observe(
