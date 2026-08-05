@@ -46,7 +46,32 @@ topped up with water ready to be drawn in, and the same explicit-confirmation di
   been observed unavailable) — this tool cannot detect an empty reservoir on your behalf. See
   "Automatic abort conditions during `frozen-prime-test`" below.
 * There is no Prime-cancellation command anywhere in the reused protocol (see PROTOCOL_AUDIT.md).
-  Subsystem reset (I2C `0x20`) is the only forced-stop mechanism, exactly as for every other mode.
+  Subsystem reset (I2C `0x20`) is the only forced-stop mechanism, exactly as for every other mode
+  — **unless `--preserve-boot-state` is given; see below.**
+
+#### `--preserve-boot-state`: a different safety model, not a relaxed one
+
+`--preserve-boot-state` never opens, probes, or writes `/dev/i2c-1` — no reset-expander probe, no
+subsystem reset sequence, and no `0x20` write of any kind, on any exit path including Ctrl+C. This
+means the usual forced-stop backstop (subsystem reset) **does not exist** in this mode:
+
+* Frozen must already be running application firmware (`Ping` must get `Pong(true)`) before this
+  mode will send anything else. If it is not, the tool refuses to start and tells you to reboot
+  the Hub — it will never attempt a bootloader → firmware jump or a reset in this mode.
+* On exit (normal completion, `"done because empty"`, the fixed observation window elapsing, or
+  Ctrl+C/SIGTERM/SIGHUP) this mode only disables both temperature targets over UART and closes the
+  UART. **If priming does not visibly stop, you must reboot the Hub or disconnect Hub power
+  yourself** — there is no I2C-side backstop to fall back on.
+* The observation window is fixed at up to 600 seconds and does not honor `--duration-seconds`
+  (which governs the normal, resettable path's much shorter 5–60 second window).
+* Everything else about `frozen-prime-test` above still applies: the same five `--confirm-*`
+  flags, the same two typed confirmation phrases, `Prime` sent at most once, and the same
+  exact-match distinction between `"[priming] done"` (success) and `"[priming] done because
+  empty"` (incomplete, not success).
+
+Use this only when you specifically need the Hub's boot/subsystem state left untouched (e.g.
+Frozen is already known-good and mid-session) and you are prepared to physically power-cycle the
+Hub yourself if priming needs to be stopped and disabling the targets doesn't stop it.
 
 ## Hazards specific to this hardware
 
@@ -116,6 +141,8 @@ PROTOCOL_AUDIT.md.
 * If firmware reports priming complete (`"FW: [priming] done"` or `"...done because empty"`)
   before the configured duration elapses, the test stops early and runs safe-stop immediately —
   it never waits out the rest of the window once completion is observed.
+* `--preserve-boot-state` replaces this whole limits list with its own fixed, non-overridable
+  600-second observation window — see the `--preserve-boot-state` section above.
 * The operator may run another separate priming cycle after inspecting and refilling the
   reservoir. **This tool never automatically repeats or restarts `Prime`.**
 

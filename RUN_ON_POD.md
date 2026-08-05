@@ -211,6 +211,49 @@ reservoir level. If everything ran but circulation wasn't clearly observed, expe
 **INCONCLUSIVE**, not PASS — see PROTOCOL_AUDIT.md for exactly why. An INCONCLUSIVE or FAIL result
 means: inspect, refill, and consider another cycle before moving on to cooling.
 
+### `--preserve-boot-state`: priming without touching I2C or resetting anything
+
+Add `--preserve-boot-state` to the command above only if you specifically need the Hub's I2C bus
+and subsystem boot state left completely untouched — e.g. Frozen is already known-good and
+mid-session, and you don't want the normal reset-expander probe/reset sequence to run at all. This
+flag changes the safety model, not just the mechanism — read this whole section before using it.
+
+```sh
+/persistent/tools/opensleep-diagnostic frozen-prime-test \
+    --frozen-port /dev/ttyS1 \
+    --preserve-boot-state \
+    --confirm-cover-hydraulics-connected \
+    --confirm-reservoir-filled \
+    --confirm-cover-loop-needs-priming \
+    --confirm-no-visible-leaks \
+    --confirm-active-test \
+    --json-output /persistent/frozen-prime-preserve.json \
+    --verbose
+```
+
+* `/dev/i2c-1` is never opened, probed, or written — not even the reset-expander probe. `--i2c-device`
+  is accepted but ignored for I/O purposes in this mode.
+* Frozen must already be running application firmware. This mode only sends `Ping` and requires
+  `Pong(true)` back; if Frozen answers from its bootloader (or doesn't answer), the tool refuses to
+  proceed and tells you to **reboot the Hub yourself** — it will not attempt a bootloader →
+  firmware jump or any reset in this mode.
+* `--duration-seconds` is ignored. The observation window is fixed at up to 600 seconds.
+* **There is no I2C subsystem-reset backstop in this mode.** On exit — normal completion, `"done
+  because empty"`, the window elapsing, or Ctrl+C — this mode only disables both temperature
+  targets over UART and closes the UART. **If priming does not visibly stop after that, reboot the
+  Hub or disconnect Hub power yourself.** Keep that access ready for the whole run, same as always.
+* The same five `--confirm-*` flags and the same two typed confirmation phrases are still required.
+* The printed/JSON summary reports this mode's own result block instead of `prime_results`:
+
+  ```
+  preserve_boot_state:          true
+  I2C writes performed:         0
+  Prime outcome:                success / incomplete (done because empty) / not observed within window / not sent
+  Pumps commanded:               true/false
+  Normal done observed:          true/false
+  Done because empty observed:   true/false
+  ```
+
 ## 7. Once the loop is confirmed filled: run a 10-second cooling test on one side
 
 Only proceed here once you've confirmed water movement and a stable reservoir level from step 6

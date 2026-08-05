@@ -109,10 +109,10 @@ index 0000000..dcd3e78
 +}
 diff --git a/src/bin/opensleep-diagnostic/cli.rs b/src/bin/opensleep-diagnostic/cli.rs
 new file mode 100644
-index 0000000..01caac0
+index 0000000..70b6993
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/cli.rs
-@@ -0,0 +1,219 @@
+@@ -0,0 +1,230 @@
 +//! CLI surface. Every flag here maps to a fixed, validated field -- there is no flag that accepts
 +//! a raw opcode, a raw frame, or an arbitrary absolute temperature target. Side selection is a
 +//! closed `ValueEnum`; the cooling delta and duration are validated in `cool_test.rs` against
@@ -315,6 +315,17 @@ index 0000000..01caac0
 +    pub assume_interactive_phrase: Option<String>,
 +    #[arg(long, hide = true)]
 +    pub assume_start_phrase: Option<String>,
++
++    /// Never touch /dev/i2c-1 (no probe, no reset, no writes of any kind) and never attempt a
++    /// bootloader -> firmware jump. Requires Frozen to already be running application firmware
++    /// (confirmed by Ping/Pong); if it is not, this refuses to proceed and tells the operator to
++    /// reboot the Hub instead of resetting anything. The priming observation window is fixed at
++    /// up to `prime_test::PRESERVE_BOOT_STATE_MAX_DURATION_SECONDS` seconds and ignores
++    /// `--duration-seconds`. On exit (normal completion, "done because empty", or a stop signal)
++    /// this only disables both temperature targets over UART and closes the UART -- it never
++    /// asserts the 0x20 subsystem reset.
++    #[arg(long, default_value_t = false)]
++    pub preserve_boot_state: bool,
 +}
 +
 +#[derive(clap::Args, Debug, Clone)]
@@ -334,10 +345,10 @@ index 0000000..01caac0
 +}
 diff --git a/src/bin/opensleep-diagnostic/cool_test.rs b/src/bin/opensleep-diagnostic/cool_test.rs
 new file mode 100644
-index 0000000..58a42bf
+index 0000000..d1a20f4
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/cool_test.rs
-@@ -0,0 +1,1539 @@
+@@ -0,0 +1,1543 @@
 +//! `frozen-cool-test`: the one subcommand that intentionally activates a cooling channel. Every
 +//! hard limit here (max delta, max duration, baseline range, heatsink ceiling) is a compile-time
 +//! constant; no CLI flag can raise any of them. See SAFETY.md for the operator-facing version of
@@ -1161,6 +1172,8 @@ index 0000000..58a42bf
 +        safe_stop: Some((&safe_stop).into()),
 +        component_results: Some(cr),
 +        prime_results: None,
++        preserve_boot_state: false,
++        preserve_boot_state_results: None,
 +        overall_pass,
 +        exit_code: 0,
 +    };
@@ -1263,6 +1276,8 @@ index 0000000..58a42bf
 +        safe_stop: None,
 +        component_results: None,
 +        prime_results: None,
++        preserve_boot_state: false,
++        preserve_boot_state_results: None,
 +        overall_pass: false,
 +        exit_code: 30,
 +    }
@@ -3434,10 +3449,10 @@ index 0000000..910d8c6
 +}
 diff --git a/src/bin/opensleep-diagnostic/passive.rs b/src/bin/opensleep-diagnostic/passive.rs
 new file mode 100644
-index 0000000..448c1ac
+index 0000000..de52a0b
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/passive.rs
-@@ -0,0 +1,440 @@
+@@ -0,0 +1,442 @@
 +//! `frozen-passive`: safe with the cover disconnected and no water. Never constructs an enabled
 +//! `SetTargetTemperature`; the only actuator-shaped command it can ever send is the disabled
 +//! (`enabled=false`) safety-off, which both `AuditedTransport` and the closed `FrozenAction` enum
@@ -3822,6 +3837,8 @@ index 0000000..448c1ac
 +        safe_stop: None,
 +        component_results: None,
 +        prime_results: None,
++        preserve_boot_state: false,
++        preserve_boot_state_results: None,
 +        overall_pass: false,
 +        exit_code: exit_code_override.unwrap_or(30),
 +    }
@@ -3880,10 +3897,10 @@ index 0000000..448c1ac
 +}
 diff --git a/src/bin/opensleep-diagnostic/prime_test.rs b/src/bin/opensleep-diagnostic/prime_test.rs
 new file mode 100644
-index 0000000..0980014
+index 0000000..225cb2b
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/prime_test.rs
-@@ -0,0 +1,1514 @@
+@@ -0,0 +1,2073 @@
 +//! `frozen-prime-test`: the one subcommand that intentionally sends `Prime` (opcode 0x52) to fill
 +//! an empty or partially-filled Eight Sleep Pod 3 hydraulic loop. See SAFETY.md for the
 +//! operator-facing guarantees and PROTOCOL_AUDIT.md for the full source audit behind every claim
@@ -3920,8 +3937,8 @@ index 0000000..0980014
 +use crate::mock::mock_frozen_link_pair;
 +use crate::ownership;
 +use crate::report::{
-+    AuditEntryJson, Confirmations, PrimeOperatorObservations, PrimeResults, PumpSampleJson, Report,
-+    TemperatureSampleJson, Verdict,
++    AuditEntryJson, Confirmations, PreserveBootStateResults, PrimeOperatorObservations, PrimeOutcome,
++    PrimeResults, PumpSampleJson, Report, TemperatureSampleJson, Verdict,
 +};
 +use crate::safe_stop::run_safe_stop;
 +use crate::safety::{AuditedTransport, FrozenAction, Mode};
@@ -3934,6 +3951,10 @@ index 0000000..0980014
 +pub const HARD_MAX_DURATION_SECONDS: u64 = 60;
 +/// Hard, non-overridable minimum -- a shorter window cannot meaningfully observe anything.
 +pub const MIN_DURATION_SECONDS: u64 = 5;
++/// Fixed observation window for `--preserve-boot-state`, which has no I2C-reset backstop and so
++/// intentionally allows a much longer supervised window than the normal (resettable) path's
++/// `HARD_MAX_DURATION_SECONDS`. Not affected by `--duration-seconds`.
++pub const PRESERVE_BOOT_STATE_MAX_DURATION_SECONDS: u64 = 600;
 +pub const BASELINE_MIN_SAMPLES: usize = 3;
 +pub const BASELINE_WINDOW: Duration = Duration::from_secs(3);
 +/// Length of each drain window within one ~1-second active-phase tick.
@@ -3948,19 +3969,24 @@ index 0000000..0980014
 +const FINAL_PHRASE: &str = "START SUPERVISED PRIMING";
 +
 +pub async fn run(args: &PrimeTestArgs) -> (Report, u8) {
-+    if args.duration_seconds > HARD_MAX_DURATION_SECONDS {
-+        log::error!(
-+            "refusing to run: --duration-seconds {} exceeds the hard maximum of {} (no option can raise this)",
-+            args.duration_seconds, HARD_MAX_DURATION_SECONDS
-+        );
-+        return (refused_report(args, false, "duration exceeds hard maximum"), 30);
-+    }
-+    if args.duration_seconds < MIN_DURATION_SECONDS {
-+        log::error!(
-+            "refusing to run: --duration-seconds {} is below the minimum of {}",
-+            args.duration_seconds, MIN_DURATION_SECONDS
-+        );
-+        return (refused_report(args, false, "duration below minimum"), 30);
++    // --preserve-boot-state uses its own fixed observation window (see
++    // PRESERVE_BOOT_STATE_MAX_DURATION_SECONDS), not --duration-seconds, so these bounds don't
++    // apply to it.
++    if !args.preserve_boot_state {
++        if args.duration_seconds > HARD_MAX_DURATION_SECONDS {
++            log::error!(
++                "refusing to run: --duration-seconds {} exceeds the hard maximum of {} (no option can raise this)",
++                args.duration_seconds, HARD_MAX_DURATION_SECONDS
++            );
++            return (refused_report(args, false, "duration exceeds hard maximum"), 30);
++        }
++        if args.duration_seconds < MIN_DURATION_SECONDS {
++            log::error!(
++                "refusing to run: --duration-seconds {} is below the minimum of {}",
++                args.duration_seconds, MIN_DURATION_SECONDS
++            );
++            return (refused_report(args, false, "duration below minimum"), 30);
++        }
 +    }
 +
 +    if !(args.confirm_cover_hydraulics_connected
@@ -3984,6 +4010,10 @@ index 0000000..0980014
 +    }
 +
 +    let capture: crate::io_logging::RawIoCapture = Arc::new(Mutex::new(Vec::new()));
++
++    if args.preserve_boot_state {
++        return run_preserve_boot_state(args, &capture).await;
++    }
 +
 +    if args.dry_run {
 +        log::warn!("--dry-run: no I2C or UART writes will be performed; using a mocked Frozen device");
@@ -4020,6 +4050,343 @@ index 0000000..0980014
 +    };
 +
 +    run_core(args, &mut i2c, link.as_mut(), false, &capture).await
++}
++
++/// `--preserve-boot-state` entry point. Deliberately never constructs an `I2cPort` of any kind
++/// (real or mock) -- there is no I2C handle anywhere in this function or anything it calls, which
++/// is what makes "zero I2C writes" a structural guarantee rather than a runtime check. Opens (or
++/// mocks) only the Frozen UART, then hands off to [`run_preserve_boot_state_core`].
++async fn run_preserve_boot_state(args: &PrimeTestArgs, capture: &crate::io_logging::RawIoCapture) -> (Report, u8) {
++    log::warn!(
++        "--preserve-boot-state: {} will not be opened or written; no subsystem reset and no bootloader -> firmware jump will be attempted",
++        args.i2c_device
++    );
++
++    if args.dry_run {
++        log::warn!("--dry-run: no UART writes will be performed; using a mocked Frozen device");
++        let (client, task) = mock_frozen_link_pair();
++        let mut link = FrozenLink::wrap_capturing(client, "dry-run", capture.clone());
++        let result = run_preserve_boot_state_core(args, &mut link, true, capture).await;
++        drop(link);
++        task.abort();
++        return result;
++    }
++
++    if let Some(early) = refuse_if_owned(args) {
++        return early;
++    }
++
++    let mut link = match opensleep::common::serial::create_port(&args.frozen_port, crate::link::BAUD) {
++        Ok(raw) => {
++            log::info!("Frozen UART opened: {} @ {} baud, 8N1, no flow control", args.frozen_port, crate::link::BAUD);
++            FrozenLink::wrap_capturing(raw, "Frozen", capture.clone())
++        }
++        Err(e) => {
++            log::error!("failed to open Frozen UART {}: {e}", args.frozen_port);
++            return (refused_report(args, false, "Frozen UART failed to open"), 20);
++        }
++    };
++
++    run_preserve_boot_state_core(args, &mut link, false, capture).await
++}
++
++/// Disables both temperature targets over UART and flushes the write side -- the only shutdown
++/// action `--preserve-boot-state` ever takes. Never touches I2C (there is no I2C handle in scope
++/// anywhere in this call tree). The UART itself is closed by the caller dropping `link` once this
++/// returns.
++async fn disable_both_over_uart<T>(link: &mut FrozenLink<T>, audit: &mut AuditedTransport)
++where
++    T: AsyncRead + AsyncWrite + Unpin,
++{
++    for side in [BedSide::Left, BedSide::Right] {
++        if let Err(e) = link.send(audit, FrozenAction::safety_off(side), COMMAND_TIMEOUT).await {
++            log::error!("--preserve-boot-state: failed to disable {side:?}: {e}");
++        }
++    }
++    match link.flush().await {
++        Ok(()) => log::info!("--preserve-boot-state: UART flushed"),
++        Err(e) => log::error!("--preserve-boot-state: UART flush failed: {e}"),
++    }
++}
++
++/// The `--preserve-boot-state` active flow itself: Ping (require `Pong(true)` from firmware
++/// already running -- no reset, no bootloader jump), disable both targets, send `Prime` exactly
++/// once, watch for the exact `"[priming] done"` / `"[priming] done because empty"` messages for up
++/// to `PRESERVE_BOOT_STATE_MAX_DURATION_SECONDS`, then disable both targets again and return --
++/// never asserting the I2C subsystem reset on any path, because no I2C handle exists here to do it
++/// with.
++async fn run_preserve_boot_state_core<T>(
++    args: &PrimeTestArgs,
++    link: &mut FrozenLink<T>,
++    dry_run: bool,
++    capture: &crate::io_logging::RawIoCapture,
++) -> (Report, u8)
++where
++    T: AsyncRead + AsyncWrite + Unpin,
++{
++    let mut audit = AuditedTransport::new(Mode::PrimeTest);
++
++    // Steps 5-7: Ping, require Pong(true) from an already-running application. No JumpToFirmware,
++    // no reset, is ever attempted in this mode.
++    let (ping_ok, mode) = crate::frozen_ops::ping(link, &mut audit, COMMAND_TIMEOUT).await;
++    let reached_firmware = ping_ok && mode == crate::frozen_ops::DeviceMode::Firmware;
++    if !reached_firmware {
++        log::error!(
++            "refusing to run with --preserve-boot-state: Frozen did not answer Ping with Pong(true) from application firmware"
++        );
++        log::error!("this mode never resets the subsystem or jumps bootloader -> firmware: reboot the Hub and retry");
++        return finish_preserve_boot_state(
++            args, dry_run, &audit, reached_firmware, false, PrimeOutcome::NotSent, false, false, false,
++            StopReason::PreflightRefused, 30, capture,
++        );
++    }
++
++    // Step 8: disable both temperature targets through UART, and confirm from the acks that
++    // neither is enabled before proceeding.
++    let mut left_enabled = None;
++    let mut right_enabled = None;
++    for side in [BedSide::Left, BedSide::Right] {
++        match link.send(&mut audit, FrozenAction::safety_off(side), COMMAND_TIMEOUT).await {
++            Ok(PacketOutcome::Received(FrozenPacket::TargetUpdate((s, t)))) => match s {
++                BedSide::Left => left_enabled = Some(t.enabled),
++                BedSide::Right => right_enabled = Some(t.enabled),
++            },
++            Ok(_) => {}
++            Err(e) => log::error!("--preserve-boot-state: safety-off for {side:?} failed: {e}"),
++        }
++    }
++    if left_enabled == Some(true) || right_enabled == Some(true) {
++        log::error!("refusing to run with --preserve-boot-state: an enabled target is still active after safety-off");
++        disable_both_over_uart(link, &mut audit).await;
++        return finish_preserve_boot_state(
++            args, dry_run, &audit, reached_firmware, false, PrimeOutcome::NotSent, false, false, false,
++            StopReason::PreflightRefused, 30, capture,
++        );
++    }
++
++    eprintln!("WARNING: Priming may rapidly lower the reservoir water level.");
++    eprintln!("Watch the reservoir continuously.");
++    eprintln!("Stop immediately if the reservoir approaches empty.");
++    eprintln!("Keep access to disconnect Hub power.");
++    eprintln!("--preserve-boot-state: no I2C subsystem reset is available as a backstop in this mode.");
++    let start_ok = confirm_phrase(
++        args.assume_start_phrase.clone(),
++        FINAL_PHRASE,
++        &format!("Type {FINAL_PHRASE} to continue: "),
++    );
++    if !start_ok {
++        log::error!("refusing to run with --preserve-boot-state: final start phrase was not matched exactly");
++        disable_both_over_uart(link, &mut audit).await;
++        return finish_preserve_boot_state(
++            args, dry_run, &audit, reached_firmware, false, PrimeOutcome::NotSent, false, false, false,
++            StopReason::PreflightRefused, 30, capture,
++        );
++    }
++
++    // Step 9: send Prime exactly once. AuditedTransport::check enforces the at-most-once rule
++    // structurally, same as the normal (resettable) path.
++    let send_result = link.send(&mut audit, FrozenAction::prime(), COMMAND_TIMEOUT).await;
++    let pumps_commanded = send_result.is_ok();
++    if !pumps_commanded {
++        log::error!("--preserve-boot-state: failed to transmit Prime: {send_result:?}");
++    }
++
++    // Steps 10-13: observe priming state for up to PRESERVE_BOOT_STATE_MAX_DURATION_SECONDS.
++    // priming_stage_text strips the "FW: [priming] " prefix and the match below compares the
++    // remainder for exact equality against "done" and "done because empty" -- never a substring
++    // check, so the two outcomes can never be confused with each other or with unrelated messages
++    // (e.g. a hypothetical future "done but slow" would fall through to `_` untouched).
++    let mut normal_done_observed = false;
++    let mut done_because_empty_observed = false;
++    let stop_reason = if pumps_commanded {
++        let active_start = Instant::now();
++        let window = Duration::from_secs(PRESERVE_BOOT_STATE_MAX_DURATION_SECONDS);
++        'observe: loop {
++            let remaining = window.saturating_sub(active_start.elapsed());
++            if remaining.is_zero() {
++                break 'observe StopReason::DurationExpired;
++            }
++            tokio::select! {
++                biased;
++                reason = wait_for_termination_signal() => {
++                    break 'observe reason;
++                }
++                outcome = link.recv(remaining) => {
++                    match outcome {
++                        Ok(PacketOutcome::Received(FrozenPacket::Message(m))) => {
++                            if let Some(stage) = priming_stage_text(&m) {
++                                match stage {
++                                    "done" => {
++                                        normal_done_observed = true;
++                                        break 'observe StopReason::PrimingCompleted;
++                                    }
++                                    "done because empty" => {
++                                        done_because_empty_observed = true;
++                                        break 'observe StopReason::PrimingCompleted;
++                                    }
++                                    _ => {}
++                                }
++                            }
++                        }
++                        Ok(PacketOutcome::TimedOut) => break 'observe StopReason::DurationExpired,
++                        Ok(PacketOutcome::Closed) => break 'observe StopReason::TelemetryLost,
++                        Ok(_) => {}
++                        Err(e) => log::error!("--preserve-boot-state: error while observing priming: {e}"),
++                    }
++                }
++            }
++        }
++    } else {
++        StopReason::UartWriteFailure
++    };
++
++    let prime_outcome = if !pumps_commanded {
++        PrimeOutcome::NotSent
++    } else if normal_done_observed {
++        PrimeOutcome::Success
++    } else if done_because_empty_observed {
++        PrimeOutcome::IncompleteReservoirEmpty
++    } else {
++        PrimeOutcome::NotObservedWithinWindow
++    };
++
++    // Steps 14-16: never assert the I2C subsystem reset in this mode, on any exit path (normal
++    // completion, "done because empty", duration expiry, or a stop signal) -- only disable both
++    // targets over UART. The caller closes the UART by dropping `link` once this function returns.
++    disable_both_over_uart(link, &mut audit).await;
++
++    if matches!(stop_reason, StopReason::CtrlC | StopReason::Sigterm | StopReason::Sighup) {
++        eprintln!("--preserve-boot-state: stop requested.");
++        eprintln!("Both temperature targets were disabled and the UART is being closed.");
++        eprintln!("No I2C subsystem reset was performed by this tool in this mode.");
++        eprintln!("If priming does not stop, reboot the Hub or disconnect Hub power.");
++    }
++
++    let overall_pass = prime_outcome == PrimeOutcome::Success;
++    finish_preserve_boot_state(
++        args, dry_run, &audit, reached_firmware, true, prime_outcome, pumps_commanded,
++        normal_done_observed, done_because_empty_observed, stop_reason,
++        if overall_pass { 0 } else { 1 }, capture,
++    )
++}
++
++#[allow(clippy::too_many_arguments)]
++fn finish_preserve_boot_state(
++    args: &PrimeTestArgs,
++    dry_run: bool,
++    audit: &AuditedTransport,
++    reached_firmware: bool,
++    start_phrase_confirmed: bool,
++    prime_outcome: PrimeOutcome,
++    pumps_commanded: bool,
++    normal_done_observed: bool,
++    done_because_empty_observed: bool,
++    stop_reason: StopReason,
++    exit_code: u8,
++    capture: &crate::io_logging::RawIoCapture,
++) -> (Report, u8) {
++    let raw_io_events = capture
++        .lock()
++        .map(|log| log.iter().map(crate::report::RawIoEventJson::from).collect())
++        .unwrap_or_default();
++
++    let overall_pass = prime_outcome == PrimeOutcome::Success;
++
++    let report = Report {
++        program_version: DIAGNOSTIC_VERSION.to_string(),
++        opensleep_base_version: opensleep::VERSION.to_string(),
++        opensleep_source_commit: source_commit().to_string(),
++        kernel: kernel_release(),
++        arch: std::env::consts::ARCH.to_string(),
++        mode: audit.mode().label().to_string(),
++        dry_run,
++        confirmations: Confirmations {
++            cover_hydraulics_connected_declared: Some(args.confirm_cover_hydraulics_connected),
++            water_loop_filled_declared: Some(args.confirm_reservoir_filled),
++            no_visible_leaks_declared: Some(args.confirm_no_visible_leaks),
++            active_test_confirmed_flag: Some(args.confirm_active_test),
++            interactive_phrase_confirmed: Some(true),
++            final_start_phrase_confirmed: Some(start_phrase_confirmed),
++        },
++        i2c_device: args.i2c_device.clone(),
++        // --preserve-boot-state never opens, probes, or writes /dev/i2c-1 -- there is no I2C
++        // handle anywhere in this call tree, so every I2C-related field below is unconditionally
++        // the "never touched" value, not merely "false because it happened to fail".
++        i2c_bus_open: false,
++        reset_expander_probe_ok: false,
++        reset_expander_value: None,
++        led_controller_probe_ok: false,
++        subsystem_reset_performed: false,
++        subsystem_reset_ok: false,
++        frozen_port: args.frozen_port.clone(),
++        frozen_uart_opened: true,
++        frozen_bootloader_ping: None,
++        frozen_firmware_ping: Some(reached_firmware),
++        frozen_hardware_info: None,
++        firmware_version_or_hash: None,
++        frozen_firmware_probed: false,
++        detected_initial_mode: None,
++        firmware_jump_sent: false,
++        outgoing_commands: audit.entries().iter().map(AuditEntryJson::from).collect(),
++        enabled_target_command_count: audit.enabled_target_count(),
++        prime_command_count: audit.prime_count(),
++        random_command_count: audit.random_count(),
++        safety_off_commands_sent: audit.entries().iter().filter(|e| e.enabled == Some(false)).count() as u32,
++        rejected_command_count: audit.rejected_command_count(),
++        prime_frame_hex: if pumps_commanded {
++            Some(
++                FrozenAction::prime()
++                    .to_command()
++                    .to_bytes()
++                    .iter()
++                    .map(|b| format!("{b:02X}"))
++                    .collect::<Vec<_>>()
++                    .join(" "),
++            )
++        } else {
++            None
++        },
++        telemetry_samples: Vec::new(),
++        raw_packets_decoded: 0,
++        malformed_windows: 0,
++        communication_timeouts: 0,
++        unsolicited_telemetry_seen: false,
++        firmware_messages: Vec::new(),
++        pump_samples: Vec::new(),
++        solenoid_valve_messages: Vec::new(),
++        reservoir_transition_messages: Vec::new(),
++        other_decoded_packets: Vec::new(),
++        raw_io_events,
++        priming_start_observed: false,
++        priming_done_observed: normal_done_observed || done_because_empty_observed,
++        priming_done_because_empty: done_because_empty_observed,
++        operator_observations: None,
++        prime_operator_observations: None,
++        stop_reason: stop_reason.to_string(),
++        safe_stop: None,
++        component_results: None,
++        prime_results: None,
++        preserve_boot_state: true,
++        preserve_boot_state_results: Some(PreserveBootStateResults {
++            i2c_writes_performed: 0,
++            prime_outcome,
++            pumps_commanded,
++            normal_done_observed,
++            done_because_empty_observed,
++        }),
++        overall_pass,
++        exit_code,
++    };
++
++    if let Some(path) = &args.json_output
++        && let Err(e) = report.write_json(path)
++    {
++        log::error!("failed to write JSON output to {path}: {e}");
++    }
++    report.print_table();
++
++    let code = report.exit_code;
++    (report, code)
 +}
 +
 +fn refuse_if_owned(args: &PrimeTestArgs) -> Option<(Report, u8)> {
@@ -4833,6 +5200,8 @@ index 0000000..0980014
 +        safe_stop: Some((&safe_stop).into()),
 +        component_results: None,
 +        prime_results: Some(pr),
++        preserve_boot_state: args.preserve_boot_state,
++        preserve_boot_state_results: None,
 +        overall_pass,
 +        exit_code: 0,
 +    };
@@ -4909,6 +5278,14 @@ index 0000000..0980014
 +        safe_stop: None,
 +        component_results: None,
 +        prime_results: None,
++        preserve_boot_state: args.preserve_boot_state,
++        preserve_boot_state_results: args.preserve_boot_state.then_some(PreserveBootStateResults {
++            i2c_writes_performed: 0,
++            prime_outcome: PrimeOutcome::NotSent,
++            pumps_commanded: false,
++            normal_done_observed: false,
++            done_because_empty_observed: false,
++        }),
 +        overall_pass: false,
 +        exit_code: 30,
 +    }
@@ -4935,6 +5312,7 @@ index 0000000..0980014
 +            dry_run,
 +            assume_interactive_phrase: Some(INTERACTIVE_PHRASE.to_string()),
 +            assume_start_phrase: Some(FINAL_PHRASE.to_string()),
++            preserve_boot_state: false,
 +        }
 +    }
 +
@@ -5397,13 +5775,211 @@ index 0000000..0980014
 +        let u = TemperatureUpdate { left_temp: 2450, right_temp: 2460, heatsink_temp: 2600, error: 9, count: 1 };
 +        assert!(evaluate_temperatures(u.left_temp, u.right_temp, u.heatsink_temp).is_ok());
 +    }
++
++    // ---- --preserve-boot-state: never touches I2C in any way (no probe, no reset, no writes),
++    // never jumps bootloader -> firmware, disables both targets and sends Prime exactly once, and
++    // distinguishes "done" (success) from "done because empty" (incomplete) by exact match. ----
++
++    fn preserve_boot_state_args(dry_run: bool) -> PrimeTestArgs {
++        let mut a = args(dry_run);
++        a.preserve_boot_state = true;
++        a
++    }
++
++    /// Source-level guardrail, complementing the runtime proofs below: scans this file's own
++    /// `--preserve-boot-state` code (from `run_preserve_boot_state` up to the next top-level `fn`)
++    /// for any reference to an I2C type or function. No I2C parameter exists anywhere in that call
++    /// chain -- this proves the omission is total (nothing to call even if a future edit tried),
++    /// not merely that today's tests happen not to trigger a write.
++    #[test]
++    fn preserve_boot_state_source_never_references_any_i2c_type_or_function() {
++        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/bin/opensleep-diagnostic/prime_test.rs");
++        let src = std::fs::read_to_string(path).expect("readable source file");
++        let start = src.find("async fn run_preserve_boot_state(").expect("run_preserve_boot_state must exist");
++        let end = src.find("fn refuse_if_owned(").expect("refuse_if_owned must exist");
++        assert!(start < end);
++        let region = &src[start..end];
++        for needle in [
++            "I2cPort", "RealI2c", "MockI2c", "write_reg", "assert_reset(", "run_reset_sequence(",
++            "probe_address(", "crate::i2c",
++        ] {
++            assert!(!region.contains(needle), "--preserve-boot-state code must never reference {needle}");
++        }
++    }
++
++    /// Custom mock Frozen device for `--preserve-boot-state` tests. Unlike the shared `mock.rs`
++    /// device (which only pushes its "done" message piggybacked on a `GetTemperatures` reply),
++    /// this one responds to `Prime` immediately with `PrimingStarted` plus the given completion
++    /// message, with no polling required -- matching how real Frozen firmware pushes messages
++    /// unsolicited (see PROTOCOL_AUDIT.md) and keeping these tests fast: `--preserve-boot-state`'s
++    /// observation loop never sends `GetTemperatures` at all (see module docs above), so a mock
++    /// that required polling to speak would never complete within the test's real wall-clock time.
++    fn spawn_device_for_preserve_boot_state(
++        mut device_side: tokio::io::DuplexStream,
++        in_firmware: bool,
++        completion_message: &'static str,
++    ) -> tokio::task::JoinHandle<()> {
++        use bytes::{Buf, BytesMut};
++        use tokio::io::{AsyncReadExt, AsyncWriteExt};
++        tokio::spawn(async move {
++            let mut acc = BytesMut::new();
++            let mut read_buf = [0u8; 256];
++            loop {
++                if acc.len() >= 2 {
++                    let len = acc[1] as usize;
++                    let total = 1 + 1 + len + 2;
++                    if acc.len() >= total {
++                        let opcode = acc[2];
++                        let payload = acc[2..2 + len].to_vec();
++                        acc.advance(total);
++                        let response: Option<Vec<u8>> = match opcode {
++                            0x01 => {
++                                let code: u8 = if in_firmware { 0b0100_0110 } else { 0b0100_0010 };
++                                Some(opensleep::common::codec::command(vec![0x81, 0x00, code]))
++                            }
++                            0x40 if payload.len() == 5 => Some(opensleep::common::codec::command(vec![
++                                0xC0, 0x00, payload[1], payload[2], payload[3], payload[4],
++                            ])),
++                            0x52 => {
++                                let mut combined = opensleep::common::codec::command(vec![0xD2, 0x00]);
++                                let mut msg = vec![0x07u8, 0x00];
++                                msg.extend_from_slice(completion_message.as_bytes());
++                                combined.extend(opensleep::common::codec::command(msg));
++                                Some(combined)
++                            }
++                            _ => None,
++                        };
++                        if let Some(resp) = response
++                            && device_side.write_all(&resp).await.is_err()
++                        {
++                            break;
++                        }
++                        continue;
++                    }
++                }
++                match device_side.read(&mut read_buf).await {
++                    Ok(0) | Err(_) => break,
++                    Ok(n) => acc.extend_from_slice(&read_buf[..n]),
++                }
++            }
++        })
++    }
++
++    #[tokio::test]
++    async fn preserve_boot_state_performs_zero_i2c_writes_on_a_successful_run() {
++        let (client, device) = tokio::io::duplex(8192);
++        let device_task = spawn_device_for_preserve_boot_state(device, true, "FW: [priming] done");
++        let mut link = FrozenLink::wrap(client, "test");
++        let capture: crate::io_logging::RawIoCapture = Arc::new(Mutex::new(Vec::new()));
++
++        let a = preserve_boot_state_args(false);
++        let (report, code) = run_preserve_boot_state_core(&a, &mut link, false, &capture).await;
++
++        // The strongest possible proof: this whole call tree never had an I2C handle in scope.
++        assert!(!report.i2c_bus_open);
++        assert!(!report.reset_expander_probe_ok);
++        assert!(!report.subsystem_reset_performed);
++        assert!(!report.subsystem_reset_ok);
++        let pbs = report.preserve_boot_state_results.clone().expect("preserve_boot_state_results must be set");
++        assert_eq!(pbs.i2c_writes_performed, 0);
++        assert_eq!(pbs.prime_outcome, PrimeOutcome::Success);
++        assert!(pbs.pumps_commanded);
++        assert!(pbs.normal_done_observed);
++        assert!(!pbs.done_because_empty_observed);
++        assert!(report.preserve_boot_state);
++        assert!(report.overall_pass);
++        assert_eq!(code, 0);
++        assert_eq!(report.prime_command_count, 1);
++        assert_eq!(report.enabled_target_command_count, 0);
++        assert_eq!(report.safety_off_commands_sent, 4); // both sides, before and after Prime
++
++        drop(link);
++        device_task.abort();
++    }
++
++    #[tokio::test]
++    async fn preserve_boot_state_reports_done_because_empty_as_incomplete_not_success() {
++        let (client, device) = tokio::io::duplex(8192);
++        let device_task = spawn_device_for_preserve_boot_state(device, true, "FW: [priming] done because empty");
++        let mut link = FrozenLink::wrap(client, "test");
++        let capture: crate::io_logging::RawIoCapture = Arc::new(Mutex::new(Vec::new()));
++
++        let a = preserve_boot_state_args(false);
++        let (report, _code) = run_preserve_boot_state_core(&a, &mut link, false, &capture).await;
++
++        // Still zero I2C writes on this path.
++        assert!(!report.i2c_bus_open);
++        let pbs = report.preserve_boot_state_results.expect("preserve_boot_state_results must be set");
++        assert_eq!(pbs.i2c_writes_performed, 0);
++        // "done because empty" is incomplete, never success, and must not be confused with "done".
++        assert_eq!(pbs.prime_outcome, PrimeOutcome::IncompleteReservoirEmpty);
++        assert!(pbs.done_because_empty_observed);
++        assert!(!pbs.normal_done_observed);
++        assert!(!report.overall_pass);
++        assert!(report.priming_done_because_empty);
++
++        drop(link);
++        device_task.abort();
++    }
++
++    #[tokio::test]
++    async fn preserve_boot_state_aborts_without_touching_i2c_when_stuck_in_bootloader() {
++        let (client, device) = tokio::io::duplex(8192);
++        // Pong(false): bootloader mode. This device never handles 0x52 (Prime) or JumpToFirmware
++        // meaningfully -- if this test passes it's because the code under test never sent them,
++        // not because the mock happened to tolerate it.
++        let device_task = spawn_device_for_preserve_boot_state(device, false, "FW: [priming] done");
++        let mut link = FrozenLink::wrap(client, "test");
++        let capture: crate::io_logging::RawIoCapture = Arc::new(Mutex::new(Vec::new()));
++
++        let a = preserve_boot_state_args(false);
++        let (report, code) = run_preserve_boot_state_core(&a, &mut link, false, &capture).await;
++
++        assert!(!report.i2c_bus_open);
++        let pbs = report.preserve_boot_state_results.expect("preserve_boot_state_results must be set");
++        assert_eq!(pbs.i2c_writes_performed, 0);
++        assert_eq!(pbs.prime_outcome, PrimeOutcome::NotSent);
++        assert!(!pbs.pumps_commanded);
++        assert!(!report.overall_pass);
++        assert_eq!(report.prime_command_count, 0, "Prime must never be sent when Frozen is not already in application firmware");
++        assert_eq!(report.safety_off_commands_sent, 0, "no disable commands should be sent before the firmware-mode check passes");
++        assert_eq!(report.frozen_firmware_ping, Some(false));
++        assert!(
++            !report.outgoing_commands.iter().any(|c| c.command_name == "JumpToFirmware"),
++            "--preserve-boot-state must never attempt a bootloader -> firmware jump"
++        );
++        assert_eq!(report.stop_reason, StopReason::PreflightRefused.to_string());
++        assert_eq!(code, 30);
++
++        drop(link);
++        device_task.abort();
++    }
++
++    #[tokio::test]
++    async fn preserve_boot_state_ignores_duration_seconds_bounds_and_still_touches_no_i2c() {
++        // --duration-seconds 999 would be refused outright ("exceeds hard maximum") in the normal,
++        // resettable mode (see refuses_when_duration_exceeds_hard_maximum above). Forcing a
++        // different, identifiable refusal further down the preflight chain (a missing confirm
++        // flag) proves the duration check never ran for --preserve-boot-state: if it had, this
++        // would instead fail with a duration-related reason, not a confirmation-flag one.
++        let mut a = preserve_boot_state_args(false);
++        a.duration_seconds = 999;
++        a.confirm_no_visible_leaks = false;
++        let (report, code) = run(&a).await;
++
++        assert_eq!(code, 30);
++        assert_eq!(report.stop_reason, "missing required confirmation flags");
++        assert!(!report.i2c_bus_open);
++        let pbs = report.preserve_boot_state_results.expect("preserve_boot_state_results must be set");
++        assert_eq!(pbs.i2c_writes_performed, 0);
++    }
 +}
 diff --git a/src/bin/opensleep-diagnostic/report.rs b/src/bin/opensleep-diagnostic/report.rs
 new file mode 100644
-index 0000000..0fa85a0
+index 0000000..730bc2c
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/report.rs
-@@ -0,0 +1,442 @@
+@@ -0,0 +1,503 @@
 +//! Structured JSON/CSV/text reporting shared by all three subcommands. Machine evidence (audit
 +//! log, decoded telemetry) is always kept in separate fields from operator-entered observations,
 +//! per the safety model: a component may only be marked PASS from decoded evidence or an explicit
@@ -5580,6 +6156,52 @@ index 0000000..0fa85a0
 +    pub overall_result: Verdict,
 +}
 +
++/// Outcome of the single `Prime` send in `frozen-prime-test --preserve-boot-state`. Distinct from
++/// `PrimeResults` (which drives the normal mode's multi-factor PASS/FAIL/INCONCLUSIVE verdict):
++/// this is a plain report of what was directly observed, since `--preserve-boot-state` has no
++/// subsystem reset to fall back on and must state exactly what happened.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
++#[serde(rename_all = "snake_case")]
++pub enum PrimeOutcome {
++    /// Preflight refused before Prime was ever sent (e.g. Frozen was not already in application
++    /// firmware), or the UART write itself failed.
++    #[default]
++    NotSent,
++    /// The exact message `"FW: [priming] done"` was observed.
++    Success,
++    /// The exact message `"FW: [priming] done because empty"` was observed: the firmware's own
++    /// account that it stopped because the reservoir ran dry. Not success.
++    IncompleteReservoirEmpty,
++    /// Prime was sent but neither completion message was observed within the fixed observation
++    /// window (or a stop signal interrupted observation first).
++    NotObservedWithinWindow,
++}
++
++impl std::fmt::Display for PrimeOutcome {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        let s = match self {
++            PrimeOutcome::NotSent => "not sent",
++            PrimeOutcome::Success => "success",
++            PrimeOutcome::IncompleteReservoirEmpty => "incomplete (done because empty)",
++            PrimeOutcome::NotObservedWithinWindow => "not observed within window",
++        };
++        write!(f, "{s}")
++    }
++}
++
++/// `frozen-prime-test --preserve-boot-state`'s report, kept separate from `PrimeResults` (see
++/// `PrimeOutcome`'s doc comment). `i2c_writes_performed` is always `0` here: this mode never opens
++/// or writes `/dev/i2c-1` at all, so there is structurally nothing to count -- the field exists so
++/// the report states that fact explicitly rather than by omission.
++#[derive(Debug, Clone, Serialize, Default)]
++pub struct PreserveBootStateResults {
++    pub i2c_writes_performed: u32,
++    pub prime_outcome: PrimeOutcome,
++    pub pumps_commanded: bool,
++    pub normal_done_observed: bool,
++    pub done_because_empty_observed: bool,
++}
++
 +/// One decoded firmware pump message (`FW: pump[<side>] ... @ <V>V <A>A`), kept separate from
 +/// `telemetry_samples` since it is not a temperature reading.
 +#[derive(Debug, Clone, Serialize)]
@@ -5733,6 +6355,12 @@ index 0000000..0fa85a0
 +    /// `frozen-prime-test`'s own result line -- always `None` outside that mode, exactly as
 +    /// `component_results` is always `None` inside it.
 +    pub prime_results: Option<PrimeResults>,
++    /// Whether `--preserve-boot-state` was requested. `false` in every other mode and every other
++    /// `frozen-prime-test` run.
++    pub preserve_boot_state: bool,
++    /// Set only for a `frozen-prime-test --preserve-boot-state` run -- always `None` otherwise,
++    /// exactly as `prime_results` is always `None` inside it.
++    pub preserve_boot_state_results: Option<PreserveBootStateResults>,
 +    pub overall_pass: bool,
 +    pub exit_code: u8,
 +}
@@ -5815,6 +6443,15 @@ index 0000000..0fa85a0
 +            log::info!("  Prime completion observed:       {}", pr.prime_completion_observed);
 +            log::info!("  Safe-stop and reset:             {}", pr.safe_stop_and_reset);
 +            log::info!("  Overall result:                  {}", pr.overall_result);
++        }
++        log::info!("preserve_boot_state: {}", self.preserve_boot_state);
++        if let Some(pbs) = &self.preserve_boot_state_results {
++            log::info!("-- preserve-boot-state results --");
++            log::info!("  I2C writes performed:        {}", pbs.i2c_writes_performed);
++            log::info!("  Prime outcome:               {}", pbs.prime_outcome);
++            log::info!("  Pumps commanded:             {}", pbs.pumps_commanded);
++            log::info!("  Normal done observed:        {}", pbs.normal_done_observed);
++            log::info!("  Done because empty observed: {}", pbs.done_because_empty_observed);
 +        }
 +        log::info!("stop reason: {}", self.stop_reason);
 +        if let Some(ss) = &self.safe_stop {

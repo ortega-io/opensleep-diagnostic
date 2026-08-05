@@ -1,11 +1,26 @@
 # TEST_RESULTS.md — opensleep-diagnostic
 
-All 129 unit/integration tests in `src/bin/opensleep-diagnostic/` pass, plus the 51 pre-existing
-`opensleep` library tests (unmodified, reused as-is) and 0 doc-tests — 180 total, 0 failed. This
+All 134 unit/integration tests in `src/bin/opensleep-diagnostic/` pass, plus the 51 pre-existing
+`opensleep` library tests (unmodified, reused as-is) and 0 doc-tests — 185 total, 0 failed. This
 was verified twice: once on the host development machine (native target), and again inside the
 `messense/rust-musl-cross:aarch64-musl` builder image via `cargo test --locked` under its
 built-in QEMU aarch64 runner (the same environment the release binary is built in) — see
 `build-report.txt`.
+
+## Revision note: `--preserve-boot-state` added to `frozen-prime-test`
+
+This revision adds `--preserve-boot-state` to `frozen-prime-test`: an alternate active-test path
+that never opens, probes, or writes `/dev/i2c-1` at all (no reset-expander probe, no subsystem
+reset, no bootloader → firmware jump), requires Frozen to already be running application firmware,
+uses a fixed 600-second observation window independent of `--duration-seconds`, and on every exit
+path only disables both temperature targets over UART and closes the UART rather than asserting
+the `0x20` subsystem reset. See SAFETY.md for the full safety-model writeup. 5 new tests were added
+to `prime_test.rs` (129 → 134 in this file's directory): a source-level guardrail proving the
+`--preserve-boot-state` code path never references any I2C type or function, a successful-run test
+proving zero I2C writes end-to-end, a `"done because empty"` test proving it is reported as
+incomplete (not success) with zero I2C writes, a bootloader-stuck-abort test proving neither
+`Prime` nor `JumpToFirmware` is ever sent with zero I2C writes, and a test proving
+`--duration-seconds` bounds are skipped for this mode while it still touches no I2C.
 
 ## Revision note: `frozen-prime-test` added
 
