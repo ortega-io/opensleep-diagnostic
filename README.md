@@ -4,9 +4,10 @@ A staged, **Frozen-only** hardware diagnostic for an Eight Sleep Pod 3 Hub (MT83
 as a diagnostic-only fork of [OpenSleep](https://github.com/LiamSnow/opensleep) (base version
 2.0.0, pinned source commit `29ea3f8f51d208a02b5d2691720157c7ce96c292`).
 
-This is **not** normal OpenSleep. It never runs the MQTT client, the profile/temperature
-scheduler, Sensor management, or LED management, and it never installs a service — every
-subcommand is a single, bounded, foreground run.
+This is **not** normal OpenSleep. Four of its five subcommands never run the MQTT client, the
+profile/temperature scheduler, Sensor management, or LED management, and none installs a service —
+every subcommand is a single, bounded, foreground run. The fifth, `frozen-prime-opensleep-init`, is
+the one deliberate exception: see SAFETY.md for exactly what that means.
 
 ## Subcommands
 
@@ -14,7 +15,8 @@ subcommand is a single, bounded, foreground run.
 |---|---|---|
 | `frozen-passive` | Read-only-effect Frozen probe: ping, hardware info, telemetry. Safe with the cover disconnected and no water. | No |
 | `frozen-cool-test` | Intentionally activates one cooling channel for a bounded window (default 10s, max 30s). Requires a filled, connected hydraulic loop and multiple explicit confirmations. | Yes — one cooling channel |
-| `frozen-prime-test` | Intentionally sends `Prime` exactly once, to fill an empty or partially-filled hydraulic loop. Requires a connected cover and multiple explicit confirmations. `Prime` is reachable in no other mode. | Yes — pumps/priming sequence |
+| `frozen-prime-test` | Intentionally sends `Prime` exactly once, to fill an empty or partially-filled hydraulic loop, via this binary's own reimplemented reset/transport. Requires a connected cover and multiple explicit confirmations. | Yes — pumps/priming sequence |
+| `frozen-prime-opensleep-init` | The same Prime-once operation, but through the real, unmodified upstream OpenSleep initialization and Frozen manager code instead of a reimplemented transport. Requires the same confirmations. | Yes — pumps/priming sequence |
 | `emergency-stop` | Independent fast path: best-effort-disables both sides, then unconditionally asserts the Frozen subsystem reset (I2C `0x20`). Works even if Frozen itself is unresponsive. | Disables only |
 
 Every subcommand accepts `--dry-run`, which performs no I2C or UART writes and instead runs the
@@ -58,8 +60,12 @@ toolchain versions, test counts, and artifact checksums.
 
 ## What this binary never does, on any path
 
-Never loads the normal config file, never connects to MQTT, never runs the Home Assistant
-integration, never opens the Sensor subsystem, never writes to the LED controller, never
-transmits `Random`, and never transmits `Prime` outside `frozen-prime-test`. These are enforced
-structurally (a closed command type plus a runtime whitelist, not just convention) and verified by
+No subcommand ever loads the operator's saved `config.ron`, runs the Home Assistant integration, or
+transmits `Random`; `Prime` is never transmitted outside `frozen-prime-test`/
+`frozen-prime-opensleep-init`. Four of the five subcommands additionally never connect to MQTT,
+never open the Sensor subsystem, and never write to the LED controller beyond a nonfatal probe --
+`frozen-prime-opensleep-init` is the one deliberate exception, since it runs the real, unmodified
+upstream initialization and Frozen manager code (see SAFETY.md for the full writeup on how that
+mode's guarantees differ). These are enforced structurally (a closed command type plus a runtime
+whitelist for the four audited modes, source-level guardrails for the fifth) and verified by
 source-scanning guardrail tests — see SAFETY.md and PROTOCOL_AUDIT.md for the full account.

@@ -1,50 +1,79 @@
 opensleep-diagnostic — build report
 ====================================
 
-Patch revision: 6 (adds --preserve-boot-state to frozen-prime-test)
-Supersedes revision 5 (added frozen-prime-test), revision 4 (corrected active-test
+Patch revision: 7 (replaces --preserve-boot-state with frozen-prime-opensleep-init)
+Supersedes revision 6 (added --preserve-boot-state to frozen-prime-test, now removed -- see
+below), revision 5 (added frozen-prime-test), revision 4 (corrected active-test
 preflight/monitoring), revision 3 (staged, Frozen-only diagnostic redesign), revision 2
 (sensor-first post-reset bootloader retry-probe), and revision 1 (initial diagnostic-only fork).
 Same upstream base commit; only source.patch changed.
 
+NOTE: the "Test results"/"Artifact validation" sections below describe revision 6's build (the
+last one actually run through build.sh); they have not yet been refreshed for revision 7. Re-run
+build.sh and update those two sections before cutting a revision-7 release.
+
+What changed in revision 7
+---------------------------
+Removed `--preserve-boot-state` (added in revision 6) and replaced it with a new subcommand,
+`frozen-prime-opensleep-init`. Real hardware evidence showed `--preserve-boot-state`'s approach --
+skip I2C entirely to avoid resetting the subsystem -- was the wrong fix: it left Frozen in a state
+where the reservoir-level (`capwater`) sensor was not reliably operational. Skipping I2C access
+was never actually the goal; a full, *correct* initialization was.
+
+`frozen-prime-opensleep-init` performs the same Prime-once operation through the real, unmodified
+upstream OpenSleep initialization and Frozen manager code --
+`opensleep::reset::ResetController::reset_subsystems`, the real LED controller, a real (never
+network-connected) `MqttManager`, a best-effort real Sensor subsystem task, and -- doing all of the
+actual work -- the real `opensleep::frozen::run` manager -- instead of either this binary's own
+reimplemented reset/transport (`frozen-prime-test`) or a custom partial reset
+(`--preserve-boot-state`). See `src/bin/opensleep-diagnostic/prime_opensleep_init.rs`'s module
+docs and SAFETY.md for the full design rationale.
+
+  - `Prime` is triggered without any command channel (none exists in the pinned upstream source):
+    this mode constructs an in-memory configuration with `prime` set to "now", which the real
+    Frozen scheduler's own internal debounce/matching-window logic (unmodified) then fires at most
+    once on its own, the same as it would for a real end user's scheduled priming time.
+    `away_mode` is deliberately left `false` (setting it `true` would also block the Prime
+    schedule, not just the temperature schedule); temperature targets are kept disabled instead via
+    an empty temperature profile, which the real scheduler already treats as "always disabled".
+  - Since the real, unmodified code has no observer hook of its own, a new `log_tap` module taps
+    the one global logger this binary already installs to observe the exact log lines that code
+    emits (`"Message: FW: [capwater] sensor unavailable"`, `"Priming Message: done"` /
+    `"...done because empty"`, etc.) without modifying that code at all.
+  - If firmware reports `[capwater] sensor unavailable` as a result of this run's own
+    initialization, `Prime` is never sent, and the initialization sequence/subsystem state that
+    produced it is printed.
+  - The observation window is fixed at the firmware-reported priming duration (600000 ms).
+  - On normal completion or "done because empty", this mode does *not* assert the I2C subsystem
+    reset -- Frozen's own firmware returns to idle on its own, and forcing a reset right after using
+    the real initialization path would be needlessly disruptive to a subsystem this mode is
+    specifically trying to leave in its normal, running state. The one exception is a genuine
+    firmware-reported pump fault, which does assert an emergency reset via this diagnostic's own
+    already-audited `assert_reset` primitive (not upstream's reset sequence).
+  - Shutdown reuses the exact mechanism real `main.rs`'s own top-level `tokio::select!` already
+    uses: the real `frozen::run`/`sensor::run` futures turned out not to be `Send` (both hold a
+    `tokio::sync::watch::Ref` internally), so they are polled directly via `tokio::select!` in the
+    same task rather than `tokio::spawn`-ed, and are simply dropped (cancelled) when the function
+    returns -- there is no `.abort()` anywhere in this file.
+  - `main.rs`'s `guardrail_tests` were rewritten: four tests that previously asserted Sensor/MQTT/
+    the LED driver/the real Frozen manager are never referenced anywhere now assert they are
+    referenced *only* by `prime_opensleep_init.rs` -- and that even that file never references the
+    real config-file loader or `rumqttc` directly.
+  - 12 net new tests (5 removed with `--preserve-boot-state`, 17 added): 7 in
+    `prime_opensleep_init.rs`, 4 in the new `log_tap.rs`, and 1 in the new `confirm.rs` (the
+    interactive-phrase helper extracted out of `prime_test.rs` so both Prime-sending modes share
+    one implementation). Because the real upstream code hardcodes real serial ports/I2C devices
+    with no mock transport to substitute, this mode's happy-path behavior cannot be exercised by an
+    automated mock-based test the way this binary's other subcommands are -- see TEST_RESULTS.md
+    for what was and wasn't verified this way.
+
 What changed in revision 6
 ---------------------------
-Added `--preserve-boot-state` to `frozen-prime-test`: an alternate active-test path that never
-opens, probes, or writes `/dev/i2c-1` at all -- no reset-expander probe, no subsystem reset
-sequence, and no bootloader -> firmware jump, on any exit path including Ctrl+C. This is a
-structural guarantee, not just a runtime check: the function implementing this path
-(`run_preserve_boot_state`/`run_preserve_boot_state_core` in `prime_test.rs`) takes no I2C
-parameter of any kind, so there is nothing in scope to write with even if a future edit tried.
-
-  - Frozen must already be running application firmware (`Ping` must get `Pong(true)`) before this
-    mode sends anything else. If it is not, the tool refuses to start and tells the operator to
-    reboot the Hub -- it never resets or jumps bootloader -> firmware in this mode.
-  - Both temperature targets are disabled through UART, `Prime` is sent exactly once (the existing
-    `AuditedTransport` at-most-once enforcement applies unchanged), and priming state is observed
-    for up to a new fixed 600-second window -- independent of `--duration-seconds`, which this mode
-    ignores entirely.
-  - The exact firmware message `"FW: [priming] done"` is treated as success; the exact message
-    `"FW: [priming] done because empty"` is treated as incomplete, never success. Both are matched
-    by exact string equality after stripping the shared `"FW: [priming] "` prefix (the same
-    `priming_stage_text` helper the normal path already used), so the two can never be confused by
-    a substring match.
-  - On every exit path (normal completion, "done because empty", the window elapsing, or a stop
-    signal) this mode only disables both temperature targets over UART and closes the UART -- it
-    never asserts the `0x20` subsystem reset. The operator is told to reboot the Hub or disconnect
-    Hub power themselves if priming does not stop.
-  - New report fields (`preserve_boot_state`, and a `preserve_boot_state_results` block with
-    `i2c_writes_performed`, `prime_outcome`, `pumps_commanded`, `normal_done_observed`,
-    `done_because_empty_observed`) report this mode's outcome independently of the normal
-    `prime_results` block, which stays `None` in this mode exactly as `preserve_boot_state_results`
-    stays `None` outside it.
-  - 5 new tests were added to `prime_test.rs`: a source-level guardrail scanning the
-    `--preserve-boot-state` code for any reference to an I2C type or function, a successful-run
-    test proving zero I2C writes end-to-end, a "done because empty" test proving it is reported as
-    incomplete (not success) with zero I2C writes, a bootloader-stuck-abort test proving neither
-    `Prime` nor `JumpToFirmware` is ever sent with zero I2C writes, and a test proving
-    `--duration-seconds` bounds are skipped for this mode while it still touches no I2C. See
-    SAFETY.md for the full operator-facing safety-model writeup (this mode has no I2C-side backstop
-    to fall back on, unlike every other path).
+Added `--preserve-boot-state` to `frozen-prime-test` (REMOVED in revision 7 above -- kept here only
+as history): an alternate active-test path that never opened, probed, or wrote `/dev/i2c-1` at all.
+Real hardware evidence subsequently showed this left the `capwater` reservoir sensor unreliable, so
+it was replaced rather than kept as an option -- see "What changed in revision 7" above for why and
+with what.
 
 What changed in revision 5
 ---------------------------

@@ -1,26 +1,64 @@
 # TEST_RESULTS.md — opensleep-diagnostic
 
-All 134 unit/integration tests in `src/bin/opensleep-diagnostic/` pass, plus the 51 pre-existing
-`opensleep` library tests (unmodified, reused as-is) and 0 doc-tests — 185 total, 0 failed. This
-was verified twice: once on the host development machine (native target), and again inside the
-`messense/rust-musl-cross:aarch64-musl` builder image via `cargo test --locked` under its
-built-in QEMU aarch64 runner (the same environment the release binary is built in) — see
-`build-report.txt`.
+All 141 unit/integration tests in `src/bin/opensleep-diagnostic/` pass, plus the 51 pre-existing
+`opensleep` library tests (unmodified, reused as-is) and 0 doc-tests — 192 total, 0 failed. This
+was verified on the host development machine (native target); see `build-report.txt` for the most
+recent verification inside the `messense/rust-musl-cross:aarch64-musl` builder image via
+`cargo test --locked` under its built-in QEMU aarch64 runner (the same environment the release
+binary is built in).
 
-## Revision note: `--preserve-boot-state` added to `frozen-prime-test`
+## Revision note: `--preserve-boot-state` replaced with `frozen-prime-opensleep-init`
 
-This revision adds `--preserve-boot-state` to `frozen-prime-test`: an alternate active-test path
-that never opens, probes, or writes `/dev/i2c-1` at all (no reset-expander probe, no subsystem
-reset, no bootloader → firmware jump), requires Frozen to already be running application firmware,
-uses a fixed 600-second observation window independent of `--duration-seconds`, and on every exit
-path only disables both temperature targets over UART and closes the UART rather than asserting
-the `0x20` subsystem reset. See SAFETY.md for the full safety-model writeup. 5 new tests were added
-to `prime_test.rs` (129 → 134 in this file's directory): a source-level guardrail proving the
-`--preserve-boot-state` code path never references any I2C type or function, a successful-run test
-proving zero I2C writes end-to-end, a `"done because empty"` test proving it is reported as
-incomplete (not success) with zero I2C writes, a bootloader-stuck-abort test proving neither
-`Prime` nor `JumpToFirmware` is ever sent with zero I2C writes, and a test proving
-`--duration-seconds` bounds are skipped for this mode while it still touches no I2C.
+The previous revision's `--preserve-boot-state` flag on `frozen-prime-test` (which skipped I2C
+entirely to avoid resetting the subsystem) has been **removed**. Real hardware evidence showed that
+approach was the wrong fix: skipping the reset didn't just avoid touching I2C, it left Frozen in a
+state where the reservoir-level (`capwater`) sensor was not reliably operational -- a regression
+this project does not want to ship, regardless of the I2C-avoidance goal that motivated it.
+
+In its place, this revision adds a new subcommand, `frozen-prime-opensleep-init`, which performs
+the same Prime-once operation through the **real, unmodified upstream OpenSleep initialization and
+Frozen manager code** (`opensleep::reset::ResetController::reset_subsystems`, `opensleep::mqtt::MqttManager`,
+`opensleep::sensor::run`, `opensleep::frozen::run`) instead of either this binary's own
+reimplemented reset/transport (`frozen-prime-test`) or a custom partial reset
+(`--preserve-boot-state`). It never touches `safety::AuditedTransport` at all: it steers the real
+upstream Frozen scheduler into sending exactly one `Prime` by constructing an in-memory
+configuration (`prime` set to "now", temperature profiles empty so targets stay disabled), observes
+the real log output that code produces (via a new `log_tap` module -- see its own docs) to detect
+`[capwater]`/`[flowrate]` sensor-unavailable messages and the exact `"done"`/`"done because empty"`
+distinction, refuses to send Prime at all if capwater is unavailable as a result of its own
+initialization, and never asserts the I2C subsystem reset on normal completion or "done because
+empty" (only a genuine firmware-reported pump fault does, via this diagnostic's own already-audited
+`assert_reset` primitive). See SAFETY.md and `prime_opensleep_init.rs`'s module docs for the full
+design rationale and safety-model writeup.
+
+12 new tests were added (129 → 141 in this file's directory, after removing the 5
+`--preserve-boot-state` tests and adding 17 new ones): 7 in `prime_opensleep_init.rs` (preflight
+refusals, dry-run behavior, the narrow pump-fault matcher, and the in-memory `Config` construction
+-- `away_mode` stays `false` and temperature targets are disabled via an empty profile instead,
+since `away_mode = true` would also block the Prime schedule), 4 in the new `log_tap.rs` (capture/
+checkpoint/exact-match behavior, including that `"done"` and `"done because empty"` are never
+confused), and 1 in the new `confirm.rs` (the interactive-phrase helper extracted out of
+`prime_test.rs` so both Prime-sending modes share one implementation). `main.rs`'s `guardrail_tests`
+were also rewritten: four tests that previously asserted Sensor/MQTT/the LED driver/the real Frozen
+manager are *never* referenced anywhere now assert they are referenced *only* by
+`prime_opensleep_init.rs` -- and that even that file never references the real config-file loader
+or `rumqttc` directly, since it still builds its own in-memory configuration.
+
+The real `opensleep::frozen::run`/`opensleep::sensor::run` futures turned out not to be `Send`
+(both hold a `tokio::sync::watch::Ref` internally), so unlike this binary's other mocked/spawned
+tasks, they cannot be `tokio::spawn`-ed -- `prime_opensleep_init.rs` polls them directly via
+`tokio::select!` in the same task, exactly the way real `main.rs`'s own top-level `select!` already
+does, which is also what makes shutdown "the normal OpenSleep manager path": there is no
+`.abort()` anywhere in that file, the real tasks are simply dropped (cancelled) when the function
+returns.
+
+Because the real, unmodified upstream code hardcodes real serial ports and I2C devices with no
+mock transport to substitute, `frozen-prime-opensleep-init` cannot be exercised against a mock the
+way this binary's other `--dry-run` modes are; its own `--dry-run` only validates confirmations/
+arguments and skips real initialization entirely. Its happy-path behavior (successful Prime send,
+`"done because empty"`, capwater-abort) was verified by hand against real hardware evidence rather
+than by an automated mock-based test -- see the module docs for why no such mock exists for this
+mode specifically.
 
 ## Revision note: `frozen-prime-test` added
 

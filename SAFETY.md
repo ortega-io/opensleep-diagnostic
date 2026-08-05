@@ -1,15 +1,16 @@
 # SAFETY.md — opensleep-diagnostic
 
 `opensleep-diagnostic` is a staged, **Frozen-only** hardware diagnostic for an Eight Sleep Pod 3
-Hub. It is not a fork of normal `opensleep` and does not run its control loops, timers, MQTT
-client, profile scheduler, or Sensor/LED management. It never installs a systemd service and never
-runs unattended — every invocation is a single foreground command that starts, does its work, and
-exits.
+Hub. Four of its five subcommands are not a fork of normal `opensleep` and do not run its control
+loops, timers, MQTT client, profile scheduler, or Sensor/LED management. The fifth,
+`frozen-prime-opensleep-init`, is the one deliberate exception — see its own section below for
+exactly what that means and why. None of the five installs a systemd service or runs unattended —
+every invocation is a single foreground command that starts, does its work, and exits.
 
-**Read this whole document before running `frozen-cool-test` or `frozen-prime-test` on real
-hardware.**
+**Read this whole document before running `frozen-cool-test`, `frozen-prime-test`, or
+`frozen-prime-opensleep-init` on real hardware.**
 
-## The three safety tiers
+## The safety tiers
 
 ### `frozen-passive` — safe with the cover disconnected and no water
 
@@ -46,32 +47,56 @@ topped up with water ready to be drawn in, and the same explicit-confirmation di
   been observed unavailable) — this tool cannot detect an empty reservoir on your behalf. See
   "Automatic abort conditions during `frozen-prime-test`" below.
 * There is no Prime-cancellation command anywhere in the reused protocol (see PROTOCOL_AUDIT.md).
-  Subsystem reset (I2C `0x20`) is the only forced-stop mechanism, exactly as for every other mode
-  — **unless `--preserve-boot-state` is given; see below.**
+  Subsystem reset (I2C `0x20`) is the only forced-stop mechanism, exactly as for every other mode.
 
-#### `--preserve-boot-state`: a different safety model, not a relaxed one
+### `frozen-prime-opensleep-init` — the same operation, through real OpenSleep initialization
 
-`--preserve-boot-state` never opens, probes, or writes `/dev/i2c-1` — no reset-expander probe, no
-subsystem reset sequence, and no `0x20` write of any kind, on any exit path including Ctrl+C. This
-means the usual forced-stop backstop (subsystem reset) **does not exist** in this mode:
+`frozen-prime-opensleep-init` sends `Prime` exactly once, just like `frozen-prime-test` — but
+instead of this binary's own reimplemented I2C reset sequence and Frozen UART transport, it calls
+the real, unmodified upstream `opensleep::reset::ResetController::reset_subsystems`,
+`opensleep::led`, `opensleep::mqtt::MqttManager`, `opensleep::sensor::run`, and
+`opensleep::frozen::run`. See `src/bin/opensleep-diagnostic/prime_opensleep_init.rs`'s module docs
+for the full design rationale (real hardware evidence showed a reimplemented, partial
+initialization path can leave the reservoir-level (`capwater`) sensor in a different state than a
+full, real OpenSleep boot does — this mode exists to remove that gap).
 
+**This is a different safety model, not a relaxed one:**
+
+* This is the *only* subcommand in this binary that runs the real Frozen manager, the real MQTT
+  client construction, the real Sensor subsystem, and the real LED controller. It still never loads
+  the operator's own saved configuration file (it builds its own in-memory configuration with
+  temperature profiles disabled and MQTT never actually connected — see the module docs) and never
+  runs a scheduler, alarms, or long-running daemon behavior: it is still a single foreground
+  command that starts, primes once, and exits.
 * Frozen must already be running application firmware (`Ping` must get `Pong(true)`) before this
-  mode will send anything else. If it is not, the tool refuses to start and tells you to reboot
-  the Hub — it will never attempt a bootloader → firmware jump or a reset in this mode.
-* On exit (normal completion, `"done because empty"`, the fixed observation window elapsing, or
-  Ctrl+C/SIGTERM/SIGHUP) this mode only disables both temperature targets over UART and closes the
-  UART. **If priming does not visibly stop, you must reboot the Hub or disconnect Hub power
-  yourself** — there is no I2C-side backstop to fall back on.
-* The observation window is fixed at up to 600 seconds and does not honor `--duration-seconds`
-  (which governs the normal, resettable path's much shorter 5–60 second window).
-* Everything else about `frozen-prime-test` above still applies: the same five `--confirm-*`
-  flags, the same two typed confirmation phrases, `Prime` sent at most once, and the same
-  exact-match distinction between `"[priming] done"` (success) and `"[priming] done because
-  empty"` (incomplete, not success).
+  mode sends anything else. If it is not, the tool refuses to start and tells you to reboot the Hub
+  — it never attempts a bootloader → firmware jump.
+* **If firmware reports `[capwater] sensor unavailable` as a result of this run's own
+  initialization, `Prime` is never sent.** The tool prints the initialization sequence and
+  subsystem state that produced this so you can diagnose it, and refuses to proceed.
+* The observation window is fixed at the firmware-reported priming duration (600000 ms) and is not
+  configurable.
+* On exit — normal completion, `"done because empty"`, the window elapsing, or a stop signal — this
+  mode does **not** assert the I2C subsystem reset. Frozen's own firmware returns to idle on its
+  own after priming ends; forcing a reset immediately afterward would be needlessly disruptive to a
+  subsystem this mode is specifically trying to leave in its normal, running state. Shutdown happens
+  by simply no longer polling the real Frozen/Sensor tasks (the same drop-based cancellation real
+  `opensleep`'s own top-level `tokio::select!` already uses), not by resetting anything.
+* The one exception: a genuine firmware-reported pump fault observed during the run **does** assert
+  an emergency I2C reset, using this diagnostic's own already-audited `assert_reset` primitive (not
+  a reimplementation of upstream's reset sequence).
+* Temperature targets are never enabled during this run (the constructed configuration has an empty
+  temperature profile, which the real scheduler always treats as disabled, regardless of time of
+  day) — there is nothing to actively disable at shutdown.
+* Everything else about `frozen-prime-test` above still applies: the same five `--confirm-*` flags,
+  the same two typed confirmation phrases, `Prime` sent at most once, and the same exact-match
+  distinction between `"[priming] done"` (success) and `"[priming] done because empty"`
+  (incomplete, not success).
 
-Use this only when you specifically need the Hub's boot/subsystem state left untouched (e.g.
-Frozen is already known-good and mid-session) and you are prepared to physically power-cycle the
-Hub yourself if priming needs to be stopped and disabling the targets doesn't stop it.
+Use this mode when you specifically want the fill/priming operation verified against real OpenSleep
+behavior rather than this binary's own reimplemented transport — e.g. after `frozen-prime-test`
+reports `[capwater]`/`[flowrate]` unavailable and you want to rule out that reimplementation as the
+cause.
 
 ## Hazards specific to this hardware
 
@@ -80,12 +105,17 @@ Hub yourself if priming needs to be stopped and disabling the targets doesn't st
   open board while an active test is running.**
 * Keep a way to physically disconnect Hub power available at all times during an active test —
   don't rely on software alone.
-* **`Prime` is reachable in exactly one mode: `frozen-prime-test`.** It cannot be constructed,
-  whitelisted, or transmitted from `frozen-passive`, `frozen-cool-test`, or `emergency-stop`, under
-  any flag combination — see PROTOCOL_AUDIT.md for the structural proof (a closed `FrozenAction`
-  enum gated by the runtime whitelist, plus an opcode backstop). Within `frozen-prime-test` itself,
-  `Prime` can be sent at most once per invocation; a second attempt is refused at the transport
-  layer, not merely avoided by this binary's own control flow.
+* **This binary's own audited command whitelist (`safety::AuditedTransport`) permits `Prime` in
+  exactly one mode: `frozen-prime-test`.** It cannot be constructed, whitelisted, or transmitted
+  from `frozen-passive`, `frozen-cool-test`, or `emergency-stop`, under any flag combination — see
+  PROTOCOL_AUDIT.md for the structural proof (a closed `FrozenAction` enum gated by the runtime
+  whitelist, plus an opcode backstop). Within `frozen-prime-test` itself, `Prime` can be sent at
+  most once per invocation; a second attempt is refused at the transport layer, not merely avoided
+  by this binary's own control flow. `frozen-prime-opensleep-init` reaches `Prime` through a
+  structurally separate path that never touches `AuditedTransport` at all: it steers the real
+  upstream Frozen scheduler (by constructing an in-memory configuration) into sending its own,
+  real `FrozenCommand::Prime` -- this binary never constructs or transmits that command itself in
+  that mode. See its own section above and `prime_opensleep_init.rs`'s module docs.
 * `Random` is never reachable in any mode: this binary's own command type cannot represent it.
 * Test **only one side per invocation** in `frozen-cool-test`. `frozen-cool-test --side left` can
   never also enable `right` in the same run — see "Command whitelist" below. `Prime` itself has no
@@ -94,11 +124,14 @@ Hub yourself if priming needs to be stopped and disabling the targets doesn't st
   session) if you observe a leak, a burning smell, abnormal noise, or anything that feels
   excessively hot.
 
-## Command whitelist — the complete list of commands this binary can ever transmit
+## Command whitelist — the complete list of commands this binary's audited transport can ever send
 
-Every outgoing Frozen command passes through `safety::AuditedTransport::check`, which enforces a
-fixed per-mode whitelist (see `src/bin/opensleep-diagnostic/safety.rs`). The full command,
-opcode, and evidence table is in `PROTOCOL_AUDIT.md`; in summary:
+Every outgoing Frozen command sent by `frozen-passive`, `frozen-cool-test`, `frozen-prime-test`,
+and `emergency-stop` passes through `safety::AuditedTransport::check`, which enforces a fixed
+per-mode whitelist (see `src/bin/opensleep-diagnostic/safety.rs`). `frozen-prime-opensleep-init` is
+the one exception -- it never uses `AuditedTransport` at all; see its own section above for what
+governs it instead. The full command, opcode, and evidence table for the audited modes is in
+`PROTOCOL_AUDIT.md`; in summary:
 
 | Mode | Permitted commands |
 |---|---|
@@ -107,12 +140,14 @@ opcode, and evidence table is in `PROTOCOL_AUDIT.md`; in summary:
 | `frozen-prime-test` | everything `frozen-passive` permits, **plus** `Prime`, at most once per run |
 | `emergency-stop` | `SetTargetTemperature(enabled=false)` for LEFT and RIGHT, and the `0x20` reset-assert write only |
 
-**Never reachable, in any mode:** `Random(_)`, any raw/undocumented opcode, an absolute
-(non-derived) temperature target, or a simultaneously-enabled left+right target.
-**`Prime` (`0x52`)** is reachable in exactly one mode (`frozen-prime-test`, at most once per run) —
-never in `frozen-passive`, `frozen-cool-test`, or `emergency-stop`. This is enforced structurally
-in two independent layers (a closed `FrozenAction` enum, plus the runtime whitelist gate with its
-own at-most-once check for `Prime`), not by convention — see `safety::tests` and
+**Never reachable through `AuditedTransport`, in any of the four audited modes:** `Random(_)`, any
+raw/undocumented opcode, an absolute (non-derived) temperature target, or a simultaneously-enabled
+left+right target.
+**`Prime` (`0x52`)** is reachable through `AuditedTransport` in exactly one mode
+(`frozen-prime-test`, at most once per run) — never in `frozen-passive`, `frozen-cool-test`, or
+`emergency-stop`. This is enforced structurally in two independent layers (a closed `FrozenAction`
+enum, plus the runtime whitelist gate with its own at-most-once check for `Prime`), not by
+convention — see `safety::tests` and
 PROTOCOL_AUDIT.md.
 
 ## Active-test limits (hard-coded; no CLI flag can override them)
@@ -141,8 +176,8 @@ PROTOCOL_AUDIT.md.
 * If firmware reports priming complete (`"FW: [priming] done"` or `"...done because empty"`)
   before the configured duration elapses, the test stops early and runs safe-stop immediately —
   it never waits out the rest of the window once completion is observed.
-* `--preserve-boot-state` replaces this whole limits list with its own fixed, non-overridable
-  600-second observation window — see the `--preserve-boot-state` section above.
+* `frozen-prime-opensleep-init` replaces this whole limits list with its own fixed, non-overridable
+  600000 ms (firmware-reported) observation window — see its own section above.
 * The operator may run another separate priming cycle after inspecting and refilling the
   reservoir. **This tool never automatically repeats or restarts `Prime`.**
 
@@ -300,18 +335,37 @@ opensleep-diagnostic emergency-stop
 is unresponsive (it best-effort-disables both sides, then unconditionally asserts the I2C reset,
 which is the real backstop). It exits non-zero if the reset could not be confirmed.
 
-## What this binary never does, on any path
+## What `frozen-passive`, `frozen-cool-test`, `frozen-prime-test`, and `emergency-stop` never do
 
-* Never loads the normal config file, never connects to MQTT, never runs the Home Assistant
-  integration.
-* Never calls `opensleep::frozen::manager::run` (the normal command-scheduling loop) or any
-  profile/scheduled-priming logic -- `frozen-prime-test` only ever sends one manually-confirmed
-  `Prime`, nothing resembling the daily-scheduled automatic priming stock OpenSleep performs.
-* Never opens the Sensor subsystem UART or references `opensleep::sensor` at all.
-* Never writes to the `0x53` LED controller — only ever a read-only, nonfatal probe.
-* Never installs or touches a systemd unit; every run is a single foreground pass, manually
-  initiated every time -- priming is never automatic.
+* Never load the operator's own saved configuration file, never connect to MQTT, never run the
+  Home Assistant integration.
+* Never call the real Frozen manager's command-scheduling loop or any profile/scheduled-priming
+  logic -- `frozen-prime-test` only ever sends one manually-confirmed `Prime`, nothing resembling
+  the daily-scheduled automatic priming stock OpenSleep performs.
+* Never open the Sensor subsystem UART or reference it at all.
+* Never write to the `0x53` LED controller — only ever a read-only, nonfatal probe.
+* Never install or touch a systemd unit; every run is a single foreground pass, manually initiated
+  every time -- priming is never automatic.
 
-These are enforced both by the fact that this binary's source never references those code paths
-(`guardrail_tests` in `main.rs` scans the diagnostic's own sources at test time to prove it) and by
-the command whitelist above.
+These are enforced both by the fact that these four modes' own source never references those code
+paths (`guardrail_tests` in `main.rs` scans the diagnostic's own sources at test time to prove it)
+and by the command whitelist above.
+
+## What `frozen-prime-opensleep-init` does differently, and what still never happens even there
+
+This mode is the one deliberate exception to every bullet above except the last two: it *does* run
+the real Frozen manager (that is the entire point -- see its own section above), *does* construct a
+real MQTT client (never connected) and a real Sensor subsystem task (best-effort, never gating
+Prime), and *does* write to the LED controller through the real, already-nonfatal upstream code
+path. Even so:
+
+* It still never reads the operator's own saved configuration file from disk -- it builds its own
+  in-memory configuration (see `prime_opensleep_init.rs` module docs).
+* It still never runs the Home Assistant integration or any scheduler/alarm/long-running behavior
+  beyond the single Prime this run exists to send.
+* It still never installs or touches a systemd unit; it is still a single foreground pass, manually
+  initiated every time, exactly like every other subcommand.
+* `guardrail_tests` in `main.rs` prove all of the above by scanning source, including that
+  `frozen-prime-opensleep-init` is the *only* file referencing the real Frozen manager, MQTT
+  client, Sensor subsystem, or LED controller driver -- and that even it never references the real
+  configuration-file loader or `rumqttc` directly.

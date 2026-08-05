@@ -87,7 +87,15 @@ reused unmodified by this fork. The `Prime` frame `7E 01 52 B6 2B` is likewise a
 byte-for-byte by upstream's own `frozen::command::tests::test_prime`, and cross-checked by this
 fork's own `prime_test::tests::prime_action_serializes_to_the_exact_source_evidenced_frame`.
 
-### Why `Random` is unreachable, and `Prime` is reachable in exactly one mode
+### Why `Random` is unreachable, and `Prime` is reachable in exactly one *audited* mode
+
+This section is entirely about `safety::AuditedTransport`, the whitelist used by `frozen-passive`,
+`frozen-cool-test`, `frozen-prime-test`, and `emergency-stop`. `frozen-prime-opensleep-init` reaches
+`Prime` through a structurally separate path that never touches `AuditedTransport` at all -- it
+steers the real, unmodified upstream Frozen scheduler (by constructing an in-memory configuration)
+into sending its own real `FrozenCommand::Prime`; this binary never constructs or transmits that
+command itself in that mode. See SAFETY.md and `prime_opensleep_init.rs`'s module docs for that
+mode's own analysis and guardrails.
 
 `src/bin/opensleep-diagnostic/safety.rs`'s `FrozenAction` enum has exactly eight variants: `Ping`,
 `GetHardwareInfo`, `GetFirmware`, `JumpToFirmware`, `GetTemperatures`, `SafetyOff`, `EnableCooling`,

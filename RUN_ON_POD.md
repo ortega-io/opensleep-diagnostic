@@ -4,12 +4,16 @@ This tool is a diagnostic, not a service. Every subcommand runs once, in the for
 writes a summary, and exits. **Do not install it as a systemd unit.** Priming is always manually
 initiated, every time — this tool never schedules or repeats it automatically.
 
-Four subcommands:
+Five subcommands:
 
 * `opensleep-diagnostic frozen-passive` — safe with the cover disconnected and no water.
 * `opensleep-diagnostic frozen-prime-test` — intentionally sends `Prime` once, to fill an empty or
-  partially-filled hydraulic loop; requires a connected cover with water in the reservoir and
-  multiple explicit confirmations. **Read SAFETY.md before running this.**
+  partially-filled hydraulic loop, via this binary's own reimplemented reset/transport; requires a
+  connected cover with water in the reservoir and multiple explicit confirmations. **Read
+  SAFETY.md before running this.**
+* `opensleep-diagnostic frozen-prime-opensleep-init` — the same Prime-once operation, but through
+  the real, unmodified upstream OpenSleep initialization and Frozen manager code instead. **Read
+  SAFETY.md before running this.**
 * `opensleep-diagnostic frozen-cool-test` — intentionally activates one cooling channel; requires
   a connected, *already-filled* hydraulic loop and multiple explicit confirmations. **Read
   SAFETY.md before running this.**
@@ -211,48 +215,68 @@ reservoir level. If everything ran but circulation wasn't clearly observed, expe
 **INCONCLUSIVE**, not PASS — see PROTOCOL_AUDIT.md for exactly why. An INCONCLUSIVE or FAIL result
 means: inspect, refill, and consider another cycle before moving on to cooling.
 
-### `--preserve-boot-state`: priming without touching I2C or resetting anything
+### `frozen-prime-opensleep-init`: the same priming, through real OpenSleep initialization
 
-Add `--preserve-boot-state` to the command above only if you specifically need the Hub's I2C bus
-and subsystem boot state left completely untouched — e.g. Frozen is already known-good and
-mid-session, and you don't want the normal reset-expander probe/reset sequence to run at all. This
-flag changes the safety model, not just the mechanism — read this whole section before using it.
+Use this subcommand instead of `frozen-prime-test` if you want the fill/priming operation run
+through the real, unmodified upstream OpenSleep initialization and Frozen manager code -- e.g.
+`frozen-prime-test` reported `[capwater]`/`[flowrate]` unavailable and you want to rule out this
+binary's own reimplemented reset/transport as the cause. This is a different safety model, not a
+relaxed one — read this whole section before using it. See SAFETY.md for the full writeup.
 
 ```sh
-/persistent/tools/opensleep-diagnostic frozen-prime-test \
-    --frozen-port /dev/ttyS1 \
-    --preserve-boot-state \
+/persistent/tools/opensleep-diagnostic frozen-prime-opensleep-init \
     --confirm-cover-hydraulics-connected \
     --confirm-reservoir-filled \
     --confirm-cover-loop-needs-priming \
     --confirm-no-visible-leaks \
     --confirm-active-test \
-    --json-output /persistent/frozen-prime-preserve.json \
+    --json-output /persistent/frozen-prime-opensleep-init.json \
     --verbose
 ```
 
-* `/dev/i2c-1` is never opened, probed, or written — not even the reset-expander probe. `--i2c-device`
-  is accepted but ignored for I/O purposes in this mode.
-* Frozen must already be running application firmware. This mode only sends `Ping` and requires
-  `Pong(true)` back; if Frozen answers from its bootloader (or doesn't answer), the tool refuses to
-  proceed and tells you to **reboot the Hub yourself** — it will not attempt a bootloader →
-  firmware jump or any reset in this mode.
-* `--duration-seconds` is ignored. The observation window is fixed at up to 600 seconds.
-* **There is no I2C subsystem-reset backstop in this mode.** On exit — normal completion, `"done
-  because empty"`, the window elapsing, or Ctrl+C — this mode only disables both temperature
-  targets over UART and closes the UART. **If priming does not visibly stop after that, reboot the
-  Hub or disconnect Hub power yourself.** Keep that access ready for the whole run, same as always.
-* The same five `--confirm-*` flags and the same two typed confirmation phrases are still required.
+You'll be asked for the same two typed confirmation phrases as `frozen-prime-test`. There is no
+`--i2c-device`/`--frozen-port` flag: this mode uses the real upstream code's own hardcoded device
+paths, not this binary's own configurable ones.
+
+* This mode runs the **real** `opensleep::reset::ResetController::reset_subsystems` (not this
+  binary's own reimplementation), the real LED controller, a real (never-connected) MQTT client, a
+  best-effort real Sensor subsystem task, and — doing all of the actual work — the real
+  `opensleep::frozen::run` manager. It never reads your saved `config.ron`; it builds its own
+  in-memory configuration with temperature profiles disabled.
+* Frozen must already be running application firmware, or already reachable from its bootloader
+  through the real wake sequence; if it never answers `Pong(true)`, the tool refuses to send Prime.
+* **If firmware reports `[capwater] sensor unavailable` as a result of this run's own
+  initialization, `Prime` is never sent.** The tool prints what happened during initialization so
+  you can diagnose it.
+* The observation window is fixed at the firmware-reported priming duration (600000 ms) and is not
+  configurable.
+* **There is no routine I2C subsystem-reset backstop in this mode.** On exit — normal completion,
+  `"done because empty"`, the window elapsing, or a stop signal — this mode does not assert the I2C
+  reset; Frozen's firmware returns to idle on its own. The one exception is a genuine
+  firmware-reported pump fault, which does trigger an emergency reset. **If priming does not
+  visibly stop, reboot the Hub or disconnect Hub power yourself.** Keep that access ready for the
+  whole run, same as always.
+* Temperature targets are never enabled during this run, so there is nothing to actively disable at
+  shutdown.
 * The printed/JSON summary reports this mode's own result block instead of `prime_results`:
 
   ```
-  preserve_boot_state:          true
-  I2C writes performed:         0
-  Prime outcome:                success / incomplete (done because empty) / not observed within window / not sent
-  Pumps commanded:               true/false
-  Normal done observed:          true/false
-  Done because empty observed:   true/false
+  Subsystem reset performed/ok:    true/true
+  Device label:                    <whatever /home/dac/app/sewer/device-label contains, or "unknown">
+  Sensor subsystem started:        true/false
+  Frozen reached firmware:         true/false
+  [capwater] unavailable observed: true/false
+  [flowrate] unavailable observed: true/false
+  Prime outcome:                   success / incomplete (done because empty) / not observed within window / not sent
+  Prime sent count:                0 or 1
+  Normal done observed:            true/false
+  Done because empty observed:     true/false
+  Emergency reset asserted:        true/false
   ```
+
+`--dry-run` for this mode only validates confirmations/arguments — unlike this binary's other
+`--dry-run` modes, it cannot run the real upstream code against a mock, because that code hardcodes
+real serial ports and I2C devices and has no mock transport to substitute one into.
 
 ## 7. Once the loop is confirmed filled: run a 10-second cooling test on one side
 
@@ -359,9 +383,13 @@ mode would.
 
 ## What this tool will never do on the Pod
 
-See SAFETY.md and PROTOCOL_AUDIT.md for the full accounting. In short: it never loads the normal
-config file, never connects to MQTT, never runs the Home Assistant integration, never starts a
-profile or temperature schedule outside its own bounded active phase, never writes to `0x53`, and
-never transmits `Prime` outside `frozen-prime-test` (where it is sent at most once per invocation,
-always manually confirmed, never scheduled or repeated automatically) or an arbitrary/undocumented
-command. It always exits after one bounded pass and is never installed as a service.
+See SAFETY.md and PROTOCOL_AUDIT.md for the full accounting. In short: no subcommand ever loads
+your saved `config.ron`, runs the Home Assistant integration, starts a profile or temperature
+schedule outside its own bounded active phase, or sends `Prime` outside `frozen-prime-test`/
+`frozen-prime-opensleep-init` (always sent at most once per invocation, always manually confirmed,
+never scheduled or repeated automatically) or an arbitrary/undocumented command. Every subcommand
+except `frozen-prime-opensleep-init` also never connects to MQTT, never opens the Sensor subsystem,
+and never writes to `0x53` beyond a nonfatal probe -- `frozen-prime-opensleep-init` is the one
+deliberate exception (it constructs a real, never-connected MQTT client and runs the real Sensor
+subsystem best-effort; see its own section above and SAFETY.md). Every subcommand always exits
+after one bounded pass and is never installed as a service.
