@@ -1,10 +1,60 @@
 # TEST_RESULTS.md — opensleep-diagnostic
 
-All 142 unit/integration tests in `src/bin/opensleep-diagnostic/` pass, plus the 51 pre-existing
-`opensleep` library tests (unmodified, reused as-is) and 0 doc-tests — 193 total, 0 failed. This
-was verified inside the `messense/rust-musl-cross:aarch64-musl` builder image via
-`cargo test --locked` under its built-in QEMU aarch64 runner (the same environment the release
-binary is built in) as part of the actual release build -- see `build-report.txt`.
+145 unit/integration tests now exist in `src/bin/opensleep-diagnostic/` (up from 142; see the
+revision note directly below), plus the 51 pre-existing `opensleep` library tests (unmodified,
+reused as-is) and 0 doc-tests. The 142/51/0 counts were verified inside the
+`messense/rust-musl-cross:aarch64-musl` builder image via `cargo test --locked` under its built-in
+QEMU aarch64 runner (the same environment the release binary is built in) as part of the diagnostic-v7
+release build -- see `build-report.txt`. **The 3 tests added since then have not yet been run
+through that same builder-image verification** (only `cargo check`, which does not execute tests,
+has been run against them so far) -- do that before cutting the next release.
+
+## Revision note: fix Frozen/Sensor UART paths for this Hub variant
+
+A live run on this Hub completed the real subsystem reset and then failed immediately with
+`Serial Io(NotFound): No such file or directory`: `frozen-prime-opensleep-init` was calling the
+real `opensleep::frozen::run` with the upstream `opensleep::frozen::PORT` constant
+(`/dev/ttymxc2`), correct for the MT8365 devkit the pinned upstream source targets but not present
+on this Hub, which exposes Frozen at `/dev/ttyS1` instead (still the unmodified upstream 38400
+baud). `frozen::run`'s `port` argument is now a locally-defined `FROZEN_UART_PATH` constant
+(`/dev/ttyS1`), passed explicitly -- never `opensleep::frozen::PORT`, which now appears in this
+file only as the comparison value in a logged override message
+(`"Frozen manager UART override: /dev/ttymxc2 -> /dev/ttyS1"`). Nothing about `frozen::run`'s
+protocol, wake sequence, or state machine changed -- only the device path handed to it. A new
+preflight check refuses to proceed (before touching I2C at all) if `/dev/ttyS1` does not exist.
+
+This revision also **removes the Sensor subsystem entirely** from this mode rather than keeping it
+as a best-effort background task: Sensor is a separate physical UART (upstream default
+`/dev/ttymxc0`, also wrong for this Hub -- it would need `/dev/ttyS2` if ever retained) with no
+bearing on Frozen priming or on `capwater`/`flowrate` reporting, so the surest way to guarantee it
+"must not prevent priming" is to never run it at all, rather than run it best-effort and have to
+keep proving its failures stay non-blocking. `main.rs`'s `sensor_subsystem_is_never_referenced`
+guardrail test (previously carved out for this file) is back to its original, stricter form: no
+file, `frozen-prime-opensleep-init` included, may reference `opensleep::sensor`/`sensor::run`.
+
+`OpenSleepInitResults` gained `frozen_uart_requested`, `frozen_uart_opened`, and
+`frozen_manager_task_running` fields, and lost `sensor_subsystem_started`/`sensor_subsystem_error`
+(no longer meaningful with Sensor removed). `frozen_uart_opened` is inferred by racing the real
+manager's future against a 500ms window immediately after starting: a real open failure resolves
+near-instantly (an immediate `Err`), while a successful open keeps the future pending for at least
+~100ms on its own (`FrozenState::publish_reset`'s MQTT publish, wrapped in a 100ms
+`tokio::time::timeout` that this mode's never-polled event loop cannot complete) before reaching
+its main loop -- so this specifically does *not* report "started" merely because a task was
+spawned, distinguishing spawned from actually opened.
+
+3 new tests: `frozen_uart_path_is_ttys1_not_the_upstream_devkit_default` and
+`frozen_run_is_never_called_with_the_upstream_port_constant` in `prime_opensleep_init.rs`, and
+`obsolete_devkit_uart_paths_are_never_hardcoded_anywhere` in `main.rs`'s `guardrail_tests` (scans
+this binary's entire source, `frozen-prime-opensleep-init` included, for `/dev/ttymxc0`/
+`/dev/ttymxc2`/`/dev/ttymxc` as hardcoded literals -- the only legitimate reference to the real
+value is the symbolic `opensleep::frozen::PORT` constant in the logged override message, which
+does not contain those literal strings in this binary's own source).
+
+**As before, this mode's active-path behavior (a real Ping/Pong exchange, the real capwater/
+flowrate check, an actual Prime send) has not been exercised against real Frozen hardware in this
+revision either** -- this fix was made from a live run's own reported error text and the pinned
+source, not from a fresh hardware run confirming the fix resolves it. Confirm on real hardware
+before relying on this revision's active-path claims.
 
 ## Revision note: `--preserve-boot-state` replaced with `frozen-prime-opensleep-init`
 

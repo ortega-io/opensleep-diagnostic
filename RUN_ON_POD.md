@@ -235,14 +235,19 @@ relaxed one — read this whole section before using it. See SAFETY.md for the f
 ```
 
 You'll be asked for the same two typed confirmation phrases as `frozen-prime-test`. There is no
-`--i2c-device`/`--frozen-port` flag: this mode uses the real upstream code's own hardcoded device
-paths, not this binary's own configurable ones.
+`--i2c-device`/`--frozen-port` flag: I2C is always `/dev/i2c-1`, and Frozen's UART is always
+`/dev/ttyS1` -- confirmed correct for this Hub (a live run failed with `Serial Io(NotFound)` when
+the upstream `opensleep::frozen::PORT` default, `/dev/ttymxc2`, correct only for the MT8365 devkit
+the pinned upstream source targets, was used instead). A preflight check refuses to proceed --
+before touching I2C at all -- if `/dev/ttyS1` does not exist.
 
 * This mode runs the **real** `opensleep::reset::ResetController::reset_subsystems` (not this
-  binary's own reimplementation), the real LED controller, a real (never-connected) MQTT client, a
-  best-effort real Sensor subsystem task, and — doing all of the actual work — the real
-  `opensleep::frozen::run` manager. It never reads your saved `config.ron`; it builds its own
-  in-memory configuration with temperature profiles disabled.
+  binary's own reimplementation), the real LED controller, a real (never-connected) MQTT client,
+  and — doing all of the actual work — the real `opensleep::frozen::run` manager, called with
+  `/dev/ttyS1` explicitly (never the upstream default). It never reads your saved `config.ron`; it
+  builds its own in-memory configuration with temperature profiles disabled. **It never starts the
+  Sensor subsystem at all** -- Sensor is a separate physical UART with no bearing on Frozen priming,
+  so the surest way to guarantee it can't block priming is to never run it.
 * Frozen must already be running application firmware, or already reachable from its bootloader
   through the real wake sequence; if it never answers `Pong(true)`, the tool refuses to send Prime.
 * **If firmware reports `[capwater] sensor unavailable` as a result of this run's own
@@ -263,16 +268,24 @@ paths, not this binary's own configurable ones.
   ```
   Subsystem reset performed/ok:    true/true
   Device label:                    <whatever /home/dac/app/sewer/device-label contains, or "unknown">
-  Sensor subsystem started:        true/false
+  Frozen UART requested:           /dev/ttyS1
+  Frozen UART opened:              true/false
+  Frozen manager task running:     true/false
   Frozen reached firmware:         true/false
   [capwater] unavailable observed: true/false
   [flowrate] unavailable observed: true/false
   Prime outcome:                   success / incomplete (done because empty) / not observed within window / not sent
+  Prime sent:                      true/false
   Prime sent count:                0 or 1
   Normal done observed:            true/false
   Done because empty observed:     true/false
   Emergency reset asserted:        true/false
   ```
+
+  `Frozen UART opened` is inferred, not directly reported by the real manager: this mode watches
+  whether the manager's task is still running ~500ms after starting (a real open failure like
+  `Serial Io(NotFound)` resolves near-instantly) rather than reporting merely that a task was
+  spawned.
 
 `--dry-run` for this mode only validates confirmations/arguments — unlike this binary's other
 `--dry-run` modes, it cannot run the real upstream code against a mock, because that code hardcodes
@@ -385,11 +398,11 @@ mode would.
 
 See SAFETY.md and PROTOCOL_AUDIT.md for the full accounting. In short: no subcommand ever loads
 your saved `config.ron`, runs the Home Assistant integration, starts a profile or temperature
-schedule outside its own bounded active phase, or sends `Prime` outside `frozen-prime-test`/
-`frozen-prime-opensleep-init` (always sent at most once per invocation, always manually confirmed,
-never scheduled or repeated automatically) or an arbitrary/undocumented command. Every subcommand
-except `frozen-prime-opensleep-init` also never connects to MQTT, never opens the Sensor subsystem,
-and never writes to `0x53` beyond a nonfatal probe -- `frozen-prime-opensleep-init` is the one
-deliberate exception (it constructs a real, never-connected MQTT client and runs the real Sensor
-subsystem best-effort; see its own section above and SAFETY.md). Every subcommand always exits
-after one bounded pass and is never installed as a service.
+schedule outside its own bounded active phase, opens the Sensor subsystem, or sends `Prime` outside
+`frozen-prime-test`/`frozen-prime-opensleep-init` (always sent at most once per invocation, always
+manually confirmed, never scheduled or repeated automatically) or an arbitrary/undocumented
+command. Every subcommand except `frozen-prime-opensleep-init` also never connects to MQTT and
+never writes to `0x53` beyond a nonfatal probe -- `frozen-prime-opensleep-init` is the one
+deliberate exception there (it constructs a real, never-connected MQTT client and writes to the LED
+controller through the real upstream code path; see its own section above and SAFETY.md). Every
+subcommand always exits after one bounded pass and is never installed as a service.

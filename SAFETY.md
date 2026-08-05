@@ -54,20 +54,30 @@ topped up with water ready to be drawn in, and the same explicit-confirmation di
 `frozen-prime-opensleep-init` sends `Prime` exactly once, just like `frozen-prime-test` — but
 instead of this binary's own reimplemented I2C reset sequence and Frozen UART transport, it calls
 the real, unmodified upstream `opensleep::reset::ResetController::reset_subsystems`,
-`opensleep::led`, `opensleep::mqtt::MqttManager`, `opensleep::sensor::run`, and
-`opensleep::frozen::run`. See `src/bin/opensleep-diagnostic/prime_opensleep_init.rs`'s module docs
-for the full design rationale (real hardware evidence showed a reimplemented, partial
-initialization path can leave the reservoir-level (`capwater`) sensor in a different state than a
-full, real OpenSleep boot does — this mode exists to remove that gap).
+`opensleep::led`, `opensleep::mqtt::MqttManager`, and `opensleep::frozen::run`. See
+`src/bin/opensleep-diagnostic/prime_opensleep_init.rs`'s module docs for the full design rationale
+(real hardware evidence showed a reimplemented, partial initialization path can leave the
+reservoir-level (`capwater`) sensor in a different state than a full, real OpenSleep boot does —
+this mode exists to remove that gap).
+
+**Frozen UART path is hardware-specific.** The upstream `opensleep::frozen::PORT` constant
+(`/dev/ttymxc2`) is correct for the MT8365 devkit this fork's pinned upstream source targets, but
+not for every Hub: a live run on this Hub completed the real subsystem reset and then failed
+immediately with `Serial Io(NotFound)` when `frozen::run` was given that path. This mode calls
+`frozen::run` with `/dev/ttyS1` explicitly instead (confirmed correct for this Hub, still at the
+unmodified upstream 38400 baud) — the manager's protocol, wake sequence, and state machine are
+untouched, only the device path differs. A preflight check refuses to proceed (before touching I2C
+at all) if `/dev/ttyS1` does not exist.
 
 **This is a different safety model, not a relaxed one:**
 
 * This is the *only* subcommand in this binary that runs the real Frozen manager, the real MQTT
-  client construction, the real Sensor subsystem, and the real LED controller. It still never loads
-  the operator's own saved configuration file (it builds its own in-memory configuration with
-  temperature profiles disabled and MQTT never actually connected — see the module docs) and never
-  runs a scheduler, alarms, or long-running daemon behavior: it is still a single foreground
-  command that starts, primes once, and exits.
+  client construction, and the real LED controller. It still never starts the Sensor subsystem at
+  all (a separate physical UART with no bearing on Frozen priming — the surest way to guarantee it
+  can't block priming is to never run it), never loads the operator's own saved configuration file
+  (it builds its own in-memory configuration with temperature profiles disabled and MQTT never
+  actually connected — see the module docs), and never runs a scheduler, alarms, or long-running
+  daemon behavior: it is still a single foreground command that starts, primes once, and exits.
 * Frozen must already be running application firmware (`Ping` must get `Pong(true)`) before this
   mode sends anything else. If it is not, the tool refuses to start and tells you to reboot the Hub
   — it never attempts a bootloader → firmware jump.
@@ -80,7 +90,7 @@ full, real OpenSleep boot does — this mode exists to remove that gap).
   mode does **not** assert the I2C subsystem reset. Frozen's own firmware returns to idle on its
   own after priming ends; forcing a reset immediately afterward would be needlessly disruptive to a
   subsystem this mode is specifically trying to leave in its normal, running state. Shutdown happens
-  by simply no longer polling the real Frozen/Sensor tasks (the same drop-based cancellation real
+  by simply no longer polling the real Frozen manager task (the same drop-based cancellation real
   `opensleep`'s own top-level `tokio::select!` already uses), not by resetting anything.
 * The one exception: a genuine firmware-reported pump fault observed during the run **does** assert
   an emergency I2C reset, using this diagnostic's own already-audited `assert_reset` primitive (not
@@ -335,6 +345,17 @@ opensleep-diagnostic emergency-stop
 is unresponsive (it best-effort-disables both sides, then unconditionally asserts the I2C reset,
 which is the real backstop). It exits non-zero if the reset could not be confirmed.
 
+## What no subcommand ever does, including `frozen-prime-opensleep-init`
+
+* **Never open the Sensor subsystem UART or reference it at all, in any mode.** Sensor is a
+  separate physical UART with no bearing on Frozen priming or on `capwater`/`flowrate` reporting
+  (both come from Frozen's own firmware messages) -- even `frozen-prime-opensleep-init`, which runs
+  the real Frozen manager, the real MQTT client construction, and the real LED controller, does not
+  start it. This is enforced by `guardrail_tests` in `main.rs` scanning the diagnostic's own
+  sources at test time: no file, `frozen-prime-opensleep-init` included, may reference it.
+* Never write to the `0x53` LED controller other than through the real, already-nonfatal upstream
+  code path (`frozen-prime-opensleep-init`) or a read-only, nonfatal probe (every other mode).
+
 ## What `frozen-passive`, `frozen-cool-test`, `frozen-prime-test`, and `emergency-stop` never do
 
 * Never load the operator's own saved configuration file, never connect to MQTT, never run the
@@ -342,8 +363,6 @@ which is the real backstop). It exits non-zero if the reset could not be confirm
 * Never call the real Frozen manager's command-scheduling loop or any profile/scheduled-priming
   logic -- `frozen-prime-test` only ever sends one manually-confirmed `Prime`, nothing resembling
   the daily-scheduled automatic priming stock OpenSleep performs.
-* Never open the Sensor subsystem UART or reference it at all.
-* Never write to the `0x53` LED controller — only ever a read-only, nonfatal probe.
 * Never install or touch a systemd unit; every run is a single foreground pass, manually initiated
   every time -- priming is never automatic.
 
@@ -353,12 +372,13 @@ and by the command whitelist above.
 
 ## What `frozen-prime-opensleep-init` does differently, and what still never happens even there
 
-This mode is the one deliberate exception to every bullet above except the last two: it *does* run
-the real Frozen manager (that is the entire point -- see its own section above), *does* construct a
-real MQTT client (never connected) and a real Sensor subsystem task (best-effort, never gating
-Prime), and *does* write to the LED controller through the real, already-nonfatal upstream code
-path. Even so:
+This mode is the one deliberate exception to the second list above except its last bullet: it
+*does* run the real Frozen manager (that is the entire point -- see its own section above) and
+*does* construct a real MQTT client (never connected), and *does* write to the LED controller
+through the real, already-nonfatal upstream code path. Even so:
 
+* It still never starts the Sensor subsystem, exactly like every other mode -- see "What no
+  subcommand ever does" above.
 * It still never reads the operator's own saved configuration file from disk -- it builds its own
   in-memory configuration (see `prime_opensleep_init.rs` module docs).
 * It still never runs the Home Assistant integration or any scheduler/alarm/long-running behavior
@@ -366,6 +386,6 @@ path. Even so:
 * It still never installs or touches a systemd unit; it is still a single foreground pass, manually
   initiated every time, exactly like every other subcommand.
 * `guardrail_tests` in `main.rs` prove all of the above by scanning source, including that
-  `frozen-prime-opensleep-init` is the *only* file referencing the real Frozen manager, MQTT
-  client, Sensor subsystem, or LED controller driver -- and that even it never references the real
-  configuration-file loader or `rumqttc` directly.
+  `frozen-prime-opensleep-init` is the *only* file referencing the real Frozen manager, the MQTT
+  client, or the LED controller driver -- and that even it never references the real
+  configuration-file loader, `rumqttc`, or an obsolete MT8365-devkit UART path directly.

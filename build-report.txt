@@ -1,12 +1,56 @@
 opensleep-diagnostic — build report
 ====================================
 
-Patch revision: 7 (replaces --preserve-boot-state with frozen-prime-opensleep-init)
-Supersedes revision 6 (added --preserve-boot-state to frozen-prime-test, now removed -- see
-below), revision 5 (added frozen-prime-test), revision 4 (corrected active-test
-preflight/monitoring), revision 3 (staged, Frozen-only diagnostic redesign), revision 2
-(sensor-first post-reset bootloader retry-probe), and revision 1 (initial diagnostic-only fork).
-Same upstream base commit; only source.patch changed.
+Patch revision: 8 (fixes Frozen/Sensor UART paths for this Hub variant)
+Supersedes revision 7 (replaced --preserve-boot-state with frozen-prime-opensleep-init), revision 6
+(added --preserve-boot-state to frozen-prime-test, now removed), revision 5 (added
+frozen-prime-test), revision 4 (corrected active-test preflight/monitoring), revision 3 (staged,
+Frozen-only diagnostic redesign), revision 2 (sensor-first post-reset bootloader retry-probe), and
+revision 1 (initial diagnostic-only fork). Same upstream base commit; only source.patch changed.
+
+NOTE: revision 8 has not yet been built through build.sh or verified inside the builder image --
+the "Test results"/"Artifact validation" sections below still describe revision 7's actual
+diagnostic-v7 release build. Only `cargo check` (which does not execute tests) has been run against
+revision 8's changes so far. Re-run build.sh, refresh those two sections with real numbers, and
+smoke-test the actual binary before cutting a revision-8 release -- see TEST_RESULTS.md.
+
+What changed in revision 8
+---------------------------
+A live run on this Hub completed the real subsystem reset and then failed immediately with
+`Serial Io(NotFound): No such file or directory`: `frozen-prime-opensleep-init` (added in revision
+7) was calling the real `opensleep::frozen::run` with the upstream `opensleep::frozen::PORT`
+constant (`/dev/ttymxc2`, correct for the MT8365 devkit the pinned upstream source targets), which
+this Hub does not expose. This Hub uses `/dev/ttyS1` for Frozen (still the unmodified upstream
+38400 baud) and would use `/dev/ttyS2` for Sensor if Sensor were ever retained here.
+
+  - `frozen::run`'s `port` argument is now a locally-defined `FROZEN_UART_PATH` constant
+    (`/dev/ttyS1`), passed explicitly. `opensleep::frozen::PORT` now appears in
+    `prime_opensleep_init.rs` only as the comparison value in a logged override message
+    (`"Frozen manager UART override: /dev/ttymxc2 -> /dev/ttyS1"`), logged before opening, and is
+    never passed to anything that opens a port. Nothing about `frozen::run`'s protocol, wake
+    sequence, or state machine changed -- only the device path handed to it.
+  - A new preflight check refuses to proceed -- before touching I2C at all -- if `/dev/ttyS1` does
+    not exist.
+  - The Sensor subsystem, previously run best-effort in the background (revision 7), is now removed
+    from this mode entirely: it is a separate physical UART with no bearing on Frozen priming or on
+    `capwater`/`flowrate` reporting, so the surest way to guarantee it "must not prevent priming" is
+    to never run it, not to run it best-effort and have to keep proving its failures stay
+    non-blocking. `main.rs`'s `sensor_subsystem_is_never_referenced` guardrail test (carved out for
+    this file in revision 7) is back to its original, stricter form: no file may reference
+    `opensleep::sensor`/`sensor::run`, `frozen-prime-opensleep-init` included.
+  - `OpenSleepInitResults` gained `frozen_uart_requested`, `frozen_uart_opened`, and
+    `frozen_manager_task_running` fields (and lost the now-meaningless `sensor_subsystem_started`/
+    `sensor_subsystem_error`). `frozen_uart_opened` distinguishes "the port opened" from "a task
+    was merely spawned" by racing the manager's future against a 500ms window immediately after
+    starting: an open failure resolves near-instantly, while a successful open keeps the future
+    pending for at least ~100ms on its own (`FrozenState::publish_reset`'s MQTT publish, wrapped in
+    a 100ms timeout this mode's never-polled event loop cannot complete) before reaching its main
+    loop.
+  - 3 new tests (145 total in this directory, up from 142): a constant-value regression test and a
+    source-scan test local to `prime_opensleep_init.rs`, plus a new `main.rs` guardrail test
+    scanning this binary's entire source for `/dev/ttymxc0`/`/dev/ttymxc2`/`/dev/ttymxc` as
+    hardcoded literals. See TEST_RESULTS.md for the full writeup, including what has and has not
+    been verified for this revision.
 
 What changed in revision 7
 ---------------------------

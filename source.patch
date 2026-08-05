@@ -3221,10 +3221,10 @@ index 0000000..216770e
 +}
 diff --git a/src/bin/opensleep-diagnostic/main.rs b/src/bin/opensleep-diagnostic/main.rs
 new file mode 100644
-index 0000000..ff0b6b9
+index 0000000..b767649
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/main.rs
-@@ -0,0 +1,285 @@
+@@ -0,0 +1,295 @@
 +//! opensleep-diagnostic: a staged, Frozen-only hardware diagnostic for an Eight Sleep Pod 3 Hub.
 +//!
 +//! Five subcommands, each with its own fixed command whitelist (see `safety.rs`):
@@ -3372,20 +3372,16 @@ index 0000000..ff0b6b9
 +    }
 +
 +    #[test]
-+    fn sensor_subsystem_is_referenced_only_by_opensleep_init() {
-+        // frozen-prime-opensleep-init is the one deliberate exception -- see its module docs on
-+        // why it runs the real Sensor subsystem (best-effort) alongside Frozen.
-+        let src = read_all_our_sources_except(&["main.rs", OPENSLEEP_INIT_FILE]);
++    fn sensor_subsystem_is_never_referenced() {
++        // Unlike MQTT/the LED driver/the real Frozen manager, frozen-prime-opensleep-init does not
++        // carve out an exception here: it never starts the Sensor subsystem either (a separate
++        // physical UART with no bearing on Frozen priming) -- see that module's docs for why "must
++        // not prevent priming" is satisfied by never running it, not by running it best-effort.
++        let src = read_all_our_sources_except(&["main.rs"]);
 +        let needle_a = format!("{}{}{}", "opensleep", "::", "sensor");
 +        let needle_b = format!("{}{}{}", "sensor", "::", "run");
-+        assert!(!src.contains(&needle_a), "diagnostic source must never reference opensleep::sensor outside frozen-prime-opensleep-init");
-+        assert!(!src.contains(&needle_b), "diagnostic source must never call the Sensor manager's run loop outside frozen-prime-opensleep-init");
-+
-+        let opensleep_init_src = read_opensleep_init_source();
-+        assert!(
-+            opensleep_init_src.contains(&needle_a),
-+            "frozen-prime-opensleep-init is expected to reference opensleep::sensor -- update this test if that changed"
-+        );
++        assert!(!src.contains(&needle_a), "diagnostic source must never reference opensleep::sensor");
++        assert!(!src.contains(&needle_b), "diagnostic source must never call the Sensor manager's run loop");
 +    }
 +
 +    #[test]
@@ -3451,6 +3447,20 @@ index 0000000..ff0b6b9
 +            opensleep_init_src.contains(&needle_b),
 +            "frozen-prime-opensleep-init is expected to call frozen::run(...) -- update this test if that changed"
 +        );
++    }
++
++    /// Item 5 of the `/dev/ttyS1` fix: the obsolete MT8365-devkit UART paths must never appear as
++    /// a hardcoded literal anywhere in this binary's own source, `frozen-prime-opensleep-init`
++    /// included. The one legitimate reference to the real value is `opensleep::frozen::PORT`,
++    /// used only as the *comparison* side of a logged override message (see that module's docs) --
++    /// a symbolic reference, never a hardcoded copy of the literal path text, and it does not
++    /// appear as those literal strings in our own source at all.
++    #[test]
++    fn obsolete_devkit_uart_paths_are_never_hardcoded_anywhere() {
++        let src = read_all_our_sources_except(&["main.rs"]);
++        for needle in ["/dev/ttymxc0", "/dev/ttymxc2", "/dev/ttymxc"] {
++            assert!(!src.contains(needle), "diagnostic source must never hardcode the obsolete UART path {needle}");
++        }
 +    }
 +
 +    #[test]
@@ -4272,15 +4282,16 @@ index 0000000..0acd6b8
 +}
 diff --git a/src/bin/opensleep-diagnostic/prime_opensleep_init.rs b/src/bin/opensleep-diagnostic/prime_opensleep_init.rs
 new file mode 100644
-index 0000000..6c2c2e3
+index 0000000..e8538ea
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/prime_opensleep_init.rs
-@@ -0,0 +1,728 @@
+@@ -0,0 +1,835 @@
 +//! `frozen-prime-opensleep-init`: fills an empty or partially-filled hydraulic loop by sending
 +//! `Prime` exactly once, through the real, unmodified upstream OpenSleep initialization and Frozen
 +//! manager code -- `opensleep::reset::ResetController::reset_subsystems`, `opensleep::led`,
-+//! `opensleep::mqtt::MqttManager`, `opensleep::sensor::run`, `opensleep::frozen::run` -- rather
-+//! than `frozen-prime-test`'s own reimplemented reset sequence and command transport.
++//! `opensleep::mqtt::MqttManager`, `opensleep::frozen::run` -- rather than `frozen-prime-test`'s
++//! own reimplemented reset sequence and command transport. The Sensor subsystem is deliberately
++//! never started at all -- see "MQTT is optional; Sensor is disabled entirely" below.
 +//!
 +//! ## Why this mode exists, and how it differs from `frozen-prime-test`
 +//!
@@ -4302,11 +4313,11 @@ index 0000000..6c2c2e3
 +//! `/home/dac/app/sewer/device-label` read, `IS31FL3194Controller` (LED; writes to the unavailable
 +//! 0x53 controller are already non-fatal in the *upstream* `frozen::run` -- see `set_led` in
 +//! `opensleep::frozen::manager` -- so nothing extra is needed for that here), `MqttManager::new`,
-+//! `opensleep::sensor::run`, and -- doing all of the real work -- `opensleep::frozen::run` (the
-+//! actual Frozen manager task: the real Ping/GetHardwareInfo boot sequence, the real wake-retry
-+//! logic, and the real command scheduler that this mode steers into sending exactly one `Prime` by
-+//! constructing an in-memory `Config`, not by calling any command channel that doesn't exist in the
-+//! upstream code -- see "Triggering Prime" below).
++//! and -- doing all of the real work -- `opensleep::frozen::run` (the actual Frozen manager task:
++//! the real Ping/GetHardwareInfo boot sequence, the real wake-retry logic, and the real command
++//! scheduler that this mode steers into sending exactly one `Prime` by constructing an in-memory
++//! `Config`, not by calling any command channel that doesn't exist in the upstream code -- see
++//! "Triggering Prime" below).
 +//!
 +//! Deliberately not reused: the real config-file loader (this mode never reads the operator's own
 +//! saved configuration from disk; it constructs its own in-memory `Config` -- see below) and
@@ -4345,16 +4356,37 @@ index 0000000..6c2c2e3
 +//! logger every subcommand already uses to observe those exact log lines without modifying
 +//! `frozen/state.rs` at all -- see that module's docs.
 +//!
-+//! ## MQTT and Sensor are optional
++//! ## The Frozen UART path is hardware-specific, and is passed explicitly -- never the upstream
++//! ## `PORT` constant
++//!
++//! `opensleep::frozen::PORT` (`"/dev/ttymxc2"`) is correct for the MT8365 devkit this fork's pinned
++//! upstream source was written against, but not for every Hub this diagnostic runs on: a real,
++//! live run on this Hub completed the real subsystem reset and then failed immediately with
++//! `Serial Io(NotFound): No such file or directory` the moment `frozen::run` tried to open that
++//! path. This Hub exposes Frozen at `/dev/ttyS1` (still 38400 baud -- `frozen::manager::BAUD` is
++//! unchanged and untouched) instead. `frozen::run`'s first parameter is a plain `port: &'static
++//! str`; this file passes `FROZEN_UART_PATH` (`"/dev/ttyS1"`) there directly and never references
++//! `opensleep::frozen::PORT` as an argument to anything that opens a port -- only, once, as the
++//! *comparison* value in the logged override message in `run_core`, which does not open it. This
++//! changes nothing about the manager's protocol, wake sequence, or state
++//! machine: `frozen::run`'s body is untouched, exactly as every other module doc in this file
++//! already claims -- only the device path handed to it differs. See `FROZEN_UART_PATH`'s own doc
++//! comment and the regression tests at the bottom of this file.
++//!
++//! ## MQTT is optional; Sensor is disabled entirely
 +//!
 +//! Real `opensleep::main` treats `MqttManager::wait_for_conn` failure as fatal (it returns before
-+//! starting Frozen at all) and structures its top-level `tokio::select!` so that `sensor::run`
-+//! completing for any reason (including "the port doesn't exist") ends the whole process. Neither
-+//! is appropriate for a one-shot Prime operation: this mode never calls `wait_for_conn` (so a
-+//! missing/unreachable MQTT broker never blocks or fails startup -- the constructed `AsyncClient`
-+//! is still handed to `frozen::run` exactly as upstream does, it simply never has its event loop
-+//! polled, so no network I/O is ever attempted) and runs `sensor::run` as a detached, best-effort
-+//! background task whose outcome is reported but never gates Prime.
++//! starting Frozen at all); that is not appropriate for a one-shot Prime operation, so this mode
++//! never calls `wait_for_conn` -- a missing/unreachable MQTT broker never blocks or fails startup.
++//! The constructed `AsyncClient` is still handed to `frozen::run` exactly as upstream does, it
++//! simply never has its event loop polled, so no network I/O is ever attempted.
++//!
++//! The Sensor subsystem is not started at all in this mode: it is a separate physical UART (the
++//! upstream default for it is also wrong for this Hub, which would need `/dev/ttyS2` if Sensor
++//! were ever retained here) with no bearing on Frozen priming or on
++//! `capwater`/`flowrate` reporting (those come from Frozen's own firmware messages -- see
++//! `frozen/state.rs`), so the surest way to guarantee it "must not prevent priming" is to never run
++//! it, rather than run it best-effort and have to keep proving its failures stay non-blocking.
 +//!
 +//! ## Shutdown
 +//!
@@ -4365,9 +4397,10 @@ index 0000000..6c2c2e3
 +//! exits via the same mechanism real `main.rs` already uses for its top-level shutdown: a
 +//! `tokio::select!` whose losing branches are dropped (cancelled) the moment one branch resolves --
 +//! here, that's either the observation loop deciding it's done, or a termination signal. Ctrl+C
-+//! disables both temperature targets by nudging the config watch channel (the real code already
-+//! re-asserts "disabled" whenever it observes a config change) and lets that same drop-based
-+//! shutdown happen; no reset is asserted for a clean stop either. The one exception is a genuine
++//! just lets that same drop-based shutdown happen -- temperature targets are never enabled during
++//! this run in the first place (the constructed profile has no temperatures, which the real
++//! scheduler always treats as disabled), so there is nothing to actively disable at that point; no
++//! reset is asserted for a clean stop either. The one exception is a genuine
 +//! firmware-reported pump fault observed during the active window, which does assert reset (via
 +//! this diagnostic's own, already-audited `i2c::assert_reset` -- not upstream's reset sequence) as
 +//! an emergency backstop.
@@ -4395,10 +4428,31 @@ index 0000000..6c2c2e3
 +const INTERACTIVE_PHRASE: &str = "I CONFIRM THE RESERVOIR IS FILLED AND THE COVER IS CONNECTED";
 +const FINAL_PHRASE: &str = "START SUPERVISED PRIMING";
 +
++/// Confirmed against a live run on this Hub (an MT8365 Pod 3 Hub variant): `opensleep::frozen::PORT`
++/// (`/dev/ttymxc2`, correct for the devkit this fork's pinned upstream source targets) does not
++/// exist here, and `frozen::run` failed immediately with `Serial Io(NotFound)` when given it. This
++/// Hub exposes Frozen at `/dev/ttyS1` instead, still at the unmodified upstream baud rate
++/// (`frozen::manager::BAUD` = 38400) -- passed explicitly to `frozen::run`'s `port` argument
++/// (never `opensleep::frozen::PORT`) with no other change to that function's protocol, wake
++/// sequence, or state machine. See the module docs above and
++/// `tests::frozen_uart_path_is_ttys1_not_the_upstream_devkit_default`.
++const FROZEN_UART_PATH: &str = "/dev/ttyS1";
++
 +/// Per firmware-reported evidence (not independently re-derived from the pinned source audit, as
 +/// `HARD_MAX_DURATION_SECONDS` in `prime_test.rs` was): the firmware's own priming state machine
 +/// runs for up to 600000 ms.
 +const FIRMWARE_PRIMING_DURATION: Duration = Duration::from_millis(600_000);
++/// How long to wait, immediately after starting the real Frozen manager, before concluding it
++/// actually opened `FROZEN_UART_PATH` rather than having failed the way this file's own doc
++/// comments describe (`Serial Io(NotFound)`, surfaced as an immediate `Err` return from
++/// `frozen::run`'s future). A real open failure (missing device, permission denied, ...) is an
++/// immediate OS-level error; the first thing a *successful* open leads to is
++/// `FrozenState::publish_reset`, which submits an MQTT publish wrapped in a 100ms
++/// `tokio::time::timeout` that this mode's never-polled event loop cannot complete -- so a
++/// successful run always keeps `frozen::run`'s future pending for at least ~100ms before its main
++/// loop is ever reached, while a failed open resolves near-instantly. This window is kept well
++/// above that ~100ms floor for headroom without materially delaying a real run.
++const UART_OPEN_SETTLE: Duration = Duration::from_millis(500);
 +/// Hard ceiling on waiting for the real Frozen manager to report `Pong(true)` (device mode ->
 +/// Firmware) after starting. Generous relative to this binary's other subcommands'
 +/// `COMMAND_TIMEOUT` because the real wake-retry loop in `opensleep::frozen::manager::run` backs
@@ -4473,8 +4527,8 @@ index 0000000..6c2c2e3
 +        log::error!("refusing to run: /dev/i2c-1 appears to be open in another process");
 +        return Some((refused_report(args, false, "I2C device already open elsewhere"), 40));
 +    }
-+    if ownership::device_exists(opensleep::frozen::PORT) && ownership::device_is_open_elsewhere(opensleep::frozen::PORT) {
-+        log::error!("refusing to run: {} appears to be open in another process", opensleep::frozen::PORT);
++    if ownership::device_exists(FROZEN_UART_PATH) && ownership::device_is_open_elsewhere(FROZEN_UART_PATH) {
++        log::error!("refusing to run: {FROZEN_UART_PATH} appears to be open in another process");
 +        return Some((refused_report(args, false, "Frozen UART already open elsewhere"), 40));
 +    }
 +    None
@@ -4513,6 +4567,14 @@ index 0000000..6c2c2e3
 +}
 +
 +async fn run_core(args: &PrimeOpenSleepInitArgs) -> (Report, u8) {
++    // Item 4: preflight check that the Frozen UART this Hub actually exposes exists, before
++    // touching I2C at all -- see `FROZEN_UART_PATH`'s doc comment for why this differs from the
++    // upstream `frozen::PORT` default.
++    if !ownership::device_exists(FROZEN_UART_PATH) {
++        log::error!("refusing to run: {FROZEN_UART_PATH} does not exist; aborting before touching I2C");
++        return (refused_report(args, false, &format!("{FROZEN_UART_PATH} does not exist")), 20);
++    }
++
 +    // Step: the real I2C reset. Not this binary's own reimplementation -- see module docs.
 +    let mut resetter = match ResetController::new() {
 +        Ok(r) => r,
@@ -4531,6 +4593,7 @@ index 0000000..6c2c2e3
 +                OpenSleepInitResults {
 +                    reset_performed: true,
 +                    reset_ok: false,
++                    frozen_uart_requested: FROZEN_UART_PATH.to_string(),
 +                    ..Default::default()
 +                },
 +                StopReason::PreflightRefused,
@@ -4543,7 +4606,7 @@ index 0000000..6c2c2e3
 +
 +    // The real LED controller, exactly as upstream constructs it -- takes ownership of the same
 +    // I2cdev the resetter just used. Its writes are already non-fatal upstream (see
-+    // `opensleep::frozen::manager::set_led`), so nothing further is needed here.
++    // `opensleep::frozen::manager::set_led`), so nothing further is needed here (item 7).
 +    let led = IS31FL3194Controller::new(resetter.take());
 +
 +    let device_label =
@@ -4551,30 +4614,64 @@ index 0000000..6c2c2e3
 +
 +    let config = build_config();
 +    let (config_tx, config_rx) = watch::channel(config);
-+    let (calibrate_tx, calibrate_rx) = mpsc::channel(32);
++    // Sensor is intentionally never started in this mode (see module docs), but MqttManager::new
++    // still requires a calibrate-request sender -- constructed and its receive side immediately
++    // dropped, since nothing will ever poll the MQTT event loop that would deliver into it.
++    let (calibrate_tx, _calibrate_rx) = mpsc::channel(32);
 +
 +    // The real MqttManager, constructed exactly as upstream does -- but its event loop is never
 +    // polled (no wait_for_conn, no run()), so no network connection is ever attempted and a
-+    // missing/unreachable broker cannot block or fail this run. See module docs.
++    // missing/unreachable broker cannot block or fail this run (item 8). See module docs.
 +    let mqtt_man = MqttManager::new(config_tx.clone(), config_rx.clone(), calibrate_tx, device_label.clone());
 +    let mqtt_client = mqtt_man.client.clone();
 +
 +    let checkpoint_before_frozen = log_tap::checkpoint();
 +
-+    // The real Frozen manager and the real Sensor subsystem. Neither's `Future` is `Send` (both
-+    // hold a `tokio::sync::watch::Ref` internally, which wraps a non-`Send` lock guard), so unlike
-+    // this binary's other spawned tasks, they cannot be `tokio::spawn`-ed -- they are polled
-+    // directly in this task via `tokio::select!` below, exactly the way real `main.rs`'s own
-+    // top-level `select!` drives them. This is also what makes shutdown "the normal OpenSleep
-+    // manager path": there is no `.abort()` anywhere in this function -- these futures are simply
-+    // dropped when `run_core` returns, cancelling them the same way real `main.rs` cancels its
-+    // losing `select!` branches.
-+    let frozen_fut = opensleep::frozen::run(opensleep::frozen::PORT, config_rx.clone(), led, mqtt_client.clone());
++    // Item 3: log the override before opening. `opensleep::frozen::PORT` is referenced here only
++    // as the comparison value in this message -- never as an argument to anything that opens a
++    // port (see `FROZEN_UART_PATH`'s doc comment).
++    log::info!("Frozen manager UART override: {} -> {FROZEN_UART_PATH}", opensleep::frozen::PORT);
++
++    // The real Frozen manager, called with `FROZEN_UART_PATH` (never `opensleep::frozen::PORT` --
++    // item 1). Its `Future` is not `Send` (it holds a `tokio::sync::watch::Ref` internally, which
++    // wraps a non-`Send` lock guard), so unlike this binary's other spawned tasks, it cannot be
++    // `tokio::spawn`-ed -- it is polled directly in this task via `tokio::select!` below, exactly
++    // the way real `main.rs`'s own top-level `select!` drives it. This is also what makes shutdown
++    // "the normal OpenSleep manager path": there is no `.abort()` anywhere in this function -- this
++    // future is simply dropped when `run_core` returns, cancelling it the same way real `main.rs`
++    // cancels its losing `select!` branches. Nothing about the manager's protocol, wake sequence,
++    // or state machine changes (item 2): only the device path differs from upstream.
++    let frozen_fut = opensleep::frozen::run(FROZEN_UART_PATH, config_rx.clone(), led, mqtt_client.clone());
 +    tokio::pin!(frozen_fut);
-+    let sensor_fut = opensleep::sensor::run(opensleep::sensor::PORT, config_tx.clone(), config_rx.clone(), calibrate_rx, mqtt_client.clone());
-+    tokio::pin!(sensor_fut);
-+    let mut sensor_done = false;
-+    let mut sensor_status: (bool, Option<String>) = (true, None);
++
++    let mut results = OpenSleepInitResults {
++        reset_performed: true,
++        reset_ok,
++        device_label: device_label.clone(),
++        frozen_uart_requested: FROZEN_UART_PATH.to_string(),
++        ..Default::default()
++    };
++
++    // Distinguish "the port opened" from "a task was merely started" (item 6's requirement applied
++    // here to Frozen too, for the same reason): race the manager's future against
++    // `UART_OPEN_SETTLE` -- see that constant's doc comment for why this window reliably
++    // distinguishes an immediate open failure (the exact `Serial Io(NotFound)` this override
++    // exists to fix) from a real, successful open.
++    tokio::select! {
++        biased;
++        res = &mut frozen_fut => {
++            log::error!(
++                "Frozen manager exited immediately after starting -- {FROZEN_UART_PATH} likely failed to open: {res:?}"
++            );
++            results.frozen_uart_opened = false;
++            results.frozen_manager_task_running = false;
++            return (finish(args, results, StopReason::PreflightRefused, 20), 20);
++        }
++        _ = tokio::time::sleep(UART_OPEN_SETTLE) => {
++            log::info!("Frozen manager still running after {UART_OPEN_SETTLE:?}: {FROZEN_UART_PATH} opened successfully");
++            results.frozen_uart_opened = true;
++        }
++    }
 +
 +    #[derive(Debug, Clone, Copy, PartialEq)]
 +    enum Phase {
@@ -4588,32 +4685,22 @@ index 0000000..6c2c2e3
 +    let mut observe_deadline = Instant::now();
 +    let mut scanned_up_to = checkpoint_before_frozen;
 +    let mut phase = Phase::WaitingForFirmware;
-+    let mut results = OpenSleepInitResults {
-+        reset_performed: true,
-+        reset_ok,
-+        device_label: device_label.clone(),
-+        ..Default::default()
-+    };
++    let mut frozen_task_crashed = false;
 +
-+    // Steps 5-13, all driven by one loop so `frozen_fut`/`sensor_fut` are polled continuously
-+    // throughout: wait for Pong(true), wait for startup messages to settle, refuse to send Prime
-+    // if capwater is unavailable, then observe the real scheduler's single Prime send for up to
-+    // the firmware-reported priming duration.
++    // Steps 9-13, all driven by one loop so `frozen_fut` is polled continuously throughout: let
++    // the real, unmodified manager perform its own Ping/JumpToFirmware/wake sequence and obtain
++    // hardware information (item 9), wait for startup messages to settle, refuse to send Prime if
++    // capwater is unavailable, then observe the real scheduler's single Prime send -- which only
++    // ever fires once the manager's own `state.is_awake()` is true, i.e. application firmware has
++    // demonstrably been reached (item 10) -- for up to the firmware-reported priming duration.
 +    let stop_reason = 'main: loop {
 +        tokio::select! {
 +            biased;
 +            reason = wait_for_termination_signal() => break 'main reason,
 +            res = &mut frozen_fut => {
 +                log::error!("Frozen task unexpectedly exited: {res:?}");
++                frozen_task_crashed = true;
 +                break 'main StopReason::UartReadFailure;
-+            }
-+            res = &mut sensor_fut, if !sensor_done => {
-+                sensor_done = true;
-+                sensor_status = match res {
-+                    Ok(()) => (true, Some("Sensor task exited normally (unexpected but non-fatal)".to_string())),
-+                    Err(e) => (false, Some(e.to_string())),
-+                };
-+                continue 'main;
 +            }
 +            _ = tokio::time::sleep(LOG_POLL_INTERVAL) => match phase {
 +                Phase::WaitingForFirmware => {
@@ -4641,6 +4728,8 @@ index 0000000..6c2c2e3
 +                            log::error!("refusing to send Prime: [capwater] sensor unavailable as a result of this run's own initialization");
 +                            log::error!("initialization sequence and subsystem state that produced this:");
 +                            log::error!("  subsystem reset performed: {} (ok: {reset_ok})", results.reset_performed);
++                            log::error!("  Frozen UART requested: {}", results.frozen_uart_requested);
++                            log::error!("  Frozen UART opened: {}", results.frozen_uart_opened);
 +                            log::error!("  Frozen reached application firmware: true");
 +                            log::error!("  [flowrate] sensor unavailable observed: {flowrate_unavailable}");
 +                            for line in log_tap::since(checkpoint_before_frozen) {
@@ -4659,6 +4748,7 @@ index 0000000..6c2c2e3
 +                    for line in &lines {
 +                        if line.target.starts_with("opensleep::frozen::manager") && line.message == " -> Prime" {
 +                            results.prime_sent_count += 1;
++                            results.prime_sent = true;
 +                        }
 +                        if line.target.starts_with("opensleep::frozen::state") {
 +                            // Step 11: do not stop immediately after "start" -- only "done"/"done
@@ -4684,13 +4774,7 @@ index 0000000..6c2c2e3
 +        }
 +    };
 +
-+    if !sensor_done {
-+        results.sensor_subsystem_started = true;
-+        results.sensor_subsystem_error = None;
-+    } else {
-+        results.sensor_subsystem_started = sensor_status.0;
-+        results.sensor_subsystem_error = sensor_status.1;
-+    }
++    results.frozen_manager_task_running = !frozen_task_crashed;
 +
 +    let prime_outcome = if results.normal_done_observed {
 +        PrimeOutcome::Success
@@ -4727,8 +4811,8 @@ index 0000000..6c2c2e3
 +
 +    // Preflight-style refusals (never reached firmware, or capwater unavailable) use this binary's
 +    // usual exit code 30 for a refused run; once past both checks this is a normal active-test
-+    // outcome (0 on success, 1 otherwise). `frozen_fut`/`sensor_fut` are dropped here, cancelling
-+    // them -- the same drop-based shutdown real main.rs's own select! already uses.
++    // outcome (0 on success, 1 otherwise). `frozen_fut` is dropped here, cancelling it -- the same
++    // drop-based shutdown real main.rs's own select! already uses.
 +    let exit_code = if !results.frozen_reached_firmware || results.capwater_unavailable_observed {
 +        30
 +    } else if prime_outcome == PrimeOutcome::Success {
@@ -4783,8 +4867,8 @@ index 0000000..6c2c2e3
 +    report.i2c_bus_open = true;
 +    report.subsystem_reset_performed = results.reset_performed;
 +    report.subsystem_reset_ok = results.reset_ok;
-+    report.frozen_port = opensleep::frozen::PORT.to_string();
-+    report.frozen_uart_opened = results.reset_performed;
++    report.frozen_port = results.frozen_uart_requested.clone();
++    report.frozen_uart_opened = results.frozen_uart_opened;
 +    report.frozen_firmware_ping = Some(results.frozen_reached_firmware);
 +    report.prime_command_count = results.prime_sent_count;
 +    report.priming_done_observed = results.normal_done_observed || results.done_because_empty_observed;
@@ -4858,7 +4942,7 @@ index 0000000..6c2c2e3
 +        led_controller_probe_ok: false,
 +        subsystem_reset_performed: false,
 +        subsystem_reset_ok: false,
-+        frozen_port: opensleep::frozen::PORT.to_string(),
++        frozen_port: FROZEN_UART_PATH.to_string(),
 +        frozen_uart_opened: false,
 +        frozen_bootloader_ping: None,
 +        frozen_firmware_ping: None,
@@ -5002,6 +5086,39 @@ index 0000000..6c2c2e3
 +        let now = Timestamp::now().to_zoned(cfg.timezone.clone()).time();
 +        let diff = now.duration_until(cfg.prime).abs();
 +        assert!(diff < jiff::SignedDuration::from_secs(5));
++    }
++
++    /// Item 12: regression test proving this Hub variant uses `/dev/ttyS1`, not
++    /// `opensleep::frozen::PORT` (`/dev/ttymxc2`, correct for the MT8365 devkit the pinned
++    /// upstream source was written against but confirmed absent on this Hub -- see
++    /// `FROZEN_UART_PATH`'s doc comment for the `Serial Io(NotFound)` evidence). Guards against a
++    /// future edit accidentally reintroducing the upstream default, e.g. by "simplifying" the
++    /// `frozen::run` call back to the symbolic constant.
++    #[test]
++    fn frozen_uart_path_is_ttys1_not_the_upstream_devkit_default() {
++        assert_eq!(FROZEN_UART_PATH, "/dev/ttyS1");
++        assert_ne!(
++            FROZEN_UART_PATH,
++            opensleep::frozen::PORT,
++            "this Hub's confirmed Frozen UART path must differ from the upstream MT8365-devkit default"
++        );
++    }
++
++    /// Complements `main.rs`'s `guardrail_tests::obsolete_devkit_uart_paths_are_never_hardcoded_anywhere`
++    /// with a check local to this file: even the one legitimate reference to
++    /// `opensleep::frozen::PORT` (the logged override comparison) must never be passed anywhere
++    /// that would open a port with it.
++    #[test]
++    fn frozen_run_is_never_called_with_the_upstream_port_constant() {
++        let path = concat!(
++            env!("CARGO_MANIFEST_DIR"),
++            "/src/bin/opensleep-diagnostic/prime_opensleep_init.rs"
++        );
++        let src = std::fs::read_to_string(path).expect("readable source file");
++        assert!(
++            !src.contains("frozen::run(opensleep::frozen::PORT"),
++            "frozen::run must always be called with FROZEN_UART_PATH, never opensleep::frozen::PORT"
++        );
 +    }
 +}
 diff --git a/src/bin/opensleep-diagnostic/prime_test.rs b/src/bin/opensleep-diagnostic/prime_test.rs
@@ -6510,10 +6627,10 @@ index 0000000..7e88c1a
 +}
 diff --git a/src/bin/opensleep-diagnostic/report.rs b/src/bin/opensleep-diagnostic/report.rs
 new file mode 100644
-index 0000000..370e89c
+index 0000000..65ef132
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/report.rs
-@@ -0,0 +1,515 @@
+@@ -0,0 +1,530 @@
 +//! Structured JSON/CSV/text reporting shared by all three subcommands. Machine evidence (audit
 +//! log, decoded telemetry) is always kept in separate fields from operator-entered observations,
 +//! per the safety model: a component may only be marked PASS from decoded evidence or an explicit
@@ -6725,19 +6842,34 @@ index 0000000..370e89c
 +/// `frozen-prime-opensleep-init`'s report: this mode runs the real, unmodified upstream
 +/// initialization/manager code (`ResetController::reset_subsystems`, `frozen::run`, ...) rather
 +/// than the diagnostic's own transport, so its evidence is what was observed in the real log
-+/// stream those functions emit, not a locally-audited command log.
++/// stream those functions emit, not a locally-audited command log. The Sensor subsystem is never
++/// started in this mode at all (see `prime_opensleep_init.rs` module docs), so there is no
++/// Sensor-related field here to report.
 +#[derive(Debug, Clone, Serialize, Default)]
 +pub struct OpenSleepInitResults {
 +    pub reset_performed: bool,
 +    pub reset_ok: bool,
 +    pub device_label: String,
-+    pub sensor_subsystem_started: bool,
-+    pub sensor_subsystem_error: Option<String>,
++    /// The Frozen UART path this run asked `frozen::run` to open -- this Hub's confirmed
++    /// `/dev/ttyS1`, never the upstream `opensleep::frozen::PORT` default.
++    pub frozen_uart_requested: String,
++    /// Whether the Frozen manager's own future was still running `UART_OPEN_SETTLE` after being
++    /// started, rather than having resolved immediately with an open error -- see that constant's
++    /// doc comment for why this distinguishes "opened" from merely "a task was started".
++    pub frozen_uart_opened: bool,
++    /// Whether the Frozen manager task was still running (had not crashed/exited on its own) as of
++    /// the end of this run's observation loop.
++    pub frozen_manager_task_running: bool,
 +    pub frozen_reached_firmware: bool,
 +    pub capwater_unavailable_observed: bool,
 +    pub flowrate_unavailable_observed: bool,
 +    pub prime_outcome: PrimeOutcome,
++    /// Real per-run count of `" -> Prime"` log lines observed from the real Frozen manager. Should
++    /// never exceed 1 -- the manager's own scheduler debounce is what enforces that, not a count
++    /// kept by this binary (see `prime_opensleep_init.rs` module docs).
 +    pub prime_sent_count: u32,
++    /// `true` iff `prime_sent_count > 0`. A plain boolean alongside the count for report clarity.
++    pub prime_sent: bool,
 +    pub normal_done_observed: bool,
 +    pub done_because_empty_observed: bool,
 +    pub emergency_reset_asserted: bool,
@@ -6986,14 +7118,14 @@ index 0000000..370e89c
 +            log::info!("-- opensleep-init results --");
 +            log::info!("  Subsystem reset performed/ok:    {}/{}", oi.reset_performed, oi.reset_ok);
 +            log::info!("  Device label:                    {}", oi.device_label);
-+            log::info!("  Sensor subsystem started:        {}", oi.sensor_subsystem_started);
-+            if let Some(e) = &oi.sensor_subsystem_error {
-+                log::info!("  Sensor subsystem error:          {e}");
-+            }
++            log::info!("  Frozen UART requested:           {}", oi.frozen_uart_requested);
++            log::info!("  Frozen UART opened:              {}", oi.frozen_uart_opened);
++            log::info!("  Frozen manager task running:     {}", oi.frozen_manager_task_running);
 +            log::info!("  Frozen reached firmware:         {}", oi.frozen_reached_firmware);
 +            log::info!("  [capwater] unavailable observed: {}", oi.capwater_unavailable_observed);
 +            log::info!("  [flowrate] unavailable observed: {}", oi.flowrate_unavailable_observed);
 +            log::info!("  Prime outcome:                   {}", oi.prime_outcome);
++            log::info!("  Prime sent:                      {}", oi.prime_sent);
 +            log::info!("  Prime sent count:                {}", oi.prime_sent_count);
 +            log::info!("  Normal done observed:            {}", oi.normal_done_observed);
 +            log::info!("  Done because empty observed:     {}", oi.done_because_empty_observed);
