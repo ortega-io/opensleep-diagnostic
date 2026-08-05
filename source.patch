@@ -4272,10 +4272,10 @@ index 0000000..0acd6b8
 +}
 diff --git a/src/bin/opensleep-diagnostic/prime_opensleep_init.rs b/src/bin/opensleep-diagnostic/prime_opensleep_init.rs
 new file mode 100644
-index 0000000..e3dc648
+index 0000000..6c2c2e3
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/prime_opensleep_init.rs
-@@ -0,0 +1,705 @@
+@@ -0,0 +1,728 @@
 +//! `frozen-prime-opensleep-init`: fills an empty or partially-filled hydraulic loop by sending
 +//! `Prime` exactly once, through the real, unmodified upstream OpenSleep initialization and Frozen
 +//! manager code -- `opensleep::reset::ResetController::reset_subsystems`, `opensleep::led`,
@@ -4815,6 +4815,13 @@ index 0000000..e3dc648
 +    };
 +    report.stop_reason = "dry run: real initialization skipped entirely".to_string();
 +    report.opensleep_init_results = Some(OpenSleepInitResults::default());
++    report.exit_code = 0;
++
++    if let Some(path) = &args.json_output
++        && let Err(e) = report.write_json(path)
++    {
++        log::error!("failed to write JSON output to {path}: {e}");
++    }
 +    report.print_table();
 +    report
 +}
@@ -4945,10 +4952,26 @@ index 0000000..e3dc648
 +    async fn dry_run_performs_no_real_initialization_and_reports_that() {
 +        let (report, code) = run(&args()).await;
 +        assert_eq!(code, 0);
++        assert_eq!(report.exit_code, 0, "the report's own exit_code field must match the returned code");
 +        assert!(report.dry_run);
 +        let oi = report.opensleep_init_results.expect("opensleep_init_results must be set");
 +        assert!(!oi.reset_performed);
 +        assert_eq!(oi.prime_outcome, PrimeOutcome::NotSent);
++    }
++
++    #[tokio::test]
++    async fn dry_run_writes_the_json_output_file_when_requested() {
++        let path = std::env::temp_dir().join(format!(
++            "opensleep-diagnostic-init-dry-run-test-{}.json",
++            std::process::id()
++        ));
++        let mut a = args();
++        a.json_output = Some(path.to_str().unwrap().to_string());
++        let (_, code) = run(&a).await;
++        assert_eq!(code, 0);
++        let contents = std::fs::read_to_string(&path).expect("dry-run must write the JSON output file");
++        assert!(contents.contains("\"mode\""));
++        let _ = std::fs::remove_file(&path);
 +    }
 +
 +    #[test]
