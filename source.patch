@@ -109,10 +109,10 @@ index 0000000..dcd3e78
 +}
 diff --git a/src/bin/opensleep-diagnostic/cli.rs b/src/bin/opensleep-diagnostic/cli.rs
 new file mode 100644
-index 0000000..f031c25
+index 0000000..4000a16
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/cli.rs
-@@ -0,0 +1,161 @@
+@@ -0,0 +1,162 @@
 +//! CLI surface. Every flag here maps to a fixed, validated field -- there is no flag that accepts
 +//! a raw opcode, a raw frame, or an arbitrary absolute temperature target. Side selection is a
 +//! closed `ValueEnum`; the cooling delta and duration are validated in `cool_test.rs` against
@@ -209,8 +209,9 @@ index 0000000..f031c25
 +    #[arg(long, default_value_t = 1.0)]
 +    pub delta_c: f64,
 +
-+    /// Active-phase duration in seconds. Hard-capped at 30 seconds; no flag can raise that cap.
-+    #[arg(long, default_value_t = 15)]
++    /// Active-phase duration in seconds. Defaults to a conservative 10 seconds for a first test;
++    /// hard-capped at 30 seconds regardless -- no flag can raise that cap.
++    #[arg(long, default_value_t = 10)]
 +    pub duration_seconds: u64,
 +
 +    /// Required: operator declares the hydraulic cover is connected
@@ -276,27 +277,38 @@ index 0000000..f031c25
 +}
 diff --git a/src/bin/opensleep-diagnostic/cool_test.rs b/src/bin/opensleep-diagnostic/cool_test.rs
 new file mode 100644
-index 0000000..da6f253
+index 0000000..36efafb
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/cool_test.rs
-@@ -0,0 +1,947 @@
+@@ -0,0 +1,1512 @@
 +//! `frozen-cool-test`: the one subcommand that intentionally activates a cooling channel. Every
 +//! hard limit here (max delta, max duration, baseline range, heatsink ceiling) is a compile-time
 +//! constant; no CLI flag can raise any of them. See SAFETY.md for the operator-facing version of
 +//! this file's guarantees.
++//!
++//! Safety telemetry (baseline validation and the active-phase per-tick checks) is driven
++//! exclusively by the unsolicited `TemperatureUpdate` push (raw opcode 0x41, the same byte as the
++//! `GetTemperatures` command itself -- Frozen appears to broadcast this on its own schedule,
++//! independent of being polled). The solicited `GetTemperature` reply (opcode 0xC1) is still
++//! requested each tick and, if it decodes, preserved in the report as raw evidence, but it is
++//! never required: real hardware has been observed sending a 14-byte 0xC1 frame, while
++//! `FrozenPacket::parse_get_temperature` (reused unmodified from `opensleep`) requires exactly 27
++//! bytes and so never decodes it. See PROTOCOL_AUDIT.md for the full account.
 +
 +use std::io::IsTerminal;
 +use std::time::Duration;
 +
 +use opensleep::common::packet::BedSide;
-+use opensleep::frozen::packet::GetTemperature;
++use opensleep::frozen::FrozenPacket;
++use opensleep::frozen::packet::TemperatureUpdate;
 +use tokio::io::{AsyncRead, AsyncWrite};
++use tokio::sync::mpsc;
 +use tokio::time::Instant;
 +
 +use crate::buildinfo::{DIAGNOSTIC_VERSION, kernel_release, source_commit};
 +use crate::cli::CoolTestArgs;
 +use crate::i2c::{I2cPort, MockI2c, RealI2c, probe_address, run_reset_sequence};
-+use crate::link::FrozenLink;
++use crate::link::{FrozenLink, LinkError, PacketOutcome};
 +use crate::mock::mock_frozen_link_pair;
 +use crate::ownership;
 +use crate::report::{
@@ -305,7 +317,7 @@ index 0000000..da6f253
 +use crate::safe_stop::run_safe_stop;
 +use crate::safety::{AuditedTransport, FrozenAction, Mode};
 +use crate::signals::{StopReason, wait_for_termination_signal};
-+use crate::telemetry::{PacketStats, sample_from_get_temperature};
++use crate::telemetry::{PacketStats, sample_from_get_temperature, sample_from_temperature_update};
 +
 +const COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 +
@@ -319,14 +331,24 @@ index 0000000..da6f253
 +/// A single-tick (~1s) water-temperature jump larger than this is treated as implausible/sensor
 +/// fault rather than real cooling, since real thermal mass cannot move this fast.
 +pub const MAX_PLAUSIBLE_TICK_JUMP_CENTIDEG: i32 = 300;
-+/// See `telemetry::TemperatureSample::error_deg` docs: treated as a PID error term, not a fault
-+/// code, per source evidence. This is a coarse backstop against wildly abnormal values only.
-+#[allow(dead_code)]
-+pub const MAX_PLAUSIBLE_ERROR_DEG: u8 = 20;
 +pub const BASELINE_MIN_SAMPLES: usize = 5;
 +pub const BASELINE_MIN_WINDOW: Duration = Duration::from_secs(5);
 +pub const BASELINE_MAX_SPREAD_CENTIDEG: i32 = 300;
++/// No fresh, valid unsolicited `TemperatureUpdate` for longer than this aborts the active phase.
 +pub const STALE_TELEMETRY_LIMIT: Duration = Duration::from_secs(2);
++/// How long after the enable command is accepted the selected-side pump is allowed to keep
++/// reporting off/0V before that is treated as an abort condition. Evidence-gated: only fires if a
++/// firmware pump message for our side was actually observed reporting zero voltage -- see
++/// `parse_pump_report`.
++pub const PUMP_CONFIRM_GRACE: Duration = Duration::from_secs(3);
++/// How long after the active phase starts before generic firmware fault keywords (see
++/// `is_generic_fault_message`) are treated as fatal, rather than logged only. Chosen conservatively
++/// (matching `STALE_TELEMETRY_LIMIT`'s magnitude) since no documented firmware startup-timing spec
++/// exists; a short window avoids mistaking benign boot-time chatter right after the enable command
++/// for a real fault.
++pub const FAULT_KEYWORD_GRACE: Duration = Duration::from_secs(2);
++/// Length of each drain window within one ~1-second active-phase/baseline-collection tick.
++const TICK_DRAIN_WINDOW: Duration = Duration::from_millis(900);
 +
 +const INTERACTIVE_PHRASE: &str = "I CONFIRM THE WATER LOOP IS CONNECTED AND FILLED";
 +
@@ -363,7 +385,7 @@ index 0000000..da6f253
 +        let mut i2c = MockI2c::always_succeed();
 +        let (client, task) = mock_frozen_link_pair();
 +        let mut link = FrozenLink::wrap(client, "dry-run");
-+        let result = run_core(args, &mut i2c, Some(&mut link), true).await;
++        let result = run_core(args, &mut i2c, Some(&mut link), true, None).await;
 +        drop(link);
 +        task.abort();
 +        return result;
@@ -389,7 +411,7 @@ index 0000000..da6f253
 +        }
 +    };
 +
-+    run_core(args, &mut i2c, link.as_mut(), false).await
++    run_core(args, &mut i2c, link.as_mut(), false, None).await
 +}
 +
 +fn refuse_if_owned(args: &CoolTestArgs) -> Option<(Report, u8)> {
@@ -429,17 +451,103 @@ index 0000000..da6f253
 +    line.trim_end_matches(['\n', '\r']) == expected
 +}
 +
++/// Spawns a background thread that reads lines from stdin for as long as the process runs, and
++/// forwards each trimmed line into the returned channel. Returns `None` (no thread spawned) when
++/// stdin is not a TTY, matching every other interactive-input gate in this binary. Only ever
++/// called from `run_core` after every blocking confirmation-phrase read has already completed, so
++/// it never races those reads for the same stdin.
++fn spawn_operator_abort_watcher() -> Option<mpsc::UnboundedReceiver<String>> {
++    if !std::io::stdin().is_terminal() {
++        return None;
++    }
++    let (tx, rx) = mpsc::unbounded_channel();
++    std::thread::spawn(move || {
++        let stdin = std::io::stdin();
++        loop {
++            let mut line = String::new();
++            match stdin.read_line(&mut line) {
++                Ok(0) | Err(_) => break,
++                Ok(_) => {
++                    if tx.send(line.trim().to_string()).is_err() {
++                        break;
++                    }
++                }
++            }
++        }
++    });
++    Some(rx)
++}
++
++/// True if `line` should abort the active test: an explicit operator report of a leak, burning
++/// smell, or abnormal noise, or the literal word ABORT.
++fn is_operator_abort_line(line: &str) -> bool {
++    let lower = line.to_lowercase();
++    lower.contains("leak") || lower.contains("smell") || lower.contains("noise") || lower.trim() == "abort"
++}
++
++/// Parses a firmware pump message for the given side (e.g. `FW: pump[left] slow @ 6.03V 0.17A`,
++/// per the captured evidence in `frozen/command.rs`). Returns `Some(true)` if it reports nonzero
++/// voltage (pump confirmed running), `Some(false)` if it explicitly reports "off" or 0.000000V,
++/// or `None` if this message is not about our side's pump at all.
++fn parse_pump_report(msg: &str, side_word: &str) -> Option<bool> {
++    let lower = msg.to_lowercase();
++    let marker = format!("pump[{side_word}]");
++    let idx = lower.find(&marker)?;
++    let rest = &lower[idx + marker.len()..];
++    if rest.trim_start().starts_with("off") {
++        return Some(false);
++    }
++    let at = rest.find('@')?;
++    let after_at = &rest[at + 1..];
++    let vpos = after_at.find('v')?;
++    let num_str = after_at[..vpos].trim();
++    let voltage: f64 = num_str.parse().ok()?;
++    Some(voltage > 0.0005)
++}
++
++/// True if `msg` names the selected TEC as locked. Matched narrowly (both "tec" and "lock" must
++/// appear) so this does not fire on unrelated messages.
++fn is_tec_locked_message(msg: &str) -> bool {
++    let lower = msg.to_lowercase();
++    lower.contains("tec") && lower.contains("lock")
++}
++
++const FAULT_KEYWORDS: [&str; 6] = ["overtemperature", "overcurrent", "shutdown", "fault", "failed", "locked"];
++
++/// Generic firmware-fault keyword scan. Excludes the literal substring "flash locked": that is a
++/// captured, evidenced, benign boot-time firmware message (`frozen/command.rs` source comment,
++/// paired with "cal_info valid"), not an actuator/safety fault, and would otherwise false-trigger
++/// on the word "locked" alone.
++fn is_generic_fault_message(msg: &str) -> bool {
++    let lower = msg.to_lowercase();
++    if lower.contains("flash locked") {
++        return false;
++    }
++    FAULT_KEYWORDS.iter().any(|kw| lower.contains(kw))
++}
++
++/// True if a firmware `Message` about the selected water/heatsink sensor is a known, non-fatal
++/// "sensor unavailable" notice (e.g. "FW: [capwater] sensor unavailable", "FW: [flowrate] sensor
++/// unavailable") rather than an active fault. These have been observed to persist with the cover
++/// connected and the reservoir filled; recorded as warnings, never treated as fatal by themselves.
++fn is_known_nonfatal_sensor_message(msg: &str) -> bool {
++    let lower = msg.to_lowercase();
++    lower.contains("sensor unavailable")
++}
++
 +async fn run_core<T, P>(
 +    args: &CoolTestArgs,
 +    i2c: &mut P,
 +    mut link: Option<&mut FrozenLink<T>>,
 +    dry_run: bool,
++    operator_abort_rx_override: Option<mpsc::UnboundedReceiver<String>>,
 +) -> (Report, u8)
 +where
 +    T: AsyncRead + AsyncWrite + Unpin,
 +    P: I2cPort,
 +{
 +    let side: BedSide = args.side.into();
++    let side_tag = side_word(side);
 +    let mut audit = AuditedTransport::new(Mode::CoolTest { side });
 +    let mut stats = PacketStats::default();
 +    let mut samples: Vec<TemperatureSampleJson> = Vec::new();
@@ -467,6 +575,8 @@ index 0000000..da6f253
 +        reached_firmware = crate::frozen_ops::jump_to_firmware_and_wait(link, &mut audit, COMMAND_TIMEOUT).await;
 +    }
 +
++    // Explicitly disable both sides before doing anything else: the selected side will be the
++    // only one ever enabled below, and the other side is kept disabled for the whole run.
 +    for s in [BedSide::Left, BedSide::Right] {
 +        let _ = link.send(&mut audit, FrozenAction::safety_off(s), COMMAND_TIMEOUT).await;
 +    }
@@ -479,24 +589,61 @@ index 0000000..da6f253
 +        );
 +    }
 +
-+    // Preflight step 8-11: at least 5 valid samples over at least 5 seconds.
++    // Preflight step 8-11: at least 5 valid samples over at least 5 seconds, from unsolicited
++    // TemperatureUpdate pushes -- see module docs for why the solicited GetTemperature reply is
++    // not relied on here.
 +    let baseline_start = Instant::now();
-+    let mut baseline_samples: Vec<GetTemperature> = Vec::new();
-+    while baseline_samples.len() < BASELINE_MIN_SAMPLES || baseline_start.elapsed() < BASELINE_MIN_WINDOW {
-+        if let Some(g) = crate::frozen_ops::get_temperatures_once(link, &mut audit, COMMAND_TIMEOUT).await {
-+            let elapsed_ms = baseline_start.elapsed().as_millis() as u64;
-+            samples.push((&sample_from_get_temperature(elapsed_ms, jiff::Timestamp::now().to_string(), &g)).into());
-+            baseline_samples.push(g);
-+        } else {
++    let mut baseline_updates: Vec<TemperatureUpdate> = Vec::new();
++    while baseline_updates.len() < BASELINE_MIN_SAMPLES || baseline_start.elapsed() < BASELINE_MIN_WINDOW {
++        if let Err(e) = link.send_only(&mut audit, FrozenAction::get_temperatures()).await {
++            log::error!("failed to send GetTemperatures during baseline collection: {e}");
 +            stats.record_timeout();
 +        }
++
++        let drain_deadline = Instant::now() + TICK_DRAIN_WINDOW;
++        loop {
++            let remaining = drain_deadline.saturating_duration_since(Instant::now());
++            if remaining.is_zero() {
++                break;
++            }
++            match link.recv(remaining).await {
++                Ok(PacketOutcome::Received(pkt)) => {
++                    stats.record(&pkt);
++                    let elapsed_ms = baseline_start.elapsed().as_millis() as u64;
++                    match pkt {
++                        FrozenPacket::TemperatureUpdate(u) => {
++                            samples.push(
++                                (&sample_from_temperature_update(elapsed_ms, jiff::Timestamp::now().to_string(), &u))
++                                    .into(),
++                            );
++                            baseline_updates.push(u);
++                        }
++                        // Raw evidence only, per module docs -- never required or used for
++                        // baseline validation.
++                        FrozenPacket::GetTemperature(g) => {
++                            samples.push(
++                                (&sample_from_get_temperature(elapsed_ms, jiff::Timestamp::now().to_string(), &g))
++                                    .into(),
++                            );
++                        }
++                        _ => {}
++                    }
++                }
++                Ok(PacketOutcome::TimedOut) => break,
++                Ok(PacketOutcome::Closed) => break,
++                Err(e) => {
++                    log::debug!("baseline collection: {e}");
++                    break;
++                }
++            }
++        }
++
 +        if baseline_start.elapsed() > BASELINE_MIN_WINDOW * 4 {
 +            break; // hard backstop against an unbounded preflight if telemetry never stabilizes
 +        }
-+        tokio::time::sleep(Duration::from_millis(200)).await;
 +    }
 +
-+    let baseline = match validate_baseline(&baseline_samples, side) {
++    let baseline = match validate_baseline(&baseline_updates, side) {
 +        Some(b) => b,
 +        None => {
 +            log::error!("refusing to run active test: baseline temperature did not pass validation");
@@ -535,12 +682,27 @@ index 0000000..da6f253
 +        );
 +    }
 +
++    // All blocking stdin reads for confirmation phrases are complete by this point, so it is now
++    // safe to start reading stdin in the background for operator-reported abort conditions
++    // without racing the reads above.
++    let mut operator_abort_rx = match operator_abort_rx_override {
++        Some(rx) => Some(rx),
++        None => spawn_operator_abort_watcher(),
++    };
++
 +    // Active execution.
 +    let send_result = link.send(&mut audit, action, COMMAND_TIMEOUT).await;
 +    cr.frozen_command_accepted = match &send_result {
 +        Ok(_) => Verdict::Pass,
 +        Err(_) => Verdict::Fail,
 +    };
++    if send_result.is_ok() {
++        eprintln!(
++            "If you observe a leak, a burning smell, or abnormal noise, type ABORT and press Enter \
++             (or press Ctrl+C) to stop immediately."
++        );
++    }
++    let we_enabled_side = send_result.is_ok();
 +
 +    let active_start = Instant::now();
 +    let duration = Duration::from_secs(args.duration_seconds.min(HARD_MAX_DURATION_SECONDS));
@@ -551,6 +713,8 @@ index 0000000..da6f253
 +    #[allow(unused_assignments)]
 +    let mut stop_reason = StopReason::Normal;
 +    let mut telemetry_ok = true;
++    let mut pump_confirmed_running = false;
++    let mut pump_last_report_off = false;
 +
 +    'active: loop {
 +        if active_start.elapsed() >= duration {
@@ -558,88 +722,162 @@ index 0000000..da6f253
 +            break;
 +        }
 +
-+        let tick_started_at = Instant::now();
-+        let tick = tokio::time::timeout(Duration::from_millis(1100), async {
-+            link.send(&mut audit, FrozenAction::get_temperatures(), COMMAND_TIMEOUT).await
-+        });
-+
-+        tokio::select! {
-+            biased;
-+            reason = wait_for_termination_signal() => {
-+                stop_reason = reason;
-+                break 'active;
-+            }
-+            result = tick => {
-+                match result {
-+                    Ok(Ok(crate::link::PacketOutcome::Received(opensleep::frozen::FrozenPacket::GetTemperature(g)))) => {
-+                        last_valid_at = Instant::now();
-+                        let elapsed_ms = active_start.elapsed().as_millis() as u64;
-+                        samples.push((&sample_from_get_temperature(elapsed_ms, jiff::Timestamp::now().to_string(), &g)).into());
-+                        active_left_c.push(crate::telemetry::centideg_to_celsius(g.left_temp));
-+                        active_right_c.push(crate::telemetry::centideg_to_celsius(g.right_temp));
-+
-+                        // Isolated behind `catch_unwind`: `evaluate_tick` is a small, pure,
-+                        // panic-free-by-design function, but wrapping it means a future bug here
-+                        // (an overflow, an added `unwrap()`) cannot bring down the whole active
-+                        // loop before safe-stop runs -- see `signals.rs` module docs.
-+                        match std::panic::catch_unwind(|| evaluate_tick(&g, side, prev_side_centideg)) {
-+                            Ok(Ok(side_centideg)) => prev_side_centideg = Some(side_centideg),
-+                            Ok(Err(reason)) => {
-+                                stop_reason = reason;
-+                                telemetry_ok = false;
-+                                break 'active;
-+                            }
-+                            Err(_panic) => {
-+                                log::error!("panic while evaluating a temperature sample; stopping safely");
-+                                stop_reason = StopReason::Panic;
-+                                telemetry_ok = false;
-+                                break 'active;
-+                            }
-+                        }
-+                    }
-+                    Ok(Ok(crate::link::PacketOutcome::Received(_other))) => { /* an unrelated decoded packet; fall through to staleness check */ }
-+                    Ok(Ok(crate::link::PacketOutcome::TimedOut)) => { /* no response this tick; fall through to staleness check */ }
-+                    Ok(Ok(crate::link::PacketOutcome::Closed)) => {
-+                        stop_reason = StopReason::TelemetryLost;
-+                        telemetry_ok = false;
-+                        break 'active;
-+                    }
-+                    Ok(Err(crate::link::LinkError::WriteIo(e))) => {
-+                        log::error!("UART write failure during active phase: {e}");
-+                        stop_reason = StopReason::UartWriteFailure;
-+                        telemetry_ok = false;
-+                        break 'active;
-+                    }
-+                    Ok(Err(crate::link::LinkError::ReadIo(e))) => {
-+                        log::error!("UART read failure during active phase: {e}");
-+                        stop_reason = StopReason::UartReadFailure;
-+                        telemetry_ok = false;
-+                        break 'active;
-+                    }
-+                    Ok(Err(crate::link::LinkError::Safety(_))) => { /* structurally unreachable: GetTemperatures is always whitelisted */ }
-+                    Err(_elapsed) => { /* outer 1100ms guard fired; fall through to staleness check */ }
-+                }
-+                if last_valid_at.elapsed() > STALE_TELEMETRY_LIMIT {
-+                    stop_reason = StopReason::TelemetryStale;
-+                    telemetry_ok = false;
-+                    break 'active;
-+                }
-+            }
++        // Best-effort solicited nudge: preserved/logged as raw evidence only if a reply happens
++        // to decode (see module docs). A write failure here is a real UART communication failure
++        // and does abort the run.
++        if let Err(e) = link.send_only(&mut audit, FrozenAction::get_temperatures()).await {
++            log::error!("UART write failure during active phase: {e}");
++            stop_reason = StopReason::UartWriteFailure;
++            telemetry_ok = false;
++            break 'active;
 +        }
 +
-+        // Pace to ~1 poll/second even when the device answers almost instantly (e.g. the mocked
-+        // device used by --dry-run and tests): "poll at least once per second" must not become
-+        // an unpaced flood of real commands against real hardware.
-+        let since_tick_start = tick_started_at.elapsed();
-+        if since_tick_start < Duration::from_secs(1) {
++        let drain_deadline = Instant::now() + TICK_DRAIN_WINDOW;
++        loop {
++            let remaining = drain_deadline.saturating_duration_since(Instant::now());
++            if remaining.is_zero() {
++                break;
++            }
 +            tokio::select! {
 +                biased;
 +                reason = wait_for_termination_signal() => {
 +                    stop_reason = reason;
 +                    break 'active;
 +                }
-+                _ = tokio::time::sleep(Duration::from_secs(1) - since_tick_start) => {}
++                maybe_line = async {
++                    match operator_abort_rx.as_mut() {
++                        Some(rx) => rx.recv().await,
++                        None => std::future::pending().await,
++                    }
++                } => {
++                    match maybe_line {
++                        Some(line) if is_operator_abort_line(&line) => {
++                            log::error!("operator-reported abort: {line:?}");
++                            stop_reason = StopReason::OperatorAbort;
++                            telemetry_ok = false;
++                            break 'active;
++                        }
++                        Some(line) => {
++                            log::info!("ignoring unrecognized operator input during active phase: {line:?}");
++                        }
++                        None => {
++                            // The channel closed (sender dropped, e.g. stdin hit EOF). Stop
++                            // polling it: with `biased` select ordering, a closed channel
++                            // resolves to `None` instantly on every poll, which would otherwise
++                            // starve `link.recv()` below forever and falsely stale out telemetry.
++                            operator_abort_rx = None;
++                        }
++                    }
++                }
++                outcome = link.recv(remaining) => {
++                    match outcome {
++                        Ok(PacketOutcome::Received(FrozenPacket::TemperatureUpdate(u))) => {
++                            stats.record(&FrozenPacket::TemperatureUpdate(u.clone()));
++                            last_valid_at = Instant::now();
++                            let elapsed_ms = active_start.elapsed().as_millis() as u64;
++                            samples.push((&sample_from_temperature_update(elapsed_ms, jiff::Timestamp::now().to_string(), &u)).into());
++                            active_left_c.push(crate::telemetry::centideg_to_celsius(u.left_temp));
++                            active_right_c.push(crate::telemetry::centideg_to_celsius(u.right_temp));
++
++                            let side_centideg = match side {
++                                BedSide::Left => u.left_temp,
++                                BedSide::Right => u.right_temp,
++                            };
++                            let heatsink_centideg = u.heatsink_temp;
++
++                            // Isolated behind `catch_unwind`: `evaluate_tick` is a small, pure,
++                            // panic-free-by-design function, but wrapping it means a future bug
++                            // here cannot bring down the whole active loop before safe-stop runs.
++                            match std::panic::catch_unwind(|| evaluate_tick(side_centideg, heatsink_centideg, prev_side_centideg)) {
++                                Ok(Ok(v)) => prev_side_centideg = Some(v),
++                                Ok(Err(reason)) => {
++                                    stop_reason = reason;
++                                    telemetry_ok = false;
++                                    break 'active;
++                                }
++                                Err(_panic) => {
++                                    log::error!("panic while evaluating a temperature sample; stopping safely");
++                                    stop_reason = StopReason::Panic;
++                                    telemetry_ok = false;
++                                    break 'active;
++                                }
++                            }
++                        }
++                        Ok(PacketOutcome::Received(FrozenPacket::GetTemperature(g))) => {
++                            // Raw evidence only -- see module docs; never gates a decision.
++                            stats.record(&FrozenPacket::GetTemperature(g.clone()));
++                            let elapsed_ms = active_start.elapsed().as_millis() as u64;
++                            samples.push((&sample_from_get_temperature(elapsed_ms, jiff::Timestamp::now().to_string(), &g)).into());
++                        }
++                        Ok(PacketOutcome::Received(FrozenPacket::Message(m))) => {
++                            stats.record(&FrozenPacket::Message(m.clone()));
++                            if let Some(running) = parse_pump_report(&m, side_tag) {
++                                pump_confirmed_running |= running;
++                                pump_last_report_off = !running;
++                            }
++                            if is_tec_locked_message(&m) {
++                                log::error!("firmware reported the selected TEC locked: {m:?}");
++                                stop_reason = StopReason::TecLocked;
++                                telemetry_ok = false;
++                                break 'active;
++                            }
++                            if is_known_nonfatal_sensor_message(&m) {
++                                log::warn!("firmware sensor-unavailable message (non-fatal): {m:?}");
++                            } else if active_start.elapsed() > FAULT_KEYWORD_GRACE && is_generic_fault_message(&m) {
++                                log::error!("firmware fault message during active phase: {m:?}");
++                                stop_reason = StopReason::FirmwareFaultMessage;
++                                telemetry_ok = false;
++                                break 'active;
++                            }
++                        }
++                        Ok(PacketOutcome::Received(FrozenPacket::TargetUpdate((s, target)))) => {
++                            stats.record(&FrozenPacket::TargetUpdate((s, target.clone())));
++                            if s == side && we_enabled_side && !target.enabled {
++                                log::error!("Frozen disabled the selected side unexpectedly");
++                                stop_reason = StopReason::TargetDisabledUnexpectedly;
++                                telemetry_ok = false;
++                                break 'active;
++                            }
++                        }
++                        Ok(PacketOutcome::Received(other)) => {
++                            stats.record(&other);
++                        }
++                        Ok(PacketOutcome::TimedOut) => break, // nothing more buffered right now
++                        Ok(PacketOutcome::Closed) => {
++                            stop_reason = StopReason::TelemetryLost;
++                            telemetry_ok = false;
++                            break 'active;
++                        }
++                        Err(LinkError::ReadIo(e)) => {
++                            log::error!("UART read failure during active phase: {e}");
++                            stop_reason = StopReason::UartReadFailure;
++                            telemetry_ok = false;
++                            break 'active;
++                        }
++                        Err(e) => {
++                            // WriteIo/Safety are structurally unreachable from `recv()` (it never
++                            // writes or checks the audit); handled generically for exhaustiveness.
++                            log::error!("unexpected error draining telemetry: {e}");
++                        }
++                    }
++                }
 +            }
++        }
++
++        if active_start.elapsed() >= PUMP_CONFIRM_GRACE && !pump_confirmed_running && pump_last_report_off {
++            log::error!(
++                "selected-side pump still reports off/0V {:?} after the target was enabled",
++                active_start.elapsed()
++            );
++            stop_reason = StopReason::PumpNotConfirmedRunning;
++            telemetry_ok = false;
++            break 'active;
++        }
++
++        if last_valid_at.elapsed() > STALE_TELEMETRY_LIMIT {
++            stop_reason = StopReason::TelemetryStale;
++            telemetry_ok = false;
++            break 'active;
 +        }
 +    }
 +
@@ -648,12 +886,17 @@ index 0000000..da6f253
 +    let safe_stop = run_safe_stop(Some(link), &mut audit, Some(i2c)).await;
 +    cr.emergency_shutdown = if safe_stop.fully_succeeded() { Verdict::Pass } else { Verdict::Fail };
 +
-+    // Firmware-message-based inference (direct evidence, per PROTOCOL_AUDIT.md): only counts as
-+    // PASS when the firmware itself printed a message naming the component for the tested side.
-+    let side_tag = format!("[{}]", side_word(side));
-+    let pump_seen = stats.messages.iter().any(|m| m.to_lowercase().contains("pump") && m.contains(&side_tag));
-+    let fan_seen = stats.messages.iter().any(|m| m.to_lowercase().contains("fan") && m.contains(&side_tag));
-+    cr.pump_operation = if pump_seen { Verdict::Pass } else { Verdict::Unverified };
++    // Pump/fan/TEC results: only ever PASS from decoded evidence, never from "the command was
++    // accepted" (`cr.frozen_command_accepted` is tracked entirely separately above).
++    let side_bracket_tag = format!("[{side_tag}]");
++    let fan_seen = stats.messages.iter().any(|m| m.to_lowercase().contains("fan") && m.contains(&side_bracket_tag));
++    cr.pump_operation = if pump_confirmed_running {
++        Verdict::Pass
++    } else if pump_last_report_off {
++        Verdict::Fail
++    } else {
++        Verdict::Unverified
++    };
 +    cr.fan_operation = if fan_seen { Verdict::Pass } else { Verdict::Unverified };
 +
 +    cr.tec_cooling_operation = tec_trend_verdict(side, &active_left_c, &active_right_c, telemetry_ok);
@@ -662,8 +905,6 @@ index 0000000..da6f253
 +
 +    let overall_pass = cr.overall_selected_side_result == Verdict::Pass;
 +
-+    // Reset_expander/subsystem-reset/LED info folded into the shared `finish` builder below via
-+    // the report fields set here first.
 +    let mut result = finish(
 +        args, dry_run, &audit, &stats, samples, cr, safe_stop, stop_reason, overall_pass,
 +    );
@@ -678,16 +919,15 @@ index 0000000..da6f253
 +}
 +
 +/// Pure, panic-free-by-design per-tick range/plausibility check, isolated so it can be run behind
-+/// `catch_unwind` in the active loop above.
-+fn evaluate_tick(g: &GetTemperature, side: BedSide, prev_side_centideg: Option<i32>) -> Result<i32, StopReason> {
-+    let side_centideg = match side {
-+        BedSide::Left => g.left_temp,
-+        BedSide::Right => g.right_temp,
-+    } as i32;
++/// `catch_unwind` in the active loop above. Operates on already-extracted centidegree values so
++/// it applies identically to `TemperatureUpdate` (the primary safety signal) and, if ever needed,
++/// `GetTemperature`.
++fn evaluate_tick(side_centideg: u16, heatsink_centideg: u16, prev_side_centideg: Option<i32>) -> Result<i32, StopReason> {
++    let side_centideg = side_centideg as i32;
 +    if !(MIN_WATER_CENTIDEG..=MAX_WATER_CENTIDEG).contains(&side_centideg) {
 +        return Err(StopReason::TemperatureRangeExceeded);
 +    }
-+    if (g.heatsink_temp as i32) > MAX_HEATSINK_CENTIDEG {
++    if (heatsink_centideg as i32) > MAX_HEATSINK_CENTIDEG {
 +        return Err(StopReason::HeatsinkLimitExceeded);
 +    }
 +    if let Some(prev) = prev_side_centideg
@@ -738,16 +978,16 @@ index 0000000..da6f253
 +    }
 +}
 +
-+fn validate_baseline(samples: &[GetTemperature], side: BedSide) -> Option<i32> {
++fn validate_baseline(samples: &[TemperatureUpdate], side: BedSide) -> Option<i32> {
 +    if samples.len() < BASELINE_MIN_SAMPLES {
 +        log::error!("baseline validation failed: only {} samples (need >= {BASELINE_MIN_SAMPLES})", samples.len());
 +        return None;
 +    }
 +    let values: Vec<i32> = samples
 +        .iter()
-+        .map(|g| match side { BedSide::Left => g.left_temp, BedSide::Right => g.right_temp } as i32)
++        .map(|u| match side { BedSide::Left => u.left_temp, BedSide::Right => u.right_temp } as i32)
 +        .collect();
-+    let heatsinks: Vec<i32> = samples.iter().map(|g| g.heatsink_temp as i32).collect();
++    let heatsinks: Vec<i32> = samples.iter().map(|u| u.heatsink_temp as i32).collect();
 +
 +    for &v in values.iter().chain(heatsinks.iter()) {
 +        if v == 0 || v == 0xFFFF {
@@ -969,6 +1209,10 @@ index 0000000..da6f253
 +        }
 +    }
 +
++    fn temp_update(left: u16, right: u16, heatsink: u16) -> TemperatureUpdate {
++        TemperatureUpdate { left_temp: left, right_temp: right, heatsink_temp: heatsink, error: 9, count: 0 }
++    }
++
 +    #[tokio::test]
 +    async fn refuses_without_all_confirmation_flags() {
 +        let mut a = args(Side::Left, true);
@@ -1027,6 +1271,15 @@ index 0000000..da6f253
 +        assert!(start.elapsed() < Duration::from_secs(10));
 +    }
 +
++    #[tokio::test]
++    async fn dry_run_uses_unsolicited_updates_and_reaches_a_verdict() {
++        let a = args(Side::Left, true);
++        let (report, _code) = run(&a).await;
++        assert!(report.unsolicited_telemetry_seen);
++        assert!(report.telemetry_samples.iter().any(|s| s.source == "unsolicited"));
++        assert!(report.component_results.is_some());
++    }
++
 +    #[test]
 +    fn max_duration_constant_matches_spec() {
 +        assert_eq!(HARD_MAX_DURATION_SECONDS, 30);
@@ -1039,53 +1292,109 @@ index 0000000..da6f253
 +
 +    #[test]
 +    fn baseline_rejects_too_few_samples() {
-+        let one = vec![GetTemperature { left_temp: 2400, right_temp: 2400, unknown_temp: 0, heatsink_temp: 2500 }];
++        let one = vec![temp_update(2400, 2400, 2500)];
 +        assert!(validate_baseline(&one, BedSide::Left).is_none());
 +    }
 +
 +    #[test]
 +    fn baseline_rejects_sentinel_zero() {
-+        let samples = vec![GetTemperature { left_temp: 0, right_temp: 2400, unknown_temp: 0, heatsink_temp: 2500 }; 5];
++        let samples = vec![temp_update(0, 2400, 2500); 5];
 +        assert!(validate_baseline(&samples, BedSide::Left).is_none());
 +    }
 +
 +    #[test]
 +    fn baseline_rejects_out_of_range() {
-+        let samples = vec![GetTemperature { left_temp: 5000, right_temp: 2400, unknown_temp: 0, heatsink_temp: 2500 }; 5];
++        let samples = vec![temp_update(5000, 2400, 2500); 5];
 +        assert!(validate_baseline(&samples, BedSide::Left).is_none());
 +    }
 +
 +    #[test]
 +    fn baseline_accepts_consistent_valid_samples() {
-+        let samples = vec![GetTemperature { left_temp: 2450, right_temp: 2460, unknown_temp: 0, heatsink_temp: 2600 }; 5];
++        let samples = vec![temp_update(2450, 2460, 2600); 5];
 +        assert_eq!(validate_baseline(&samples, BedSide::Left), Some(2450));
 +    }
 +
 +    #[test]
 +    fn evaluate_tick_accepts_a_plausible_sample() {
-+        let g = GetTemperature { left_temp: 2350, right_temp: 2460, unknown_temp: 0, heatsink_temp: 2700 };
-+        assert_eq!(evaluate_tick(&g, BedSide::Left, Some(2400)), Ok(2350));
++        assert_eq!(evaluate_tick(2350, 2700, Some(2400)), Ok(2350));
 +    }
 +
 +    #[test]
 +    fn evaluate_tick_rejects_out_of_range_water_temperature() {
-+        let g = GetTemperature { left_temp: 100, right_temp: 2460, unknown_temp: 0, heatsink_temp: 2700 };
-+        assert_eq!(evaluate_tick(&g, BedSide::Left, None), Err(StopReason::TemperatureRangeExceeded));
++        assert_eq!(evaluate_tick(100, 2700, None), Err(StopReason::TemperatureRangeExceeded));
 +    }
 +
 +    #[test]
 +    fn evaluate_tick_rejects_heatsink_over_limit() {
-+        let g = GetTemperature { left_temp: 2400, right_temp: 2460, unknown_temp: 0, heatsink_temp: 5000 };
-+        assert_eq!(evaluate_tick(&g, BedSide::Left, None), Err(StopReason::HeatsinkLimitExceeded));
++        assert_eq!(evaluate_tick(2400, 5000, None), Err(StopReason::HeatsinkLimitExceeded));
 +    }
 +
 +    #[test]
 +    fn evaluate_tick_rejects_implausible_single_tick_jump() {
-+        let g = GetTemperature { left_temp: 3000, right_temp: 2460, unknown_temp: 0, heatsink_temp: 2700 };
-+        assert_eq!(
-+            evaluate_tick(&g, BedSide::Left, Some(2400)),
-+            Err(StopReason::ImplausibleTemperatureChange)
-+        );
++        assert_eq!(evaluate_tick(3000, 2700, Some(2400)), Err(StopReason::ImplausibleTemperatureChange));
++    }
++
++    #[test]
++    fn evaluate_tick_has_no_control_error_parameter_to_gate_on() {
++        // Real captured evidence: control_error_c is a PID/control-loop error term (deg C), not a
++        // fault code -- see telemetry::TemperatureSample::control_error_c. evaluate_tick doesn't
++        // even take this field, which is itself the proof it can never gate a decision.
++        assert_eq!(evaluate_tick(2350, 2700, Some(2400)), Ok(2350));
++    }
++
++    #[test]
++    fn pump_report_detects_running_from_nonzero_voltage() {
++        assert_eq!(parse_pump_report("FW: pump[left] slow @ 6.030475V 0.169202A", "left"), Some(true));
++    }
++
++    #[test]
++    fn pump_report_detects_off_from_zero_voltage() {
++        assert_eq!(parse_pump_report("FW: pump[left] slow @ 0.000000V 0.000000A", "left"), Some(false));
++    }
++
++    #[test]
++    fn pump_report_detects_explicit_off_word() {
++        assert_eq!(parse_pump_report("FW: pump[left] off", "left"), Some(false));
++    }
++
++    #[test]
++    fn pump_report_ignores_the_other_side() {
++        assert_eq!(parse_pump_report("FW: pump[right] slow @ 6.03V 0.17A", "left"), None);
++    }
++
++    #[test]
++    fn pump_report_ignores_unrelated_messages() {
++        assert_eq!(parse_pump_report("FW: pid[heatsink] 3.0625 0.69 0.69 0.0 0.0", "left"), None);
++    }
++
++    #[test]
++    fn tec_locked_message_is_detected() {
++        assert!(is_tec_locked_message("FW: tec[left] locked"));
++    }
++
++    #[test]
++    fn flash_locked_is_not_a_tec_lock() {
++        assert!(!is_tec_locked_message("FW: flash locked"));
++    }
++
++    #[test]
++    fn generic_fault_keywords_are_detected() {
++        assert!(is_generic_fault_message("FW: overtemperature shutdown"));
++        assert!(is_generic_fault_message("FW: pump[left] fault"));
++    }
++
++    #[test]
++    fn flash_locked_is_excluded_from_the_generic_fault_scan() {
++        // Real, evidenced, benign firmware boot-time message (frozen/command.rs source comment,
++        // paired with "cal_info valid") -- must never be confused with a real "locked" fault.
++        assert!(!is_generic_fault_message("FW: flash locked"));
++        assert!(!is_generic_fault_message("Message: FW: flash locked"));
++    }
++
++    #[test]
++    fn capwater_and_flowrate_unavailable_are_recognized_as_nonfatal_sensor_messages() {
++        assert!(is_known_nonfatal_sensor_message("FW: [capwater] sensor unavailable"));
++        assert!(is_known_nonfatal_sensor_message("FW: [flowrate] sensor unavailable"));
 +    }
 +
 +    #[test]
@@ -1132,6 +1441,22 @@ index 0000000..da6f253
 +        assert_eq!(overall_verdict(&cr), Verdict::Inconclusive);
 +    }
 +
++    #[test]
++    fn overall_verdict_does_not_pass_from_command_acceptance_alone() {
++        // Guards item 7 of the safety spec correction: accepting the enable command must never by
++        // itself be enough to call the TEC/pump PASS.
++        let cr = ComponentResults {
++            frozen_command_accepted: Verdict::Pass,
++            pump_operation: Verdict::Unknown,
++            fan_operation: Verdict::Unknown,
++            tec_cooling_operation: Verdict::Unknown,
++            telemetry_remained_valid: Verdict::Pass,
++            emergency_shutdown: Verdict::Pass,
++            overall_selected_side_result: Verdict::Unknown,
++        };
++        assert_ne!(overall_verdict(&cr), Verdict::Pass);
++    }
++
 +    #[tokio::test]
 +    async fn termination_signal_future_does_not_resolve_spuriously() {
 +        // Real SIGTERM/SIGINT delivery to a shared `cargo test` process is not exercised here
@@ -1151,18 +1476,21 @@ index 0000000..da6f253
 +        assert!(report.safe_stop.unwrap().i2c_reset_asserted);
 +    }
 +
-+    /// A device that answers everything needed to get through preflight, then goes silent during
-+    /// the active phase -- proving stale telemetry triggers safe-stop rather than hanging forever.
++    /// A fake device that answers Ping/JumpToFirmware/SetTargetTemperature plausibly, and for
++    /// GetTemperatures requests either pushes an unsolicited TemperatureUpdate (0x41) -- while
++    /// `pushes_remaining > 0` -- or goes silent, simulating telemetry loss for the value this
++    /// binary actually relies on for safety monitoring.
 +    fn spawn_device_that_goes_silent_during_active_phase(
 +        mut device_side: tokio::io::DuplexStream,
-+        answer_temperature_requests: usize,
++        pushes_remaining: usize,
 +    ) -> tokio::task::JoinHandle<()> {
 +        use bytes::{Buf, BytesMut};
 +        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 +        tokio::spawn(async move {
 +            let mut acc = BytesMut::new();
 +            let mut read_buf = [0u8; 256];
-+            let mut temp_replies_sent = 0usize;
++            let mut pushes_remaining = pushes_remaining;
++            let mut count: u8 = 0;
 +            loop {
 +                if acc.len() >= 2 {
 +                    let len = acc[1] as usize;
@@ -1172,18 +1500,14 @@ index 0000000..da6f253
 +                        let payload = acc[2..2 + len].to_vec();
 +                        acc.advance(total);
 +                        let response = match opcode {
-+                            0x01 => Some(crate::mock::MOCK_BASELINE_LEFT_CENTIDEG).map(|_| {
-+                                opensleep::common::codec::command(vec![0x81, 0x00, 0b0100_0110])
-+                            }),
++                            0x01 => Some(opensleep::common::codec::command(vec![0x81, 0x00, 0b0100_0110])),
 +                            0x41 => {
-+                                if temp_replies_sent < answer_temperature_requests {
-+                                    temp_replies_sent += 1;
-+                                    let mut p = vec![
-+                                        0xC1, 0x00, 0x01, 0x09, 0x9A, 0x02, 0x09, 0xA4, 0x03, 0x00, 0x00, 0x04, 0x0A,
-+                                        0x28,
-+                                    ];
-+                                    p.resize(27, 0);
-+                                    Some(opensleep::common::codec::command(p))
++                                if pushes_remaining > 0 {
++                                    pushes_remaining -= 1;
++                                    count = count.wrapping_add(1);
++                                    Some(opensleep::common::codec::command(vec![
++                                        0x41, 0x09, 0x9A, 0x09, 0xA4, 0x0A, 0x28, 9, count,
++                                    ]))
 +                                } else {
 +                                    None // goes silent: simulates telemetry loss
 +                                }
@@ -1218,13 +1542,255 @@ index 0000000..da6f253
 +
 +        let mut a = args(Side::Left, false);
 +        a.duration_seconds = 10; // long enough that only staleness (not duration) ends the run
-+        let (report, _code) = run_core(&a, &mut i2c, Some(&mut link), false).await;
++        let (report, _code) = run_core(&a, &mut i2c, Some(&mut link), false, None).await;
 +
 +        assert_eq!(report.stop_reason, StopReason::TelemetryStale.to_string());
 +        assert!(report.safe_stop.unwrap().i2c_reset_asserted);
 +
 +        drop(link);
 +        device_task.abort();
++    }
++
++    /// A fake device that acks Ping/JumpToFirmware, always pushes an unsolicited
++    /// TemperatureUpdate for every GetTemperatures request (so staleness never fires), acks the
++    /// enable command with a TargetUpdate(enabled=true), and then -- once `disable_after` further
++    /// GetTemperatures requests have gone by -- proactively pushes an unsolicited
++    /// TargetUpdate(enabled=false) for the given side, simulating Frozen disabling the channel on
++    /// its own.
++    fn spawn_device_that_disables_target_unexpectedly(
++        mut device_side: tokio::io::DuplexStream,
++        side_byte: u8,
++        disable_after: usize,
++    ) -> tokio::task::JoinHandle<()> {
++        use bytes::{Buf, BytesMut};
++        use tokio::io::{AsyncReadExt, AsyncWriteExt};
++        tokio::spawn(async move {
++            let mut acc = BytesMut::new();
++            let mut read_buf = [0u8; 256];
++            let mut temp_requests: usize = 0;
++            let mut count: u8 = 0;
++            loop {
++                if acc.len() >= 2 {
++                    let len = acc[1] as usize;
++                    let total = 1 + 1 + len + 2;
++                    if acc.len() >= total {
++                        let opcode = acc[2];
++                        let payload = acc[2..2 + len].to_vec();
++                        acc.advance(total);
++                        let mut frames: Vec<Vec<u8>> = Vec::new();
++                        match opcode {
++                            0x01 => frames.push(opensleep::common::codec::command(vec![0x81, 0x00, 0b0100_0110])),
++                            0x41 => {
++                                temp_requests += 1;
++                                count = count.wrapping_add(1);
++                                frames.push(opensleep::common::codec::command(vec![
++                                    0x41, 0x09, 0x9A, 0x09, 0xA4, 0x0A, 0x28, 9, count,
++                                ]));
++                                if temp_requests >= disable_after {
++                                    frames.push(opensleep::common::codec::command(vec![
++                                        0xC0, 0x00, side_byte, 0x00, 0x00, 0x00,
++                                    ]));
++                                }
++                            }
++                            0x40 if payload.len() == 5 => frames.push(opensleep::common::codec::command(vec![
++                                0xC0, 0x00, payload[1], payload[2], payload[3], payload[4],
++                            ])),
++                            _ => {}
++                        }
++                        for f in frames {
++                            if device_side.write_all(&f).await.is_err() {
++                                return;
++                            }
++                        }
++                        continue;
++                    }
++                }
++                match device_side.read(&mut read_buf).await {
++                    Ok(0) | Err(_) => break,
++                    Ok(n) => acc.extend_from_slice(&read_buf[..n]),
++                }
++            }
++        })
++    }
++
++    #[tokio::test]
++    async fn frozen_disabling_the_target_unexpectedly_triggers_safe_stop() {
++        let (client, device) = tokio::io::duplex(8192);
++        let device_task = spawn_device_that_disables_target_unexpectedly(device, 0x00, 3);
++        let mut link = FrozenLink::wrap(client, "test");
++        let mut i2c = MockI2c::always_succeed();
++
++        let mut a = args(Side::Left, false);
++        a.duration_seconds = 10;
++        let (report, _code) = run_core(&a, &mut i2c, Some(&mut link), false, None).await;
++
++        assert_eq!(report.stop_reason, StopReason::TargetDisabledUnexpectedly.to_string());
++        assert!(report.safe_stop.unwrap().i2c_reset_asserted);
++
++        drop(link);
++        device_task.abort();
++    }
++
++    /// A fake device that acks Ping/JumpToFirmware/enable and always pushes an unsolicited
++    /// TemperatureUpdate, and additionally pushes a fixed `Message` on every GetTemperatures
++    /// request after preflight (`messages_after` counts every 0x41 request, so preflight baseline
++    /// requests are included in the count -- tests pick a generous `messages_after` to land the
++    /// message during the active phase).
++    fn spawn_device_with_a_message(
++        mut device_side: tokio::io::DuplexStream,
++        message: &'static str,
++        messages_after: usize,
++    ) -> tokio::task::JoinHandle<()> {
++        use bytes::{Buf, BytesMut};
++        use tokio::io::{AsyncReadExt, AsyncWriteExt};
++        tokio::spawn(async move {
++            let mut acc = BytesMut::new();
++            let mut read_buf = [0u8; 256];
++            let mut temp_requests: usize = 0;
++            let mut count: u8 = 0;
++            loop {
++                if acc.len() >= 2 {
++                    let len = acc[1] as usize;
++                    let total = 1 + 1 + len + 2;
++                    if acc.len() >= total {
++                        let opcode = acc[2];
++                        let payload = acc[2..2 + len].to_vec();
++                        acc.advance(total);
++                        let mut frames: Vec<Vec<u8>> = Vec::new();
++                        match opcode {
++                            0x01 => frames.push(opensleep::common::codec::command(vec![0x81, 0x00, 0b0100_0110])),
++                            0x41 => {
++                                temp_requests += 1;
++                                count = count.wrapping_add(1);
++                                frames.push(opensleep::common::codec::command(vec![
++                                    0x41, 0x09, 0x9A, 0x09, 0xA4, 0x0A, 0x28, 9, count,
++                                ]));
++                                if temp_requests >= messages_after {
++                                    let mut p = vec![0x07u8, 0x00];
++                                    p.extend_from_slice(message.as_bytes());
++                                    frames.push(opensleep::common::codec::command(p));
++                                }
++                            }
++                            0x40 if payload.len() == 5 => frames.push(opensleep::common::codec::command(vec![
++                                0xC0, 0x00, payload[1], payload[2], payload[3], payload[4],
++                            ])),
++                            _ => {}
++                        }
++                        for f in frames {
++                            if device_side.write_all(&f).await.is_err() {
++                                return;
++                            }
++                        }
++                        continue;
++                    }
++                }
++                match device_side.read(&mut read_buf).await {
++                    Ok(0) | Err(_) => break,
++                    Ok(n) => acc.extend_from_slice(&read_buf[..n]),
++                }
++            }
++        })
++    }
++
++    #[tokio::test]
++    async fn tec_locked_message_triggers_safe_stop() {
++        let (client, device) = tokio::io::duplex(8192);
++        let device_task = spawn_device_with_a_message(device, "FW: tec[left] locked", 3);
++        let mut link = FrozenLink::wrap(client, "test");
++        let mut i2c = MockI2c::always_succeed();
++
++        let mut a = args(Side::Left, false);
++        a.duration_seconds = 10;
++        let (report, _code) = run_core(&a, &mut i2c, Some(&mut link), false, None).await;
++
++        assert_eq!(report.stop_reason, StopReason::TecLocked.to_string());
++
++        drop(link);
++        device_task.abort();
++    }
++
++    #[tokio::test]
++    async fn flash_locked_message_does_not_trigger_safe_stop() {
++        let (client, device) = tokio::io::duplex(8192);
++        // Sent on essentially every tick (messages_after=1); if this were mistaken for a fault
++        // the run would abort almost immediately instead of running its full duration.
++        let device_task = spawn_device_with_a_message(device, "FW: flash locked", 1);
++        let mut link = FrozenLink::wrap(client, "test");
++        let mut i2c = MockI2c::always_succeed();
++
++        let mut a = args(Side::Left, false);
++        a.duration_seconds = 2;
++        let (report, _code) = run_core(&a, &mut i2c, Some(&mut link), false, None).await;
++
++        assert_eq!(report.stop_reason, StopReason::DurationExpired.to_string());
++
++        drop(link);
++        device_task.abort();
++    }
++
++    #[tokio::test]
++    async fn generic_fault_message_triggers_safe_stop_after_the_grace_period() {
++        let (client, device) = tokio::io::duplex(8192);
++        // messages_after chosen generously so the message lands well after FAULT_KEYWORD_GRACE
++        // (2s) has elapsed from the start of the active phase.
++        let device_task = spawn_device_with_a_message(device, "FW: pump[left] overcurrent shutdown", 6);
++        let mut link = FrozenLink::wrap(client, "test");
++        let mut i2c = MockI2c::always_succeed();
++
++        let mut a = args(Side::Left, false);
++        a.duration_seconds = 15;
++        let (report, _code) = run_core(&a, &mut i2c, Some(&mut link), false, None).await;
++
++        assert_eq!(report.stop_reason, StopReason::FirmwareFaultMessage.to_string());
++
++        drop(link);
++        device_task.abort();
++    }
++
++    #[tokio::test]
++    async fn operator_reported_leak_aborts_the_active_phase() {
++        let (client, task) = mock_frozen_link_pair();
++        let mut link = FrozenLink::wrap(client, "test");
++        let mut i2c = MockI2c::always_succeed();
++        let (tx, rx) = mpsc::unbounded_channel();
++        // Send after a short delay so it lands during the active phase, not before.
++        tokio::spawn(async move {
++            tokio::time::sleep(Duration::from_millis(500)).await;
++            let _ = tx.send("LEAK".to_string());
++        });
++
++        let mut a = args(Side::Left, false);
++        a.duration_seconds = 10;
++        let (report, _code) = run_core(&a, &mut i2c, Some(&mut link), false, Some(rx)).await;
++
++        assert_eq!(report.stop_reason, StopReason::OperatorAbort.to_string());
++        assert!(report.safe_stop.unwrap().i2c_reset_asserted);
++
++        drop(link);
++        task.abort();
++    }
++
++    #[tokio::test]
++    async fn unrecognized_operator_input_does_not_abort() {
++        let (client, task) = mock_frozen_link_pair();
++        let mut link = FrozenLink::wrap(client, "test");
++        let mut i2c = MockI2c::always_succeed();
++        let (tx, rx) = mpsc::unbounded_channel();
++        tokio::spawn(async move {
++            tokio::time::sleep(Duration::from_millis(200)).await;
++            let _ = tx.send("hello".to_string());
++        });
++
++        let mut a = args(Side::Left, false);
++        // Comfortably above STALE_TELEMETRY_LIMIT (2s) so ordinary scheduling jitter around the
++        // per-tick drain window can't race the duration check against a false staleness abort.
++        a.duration_seconds = 6;
++        let (report, _code) = run_core(&a, &mut i2c, Some(&mut link), false, Some(rx)).await;
++
++        assert_eq!(report.stop_reason, StopReason::DurationExpired.to_string());
++
++        drop(link);
++        task.abort();
 +    }
 +}
 diff --git a/src/bin/opensleep-diagnostic/emergency_stop.rs b/src/bin/opensleep-diagnostic/emergency_stop.rs
@@ -1370,21 +1936,20 @@ index 0000000..9b7fc97
 +}
 diff --git a/src/bin/opensleep-diagnostic/frozen_ops.rs b/src/bin/opensleep-diagnostic/frozen_ops.rs
 new file mode 100644
-index 0000000..05715e5
+index 0000000..666ce19
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/frozen_ops.rs
-@@ -0,0 +1,181 @@
+@@ -0,0 +1,169 @@
 +//! Small Frozen protocol operations shared by `frozen-passive` and `frozen-cool-test`: Ping,
-+//! GetHardwareInfo, mode detection via `FrozenPacket::Pong`'s `in_firmware` flag (never inferred
-+//! from timing alone), the bootloader -> firmware transition, and a single `GetTemperatures`
-+//! round trip. All built on `FrozenLink`/`AuditedTransport`; nothing here can reach an opcode
-+//! outside the current mode's whitelist.
++//! GetHardwareInfo, and mode detection via `FrozenPacket::Pong`'s `in_firmware` flag (never
++//! inferred from timing alone), plus the bootloader -> firmware transition. All built on
++//! `FrozenLink`/`AuditedTransport`; nothing here can reach an opcode outside the current mode's
++//! whitelist.
 +
 +use std::time::Duration;
 +
 +use opensleep::common::packet::HardwareInfo;
 +use opensleep::frozen::FrozenPacket;
-+use opensleep::frozen::packet::GetTemperature;
 +use tokio::io::{AsyncRead, AsyncWrite};
 +use tokio::time::Instant;
 +
@@ -1501,28 +2066,6 @@ index 0000000..05715e5
 +    }
 +}
 +
-+pub async fn get_temperatures_once<T>(
-+    link: &mut FrozenLink<T>,
-+    audit: &mut AuditedTransport,
-+    timeout: Duration,
-+) -> Option<GetTemperature>
-+where
-+    T: AsyncRead + AsyncWrite + Unpin,
-+{
-+    match link.send(audit, FrozenAction::get_temperatures(), timeout).await {
-+        Ok(PacketOutcome::Received(FrozenPacket::GetTemperature(g))) => Some(g),
-+        Ok(PacketOutcome::Received(other)) => {
-+            log::debug!("GetTemperatures got a non-GetTemperature packet first: {other:?}");
-+            None
-+        }
-+        Ok(_) => None,
-+        Err(e) => {
-+            log::error!("GetTemperatures failed: {e}");
-+            None
-+        }
-+    }
-+}
-+
 +#[cfg(test)]
 +mod tests {
 +    use super::*;
@@ -1541,16 +2084,27 @@ index 0000000..05715e5
 +        task.abort();
 +    }
 +
++    /// The mock device's solicited 0xC1 reply to GetTemperatures still decodes correctly against
++    /// the real, unmodified `FrozenPacket::parse_get_temperature` -- kept as raw evidence in
++    /// reports even though `cool_test.rs`'s baseline/active-phase safety logic no longer relies
++    /// on it (see that module's docs for why: real hardware sends a 14-byte 0xC1 frame, and the
++    /// parser requires exactly 27).
 +    #[tokio::test]
-+    async fn get_temperatures_decodes_the_solicited_response() {
++    async fn get_temperatures_solicited_reply_still_decodes_from_the_mock() {
 +        let (client, task) = mock_frozen_link_pair();
 +        let mut link = FrozenLink::wrap(client, "test");
 +        let mut audit = AuditedTransport::new(Mode::Passive);
-+        let g = get_temperatures_once(&mut link, &mut audit, Duration::from_secs(1))
++        let outcome = link
++            .send(&mut audit, FrozenAction::get_temperatures(), Duration::from_secs(1))
 +            .await
-+            .expect("expected a decoded GetTemperature");
-+        assert_eq!(g.left_temp, crate::mock::MOCK_BASELINE_LEFT_CENTIDEG);
-+        assert_eq!(g.right_temp, crate::mock::MOCK_BASELINE_RIGHT_CENTIDEG);
++            .unwrap();
++        match outcome {
++            PacketOutcome::Received(FrozenPacket::GetTemperature(g)) => {
++                assert_eq!(g.left_temp, crate::mock::MOCK_BASELINE_LEFT_CENTIDEG);
++                assert_eq!(g.right_temp, crate::mock::MOCK_BASELINE_RIGHT_CENTIDEG);
++            }
++            other => panic!("unexpected outcome: {other:?}"),
++        }
 +        drop(link);
 +        task.abort();
 +    }
@@ -1936,10 +2490,10 @@ index 0000000..00f7d23
 +}
 diff --git a/src/bin/opensleep-diagnostic/link.rs b/src/bin/opensleep-diagnostic/link.rs
 new file mode 100644
-index 0000000..ece2380
+index 0000000..5ced463
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/link.rs
-@@ -0,0 +1,245 @@
+@@ -0,0 +1,288 @@
 +//! Frozen UART transport: every send goes through [`AuditedTransport::check`] first, and the wire
 +//! framing itself is entirely `opensleep::common::codec::PacketCodec` / `FrozenPacket` -- nothing
 +//! here reimplements packet encoding or decoding. Generic over the underlying I/O so the exact
@@ -2029,6 +2583,18 @@ index 0000000..ece2380
 +    /// unsolicited telemetry/messages that arrive between our own polls.
 +    pub async fn recv(&mut self, wait: Duration) -> Result<PacketOutcome, LinkError> {
 +        Self::await_one(&mut self.framed, wait).await
++    }
++
++    /// Checks `action` against the audit's whitelist and, only if it passes, serializes and
++    /// transmits it -- but does not itself wait for a reply. Used where the caller wants to
++    /// nudge the device (and have the send audited/logged) but will pick up whatever arrives,
++    /// solicited or not, via a subsequent [`Self::recv`] drain loop instead of pairing this send
++    /// with exactly one response.
++    pub async fn send_only(&mut self, audit: &mut AuditedTransport, action: FrozenAction) -> Result<(), LinkError> {
++        audit.check(&action).map_err(LinkError::Safety)?;
++        let cmd = action.to_command();
++        log::info!("-> {} ({:?}) [no-wait]", action.name(), cmd);
++        self.framed.send(cmd).await.map_err(LinkError::WriteIo)
 +    }
 +
 +    pub async fn flush(&mut self) -> Result<(), std::io::Error> {
@@ -2171,6 +2737,37 @@ index 0000000..ece2380
 +
 +        drop(link);
 +        assert_eq!(device_task.await.unwrap(), vec![0x40]);
++    }
++
++    #[tokio::test]
++    async fn send_only_writes_without_waiting_for_a_reply() {
++        let (client, device) = tokio::io::duplex(4096);
++        let device_task = spawn_fake_frozen(device, vec![(0x41, vec![])]);
++
++        let mut link = FrozenLink::wrap(client, "test");
++        let mut audit = AuditedTransport::new(Mode::Passive);
++        link.send_only(&mut audit, FrozenAction::get_temperatures())
++            .await
++            .unwrap();
++        assert_eq!(audit.sent_count(), 1);
++
++        drop(link);
++        assert_eq!(device_task.await.unwrap(), vec![0x41]);
++    }
++
++    #[tokio::test]
++    async fn send_only_is_rejected_by_the_whitelist_before_any_bytes_are_written() {
++        let (client, device) = tokio::io::duplex(4096);
++        let device_task = spawn_fake_frozen(device, vec![]);
++
++        let mut link = FrozenLink::wrap(client, "test");
++        let mut audit = AuditedTransport::new(Mode::EmergencyStop);
++        let err = link.send_only(&mut audit, FrozenAction::get_hardware_info()).await;
++        assert!(matches!(err, Err(LinkError::Safety(_))));
++        assert_eq!(audit.sent_count(), 0);
++
++        drop(link);
++        device_task.abort();
 +    }
 +
 +    #[tokio::test]
@@ -2356,10 +2953,10 @@ index 0000000..92894ec
 +}
 diff --git a/src/bin/opensleep-diagnostic/mock.rs b/src/bin/opensleep-diagnostic/mock.rs
 new file mode 100644
-index 0000000..64d13c5
+index 0000000..6cdfce6
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/mock.rs
-@@ -0,0 +1,105 @@
+@@ -0,0 +1,139 @@
 +//! Mock Frozen device used by `--dry-run` (so dry-run is testable on a normal development
 +//! computer with no real hardware attached) and reused directly by integration tests. Speaks the
 +//! exact real wire framing (`opensleep::common::codec::command`) on one end of a
@@ -2413,13 +3010,29 @@ index 0000000..64d13c5
 +    opensleep::common::codec::command(vec![0xC0, 0x00, side, enabled as u8, t[0], t[1]])
 +}
 +
++/// Matches `FrozenPacket::parse_temperature_update`'s exact layout (opcode + 8 bytes: left/
++/// right/heatsink as big-endian u16, then a one-byte control-error term, then a one-byte
++/// wrapping counter). Real hardware pushes this unsolicited, on its own schedule, using the same
++/// raw opcode (0x41) as the `GetTemperatures` command itself -- see PROTOCOL_AUDIT.md.
++fn mock_temperature_update_frame(left: u16, right: u16, heatsink: u16, control_error_c: u8, count: u8) -> Vec<u8> {
++    let l = left.to_be_bytes();
++    let r = right.to_be_bytes();
++    let h = heatsink.to_be_bytes();
++    opensleep::common::codec::command(vec![0x41, l[0], l[1], r[0], r[1], h[0], h[1], control_error_c, count])
++}
++
 +/// Spawns a background task that answers Frozen commands plausibly: Ping -> in-firmware Pong,
-+/// GetHardwareInfo -> a fixed hardware-info fixture, GetTemperatures -> the fixed baseline
-+/// above, SetTargetTemperature -> an echoing TargetUpdate ack. Runs until the client side closes.
++/// GetHardwareInfo -> a fixed hardware-info fixture, GetTemperatures -> the fixed baseline above
++/// (both the solicited 0xC1 reply AND an immediately-following unsolicited 0x41 push, mirroring
++/// real hardware pushing telemetry on its own schedule independent of being polled -- see
++/// `cool_test.rs`, which relies on the unsolicited push, not the solicited reply, for safety
++/// monitoring), SetTargetTemperature -> an echoing TargetUpdate ack. Runs until the client side
++/// closes.
 +pub fn spawn_mock_frozen_device(mut device_side: DuplexStream) -> tokio::task::JoinHandle<()> {
 +    tokio::spawn(async move {
 +        let mut acc = BytesMut::new();
 +        let mut read_buf = [0u8; 256];
++        let mut temperature_update_count: u8 = 0;
 +        loop {
 +            if acc.len() >= 2 {
 +                let len = acc[1] as usize;
@@ -2428,12 +3041,30 @@ index 0000000..64d13c5
 +                    let opcode = acc[2];
 +                    let payload = acc[2..2 + len].to_vec();
 +                    acc.advance(total);
++                    if opcode == 0x41 {
++                        temperature_update_count = temperature_update_count.wrapping_add(1);
++                        let mut combined = mock_get_temperature_frame();
++                        // The real captured evidence for this control-error term is 8-9 during
++                        // normal pump operation (frozen/command.rs source comment; real passive
++                        // telemetry from this hardware consistently reports 9) -- never a fault
++                        // code, so the mock reuses that exact value rather than 0.
++                        combined.extend(mock_temperature_update_frame(
++                            MOCK_BASELINE_LEFT_CENTIDEG,
++                            MOCK_BASELINE_RIGHT_CENTIDEG,
++                            MOCK_HEATSINK_CENTIDEG,
++                            9,
++                            temperature_update_count,
++                        ));
++                        if device_side.write_all(&combined).await.is_err() {
++                            break;
++                        }
++                        continue;
++                    }
 +                    let response = match opcode {
 +                        0x01 => Some(mock_pong_frame(true)),
 +                        0x02 => Some(mock_hardware_info_frame()),
 +                        0x04 => Some(opensleep::common::codec::command(vec![0x84])),
 +                        0x10 => Some(opensleep::common::codec::command(vec![0x90, 0x00])),
-+                        0x41 => Some(mock_get_temperature_frame()),
 +                        0x40 if payload.len() == 5 => {
 +                            let side = payload[1];
 +                            let enabled = payload[2] != 0;
@@ -3025,10 +3656,10 @@ index 0000000..986af26
 +}
 diff --git a/src/bin/opensleep-diagnostic/report.rs b/src/bin/opensleep-diagnostic/report.rs
 new file mode 100644
-index 0000000..2b1490a
+index 0000000..280409c
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/report.rs
-@@ -0,0 +1,310 @@
+@@ -0,0 +1,317 @@
 +//! Structured JSON/CSV/text reporting shared by all three subcommands. Machine evidence (audit
 +//! log, decoded telemetry) is always kept in separate fields from operator-entered observations,
 +//! per the safety model: a component may only be marked PASS from decoded evidence or an explicit
@@ -3115,7 +3746,11 @@ index 0000000..2b1490a
 +    pub left_water_c: Option<f64>,
 +    pub right_water_c: Option<f64>,
 +    pub heatsink_c: Option<f64>,
-+    pub error_deg_raw: Option<u8>,
++    /// Control-loop error term in degrees C (`TemperatureUpdate.error`, source-documented as
++    /// "error in deg celcius"). NOT a fault/status code -- see `telemetry::TemperatureSample`'s
++    /// doc comment for the evidence. `None` for samples decoded from a solicited `GetTemperature`
++    /// reply, which carries no such field.
++    pub control_error_c: Option<u8>,
 +    pub raw_left_centideg: Option<u16>,
 +    pub raw_right_centideg: Option<u16>,
 +    pub raw_heatsink_centideg: Option<u16>,
@@ -3133,7 +3768,7 @@ index 0000000..2b1490a
 +            left_water_c: s.left_water_c,
 +            right_water_c: s.right_water_c,
 +            heatsink_c: s.heatsink_c,
-+            error_deg_raw: s.error_deg,
++            control_error_c: s.control_error_c,
 +            raw_left_centideg: s.raw_left,
 +            raw_right_centideg: s.raw_right,
 +            raw_heatsink_centideg: s.raw_heatsink,
@@ -3257,7 +3892,10 @@ index 0000000..2b1490a
 +
 +    pub fn write_csv(&self, path: &str) -> std::io::Result<()> {
 +        let mut w = std::fs::File::create(path)?;
-+        writeln!(w, "elapsed_ms,left_water_c,right_water_c,heatsink_c,status_code")?;
++        // Renamed from the original "status_code" header: that name was inaccurate.
++        // `TemperatureUpdate.error` is a control-loop error term in degrees C, not a status/fault
++        // code -- see `telemetry::TemperatureSample::control_error_c`'s doc comment for evidence.
++        writeln!(w, "elapsed_ms,left_water_c,right_water_c,heatsink_c,control_error_c")?;
 +        for s in &self.telemetry_samples {
 +            writeln!(
 +                w,
@@ -3266,7 +3904,7 @@ index 0000000..2b1490a
 +                s.left_water_c.map(|v| v.to_string()).unwrap_or_default(),
 +                s.right_water_c.map(|v| v.to_string()).unwrap_or_default(),
 +                s.heatsink_c.map(|v| v.to_string()).unwrap_or_default(),
-+                s.error_deg_raw.map(|v| v.to_string()).unwrap_or_default(),
++                s.control_error_c.map(|v| v.to_string()).unwrap_or_default(),
 +            )?;
 +        }
 +        Ok(())
@@ -4068,10 +4706,10 @@ index 0000000..c11963b
 +}
 diff --git a/src/bin/opensleep-diagnostic/signals.rs b/src/bin/opensleep-diagnostic/signals.rs
 new file mode 100644
-index 0000000..0424193
+index 0000000..7e39199
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/signals.rs
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,163 @@
 +//! Everything that can cut an active phase short. `StopReason` is the vocabulary every abort path
 +//! (Ctrl+C, SIGTERM/SIGHUP, timeout, communication/telemetry error, panic, ...) reduces to before
 +//! `safe_stop::run_safe_stop` runs and the report is written.
@@ -4124,6 +4762,24 @@ index 0000000..0424193
 +    TemperatureRangeExceeded,
 +    Panic,
 +    PreflightRefused,
++    /// The selected side's pump was still reported off / at 0.000000V more than
++    /// `cool_test::PUMP_CONFIRM_GRACE` after the enable command was accepted -- evidence-gated:
++    /// only fires when a firmware pump message for our side was actually observed reporting
++    /// zero voltage, never merely from the absence of a message. See `cool_test::parse_pump_report`.
++    PumpNotConfirmedRunning,
++    /// A firmware message named the selected TEC as locked (matched by the literal substrings
++    /// "tec" and "lock" together, case-insensitively -- see `cool_test::is_tec_locked_message`).
++    TecLocked,
++    /// Frozen sent an unsolicited `TargetUpdate` reporting the selected side disabled after we
++    /// had successfully enabled it -- i.e. the device turned the channel off on its own.
++    TargetDisabledUnexpectedly,
++    /// A firmware `Message` contained one of the generic fault keywords (overtemperature,
++    /// overcurrent, shutdown, fault, failed, locked) after the startup grace period. See
++    /// `cool_test::is_generic_fault_message` for the "flash locked" carve-out.
++    FirmwareFaultMessage,
++    /// The operator typed a report of a leak, burning smell, or abnormal noise (or the literal
++    /// word ABORT) during the active phase. See `cool_test::spawn_operator_abort_watcher`.
++    OperatorAbort,
 +}
 +
 +impl StopReason {
@@ -4146,6 +4802,11 @@ index 0000000..0424193
 +            StopReason::TemperatureRangeExceeded => "water temperature left the conservative compile-time range",
 +            StopReason::Panic => "internal panic or task failure",
 +            StopReason::PreflightRefused => "preflight checks refused to start the active test",
++            StopReason::PumpNotConfirmedRunning => "selected-side pump still reported off/0V after the startup grace period",
++            StopReason::TecLocked => "firmware reported the selected TEC locked",
++            StopReason::TargetDisabledUnexpectedly => "Frozen disabled the selected target unexpectedly",
++            StopReason::FirmwareFaultMessage => "firmware reported a fault condition by message",
++            StopReason::OperatorAbort => "operator reported a leak, smell, or abnormal noise",
 +        }
 +    }
 +}
@@ -4202,6 +4863,11 @@ index 0000000..0424193
 +            StopReason::TemperatureRangeExceeded,
 +            StopReason::Panic,
 +            StopReason::PreflightRefused,
++            StopReason::PumpNotConfirmedRunning,
++            StopReason::TecLocked,
++            StopReason::TargetDisabledUnexpectedly,
++            StopReason::FirmwareFaultMessage,
++            StopReason::OperatorAbort,
 +        ] {
 +            assert!(!reason.description().is_empty());
 +        }
@@ -4209,10 +4875,10 @@ index 0000000..0424193
 +}
 diff --git a/src/bin/opensleep-diagnostic/telemetry.rs b/src/bin/opensleep-diagnostic/telemetry.rs
 new file mode 100644
-index 0000000..9d00599
+index 0000000..ff1238e
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/telemetry.rs
-@@ -0,0 +1,159 @@
+@@ -0,0 +1,160 @@
 +//! Telemetry decoding and unit conversion for `FrozenPacket`.
 +//!
 +//! Unit evidence: `frozen/packet.rs` documents `FrozenTarget::temp`, `TemperatureUpdate`'s three
@@ -4221,7 +4887,7 @@ index 0000000..9d00599
 +//! target of `temp: 3600` and asserts its serialized bytes are `0E 10` (3600 decimal), consistent
 +//! with 36.00 C as a plausible heating-pad setpoint. Both facts agree: divide the raw `u16` by
 +//! 100 to get degrees Celsius. If this evidence were ever absent for a field, this module would
-+//! leave it unconverted and labeled unknown rather than guess -- see `error_deg` below.
++//! leave it unconverted and labeled unknown rather than guess -- see `control_error_c` below.
 +
 +use opensleep::frozen::FrozenPacket;
 +use opensleep::frozen::packet::{GetTemperature, TemperatureUpdate};
@@ -4239,13 +4905,14 @@ index 0000000..9d00599
 +    pub left_water_c: Option<f64>,
 +    pub right_water_c: Option<f64>,
 +    pub heatsink_c: Option<f64>,
-+    /// `TemperatureUpdate.error`: per the source doc comment this is "error in deg celcius", and
-+    /// the captured firmware log evidence in `frozen/command.rs` (`Message: FW: pid[heatsink]
-+    /// ...` appearing alongside an "Error: 8" line) shows it logged next to PID-loop debug
-+    /// output. Treated here as a PID error *term*, not a fault/status flag -- it is not used to
-+    /// gate pass/fail decisions because its exact semantics beyond "a temperature error value"
-+    /// are not established by the source.
-+    pub error_deg: Option<u8>,
++    /// `TemperatureUpdate.error`: per the source doc comment this is "error in deg celcius" (a
++    /// control-loop error term, in degrees C, NOT a fault/status code). Evidence: the captured
++    /// firmware log in `frozen/command.rs` shows "Temperature update ... Error: 8" logged
++    /// alongside PID-loop debug output during normal pump operation, and real passive telemetry
++    /// captured from this hardware consistently reports a value of 9 with no other sign of a
++    /// fault. Never used to gate pass/fail/abort decisions -- a nonzero value here is expected
++    /// and does not by itself indicate a problem.
++    pub control_error_c: Option<u8>,
 +    pub raw_left: Option<u16>,
 +    pub raw_right: Option<u16>,
 +    pub raw_heatsink: Option<u16>,
@@ -4268,7 +4935,7 @@ index 0000000..9d00599
 +        left_water_c: Some(centideg_to_celsius(g.left_temp)),
 +        right_water_c: Some(centideg_to_celsius(g.right_temp)),
 +        heatsink_c: Some(centideg_to_celsius(g.heatsink_temp)),
-+        error_deg: None,
++        control_error_c: None,
 +        raw_left: Some(g.left_temp),
 +        raw_right: Some(g.right_temp),
 +        raw_heatsink: Some(g.heatsink_temp),
@@ -4287,7 +4954,7 @@ index 0000000..9d00599
 +        left_water_c: Some(centideg_to_celsius(u.left_temp)),
 +        right_water_c: Some(centideg_to_celsius(u.right_temp)),
 +        heatsink_c: Some(centideg_to_celsius(u.heatsink_temp)),
-+        error_deg: Some(u.error),
++        control_error_c: Some(u.error),
 +        raw_left: Some(u.left_temp),
 +        raw_right: Some(u.right_temp),
 +        raw_heatsink: Some(u.heatsink_temp),

@@ -119,13 +119,17 @@ firmware and reports valid telemetry.
    ```
 5. Read SAFETY.md in full if you have not already.
 
-## 6. Run a 15-second cooling test on one side
+## 6. Run a 10-second cooling test on one side
+
+`--delta-c 1.0` and `--duration-seconds 10` are both already the defaults for a first test; they're
+spelled out below for clarity. Only the selected side is ever enabled -- the other side is
+explicitly disabled before the test starts and stays that way for the whole run.
 
 ```sh
 /persistent/tools/opensleep-diagnostic frozen-cool-test \
     --side left \
     --delta-c 1.0 \
-    --duration-seconds 15 \
+    --duration-seconds 10 \
     --confirm-cover-hydraulics-connected \
     --confirm-water-loop-filled \
     --confirm-no-visible-leaks \
@@ -157,11 +161,15 @@ During the active phase, watch/listen (without touching or metering the open boa
 * Leaks
 * A burning smell
 
-If you observe any of the last three, press **Ctrl+C** immediately, or run `emergency-stop` from
-your second session. The tool itself also aborts automatically on: lost/stale telemetry (> 2s),
-a UART read/write failure, an implausible temperature jump, the heatsink or water-temperature
-limits being exceeded, or the (non-overridable, 30-second-max) duration expiring — and always runs
-the same safe-stop sequence regardless of why it stopped.
+If you observe any of the last three, **type `ABORT` (or a word like `LEAK`) and press Enter**, or
+press **Ctrl+C** immediately, or run `emergency-stop` from your second session -- all three stop
+the test the same way. The tool itself also aborts automatically on: lost/stale telemetry (> 2s), a
+UART read/write failure, an implausible temperature jump, the heatsink or water-temperature limits
+being exceeded, the selected pump still reporting off/0V more than 3 seconds after being enabled,
+a firmware message reporting the selected TEC locked, Frozen disabling the selected side on its
+own, a firmware fault-keyword message after a brief startup grace period, or the (non-overridable,
+30-second-max) duration expiring -- see SAFETY.md for the full list. It always runs the same
+safe-stop sequence regardless of why it stopped.
 
 At the end, you'll be prompted for operator observations (pump heard/felt, fan seen/heard, airflow
 felt, leak observed, unusual smell/noise, free-text notes). These are stored in the JSON report as

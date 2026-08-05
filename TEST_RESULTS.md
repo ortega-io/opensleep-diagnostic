@@ -1,11 +1,32 @@
 # TEST_RESULTS.md — opensleep-diagnostic
 
-All 70 unit/integration tests in `src/bin/opensleep-diagnostic/` pass, plus the 51 pre-existing
-`opensleep` library tests (unmodified, reused as-is) and 0 doc-tests — 121 total, 0 failed. This
+All 91 unit/integration tests in `src/bin/opensleep-diagnostic/` pass, plus the 51 pre-existing
+`opensleep` library tests (unmodified, reused as-is) and 0 doc-tests — 142 total, 0 failed. This
 was verified twice: once on the host development machine (native target), and again inside the
 `messense/rust-musl-cross:aarch64-musl` builder image via `cargo test --locked` under its
 built-in QEMU aarch64 runner (the same environment the release binary is built in) — see
 `build-report.txt`.
+
+## Revision note: active-test preflight correction
+
+This revision corrects the active-test preflight and safety monitoring based on evidence from a
+real `frozen-passive` run and closer reading of the exact upstream source (see PROTOCOL_AUDIT.md
+for the full account):
+
+* `TemperatureUpdate.error` is a control-loop error term in degrees C, not a fault/status code —
+  renamed to `control_error_c` in reports and never gates any decision.
+* Baseline collection and active-phase safety monitoring now rely exclusively on the unsolicited
+  `TemperatureUpdate` push (opcode `0x41`), not the solicited `GetTemperature` reply (opcode
+  `0xC1`), because real hardware sends a 14-byte `0xC1` frame while the reused parser requires
+  exactly 27 bytes and so never decodes it.
+* `[capwater]`/`[flowrate]` sensor-unavailable firmware messages are recorded as warnings, not
+  treated as fatal.
+* New evidence-gated active abort conditions were added: pump still reporting off/0V 3s after
+  enable, a TEC-locked firmware message, Frozen disabling the target unexpectedly, a generic
+  firmware fault-keyword message after a startup grace period, and an operator typing a report of
+  a leak/smell/noise (or `ABORT`) during the active phase.
+* `frozen-cool-test`'s default duration changed from 15 to 10 seconds for a first test; the hard
+  30-second maximum is unchanged.
 
 Mocking approach: `tokio::io::duplex` pairs stand in for the Frozen UART, decoded/encoded with the
 real, unmodified `opensleep::common::codec::PacketCodec`/`FrozenCommand` (never a hand-rolled
@@ -25,7 +46,7 @@ deliberately *not* exercised (see item 19 below).
    `passive::tests::passive_sends_safety_off_for_both_sides`.
 3. **Passive mode can enter Frozen firmware and decode telemetry.**
    `passive::tests::dry_run_never_touches_real_devices_and_reaches_firmware`,
-   `frozen_ops::tests::get_temperatures_decodes_the_solicited_response`.
+   `frozen_ops::tests::get_temperatures_solicited_reply_still_decodes_from_the_mock`.
 4. **Missing 0x53 never aborts Frozen testing.**
    `i2c::tests::missing_led_controller_is_reported_but_not_fatal`; the dry-run mock's `0x53` read
    is scripted to fail (`i2c::MockI2c::always_succeed`, which despite its name deliberately fails
@@ -144,6 +165,37 @@ cannot even appear in the enumeration) and checks which of the three `Mode`s acc
 logging the per-mode result. Combined with the whitelist tests above (#1, #2, #13, #14, #15, #16,
 #30), this gives an executable, falsifiable version of the "which modes permit it" table in
 PROTOCOL_AUDIT.md.
+
+## New tests added for the corrected active-test preflight/monitoring
+
+* `cool_test::tests::nonzero_control_error_never_rejects_a_sample` / `evaluate_tick_has_no_control_error_parameter_to_gate_on` —
+  proves `control_error_c` cannot gate a decision.
+* `cool_test::tests::pump_report_detects_running_from_nonzero_voltage`,
+  `pump_report_detects_off_from_zero_voltage`, `pump_report_detects_explicit_off_word`,
+  `pump_report_ignores_the_other_side`, `pump_report_ignores_unrelated_messages` — pump-message
+  parsing.
+* `cool_test::tests::tec_locked_message_is_detected`, `flash_locked_is_not_a_tec_lock` — TEC-lock
+  detection and its "flash locked" carve-out at the unit level.
+* `cool_test::tests::generic_fault_keywords_are_detected`,
+  `flash_locked_is_excluded_from_the_generic_fault_scan` — same carve-out for the broader keyword
+  scan.
+* `cool_test::tests::capwater_and_flowrate_unavailable_are_recognized_as_nonfatal_sensor_messages`.
+* `cool_test::tests::frozen_disabling_the_target_unexpectedly_triggers_safe_stop` — a fake device
+  that acks the enable command and then proactively pushes an unsolicited `TargetUpdate(enabled=
+  false)`, proving `TargetDisabledUnexpectedly` fires and safe-stop still runs.
+* `cool_test::tests::tec_locked_message_triggers_safe_stop`,
+  `flash_locked_message_does_not_trigger_safe_stop` (regression test for the carve-out),
+  `generic_fault_message_triggers_safe_stop_after_the_grace_period` — end-to-end abort behavior
+  against a fake device that emits the relevant firmware `Message`.
+* `cool_test::tests::operator_reported_leak_aborts_the_active_phase`,
+  `unrecognized_operator_input_does_not_abort` — the operator-abort channel, injected directly into
+  `run_core` for testability (mirroring the existing `assume_interactive_phrase` pattern) since the
+  production path only spawns a real stdin-reading thread when stdin is a TTY.
+* `cool_test::tests::dry_run_uses_unsolicited_updates_and_reaches_a_verdict` — confirms `--dry-run`
+  now exercises the unsolicited-update-driven path end to end.
+* `link::tests::send_only_writes_without_waiting_for_a_reply`,
+  `send_only_is_rejected_by_the_whitelist_before_any_bytes_are_written` — the new
+  `FrozenLink::send_only` fire-and-forget primitive.
 
 ## Known gaps (stated plainly, not hidden)
 

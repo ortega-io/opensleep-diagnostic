@@ -1,9 +1,45 @@
 opensleep-diagnostic — build report
 ====================================
 
-Patch revision: 3 (staged, Frozen-only diagnostic: frozen-passive / frozen-cool-test / emergency-stop)
-Supersedes revision 2 (sensor-first post-reset bootloader retry-probe) and revision 1 (initial
-diagnostic-only fork). Same upstream base commit; only source.patch changed.
+Patch revision: 4 (corrected active-test preflight/monitoring based on real hardware evidence)
+Supersedes revision 3 (staged, Frozen-only diagnostic redesign), revision 2 (sensor-first
+post-reset bootloader retry-probe), and revision 1 (initial diagnostic-only fork). Same upstream
+base commit; only source.patch changed.
+
+What changed in revision 4
+---------------------------
+Corrected `frozen-cool-test`'s active-test preflight and safety monitoring based on evidence from
+a real `frozen-passive` run and closer reading of the exact upstream source. Full account in
+PROTOCOL_AUDIT.md and TEST_RESULTS.md; summary:
+
+  - `TemperatureUpdate.error` is a control-loop error term in degrees C, not a fault/status code
+    (source doc comment: "error in deg celcius"; real captured telemetry consistently reports 9
+    with no other sign of a fault). Renamed to `control_error_c` in JSON/CSV output and confirmed
+    to never gate any pass/fail/abort decision -- `cool_test::evaluate_tick` doesn't even take
+    this field as a parameter.
+  - Baseline collection and active-phase safety monitoring now rely exclusively on the unsolicited
+    `TemperatureUpdate` push (opcode 0x41), not the solicited `GetTemperature` reply (opcode
+    0xC1): real hardware has been observed sending a 14-byte 0xC1 frame, while the reused,
+    unmodified parser requires exactly 27 bytes and so never decodes it. The solicited reply is
+    still requested each tick (via a new `FrozenLink::send_only` fire-and-forget primitive) and
+    preserved/logged as raw evidence when it does decode, but nothing safety-relevant depends on
+    it anymore.
+  - `[capwater]`/`[flowrate]` sensor-unavailable firmware messages are recorded as warnings, not
+    treated as fatal (observed persisting with the cover connected and the reservoir filled; flow
+    itself is not exercised until a pump actually runs).
+  - New evidence-gated active-phase abort conditions: the selected pump still reporting off/0V
+    more than 3 seconds after being enabled; a firmware message reporting the selected TEC locked;
+    Frozen disabling the selected side on its own; a firmware fault-keyword message
+    (overtemperature/overcurrent/shutdown/fault/failed/locked) after a 2-second startup grace
+    period, with a documented carve-out for the evidenced, benign "flash locked" message; and the
+    operator typing a report of a leak/smell/noise (or the literal word ABORT) during the active
+    phase, read from a background stdin watcher started only after every confirmation-phrase read
+    is complete.
+  - `frozen-cool-test`'s default duration changed from 15 to 10 seconds for a first test; the hard
+    30-second maximum, the 2.0C max delta, and the 15-35C baseline range are all unchanged.
+  - Pump operation can now be reported PASS (not just UNVERIFIED) from decoded firmware voltage
+    evidence, and FAIL if the most recent such message reports 0V/off -- still never PASS merely
+    because the enable command was accepted.
 
 What changed in revision 3
 ---------------------------
@@ -61,10 +97,12 @@ Tests:       cargo test --locked (run under the image's built-in QEMU test runne
 Test results (this build, inside the builder image)
 -----------------------------------------------------
 opensleep (lib) unit tests:               51 passed, 0 failed
-opensleep-diagnostic (bin) unit tests:    70 passed, 0 failed
+opensleep-diagnostic (bin) unit tests:    91 passed, 0 failed
 Doc-tests:                                 0 (none defined)
 
-See TEST_RESULTS.md for the full breakdown against the safety spec's 30-item test checklist.
+See TEST_RESULTS.md for the full breakdown against the safety spec's 30-item test checklist, plus
+the "New tests added for the corrected active-test preflight/monitoring" section for this
+revision's additions.
 
 Artifact validation
 --------------------
@@ -72,18 +110,20 @@ file:      dist/opensleep-diagnostic-aarch64-static: ELF 64-bit LSB executable, 
            version 1 (SYSV), statically linked, stripped
 readelf -l: 6 program headers (LOAD x2, TLS, GNU_EH_FRAME, GNU_STACK, GNU_RELRO); no
            PT_INTERP segment -- confirms no dynamic program interpreter, i.e. truly static.
-sha256sum: 22b611308b7e69ee42428d85666a4fb8e99d32897dd610dbce10004b16c9e1d6  opensleep-diagnostic-aarch64-static
+sha256sum: 245ec05f1e65711d61400f9d6e7b0f2a8d8babf1b2f83538130742174247a200  opensleep-diagnostic-aarch64-static
            (2,167,520 bytes)
            Verified against the .sha256 file written by the same build: OK
 Smoke test: qemu-aarch64-static (user-mode emulation) was used to actually run the built ARM64
            binary on the x86-64 build host: `--help`, `frozen-passive --dry-run`,
            `frozen-cool-test --dry-run` (with hidden --assume-* test flags standing in for the
-           interactive phrases), and `emergency-stop --dry-run` all ran successfully and produced
-           the expected JSON reports and log output. This caught and fixed one real bug before
-           this final build: the active-phase polling loop was not pacing itself to ~1 request/
-           second against a fast-responding device (it would have flooded a real Frozen UART with
-           commands far faster than intended); a tick-pacing sleep was added and reverified both
-           by `cargo test` and by rerunning this same qemu smoke test.
+           interactive phrases, --duration-seconds 5), and `emergency-stop --dry-run` all ran
+           successfully and produced the expected JSON reports and log output. The cool-test run
+           decoded both unsolicited TemperatureUpdate samples (error/control_error_c=9, matching
+           the real captured evidence) and solicited GetTemperature samples from the mock, took
+           ~11.5s wall-clock for a 5s active phase plus baseline collection (consistent with ~1
+           request/second pacing, not the runaway-flood bug fixed in the prior revision), and the
+           JSON output confirmed the field is now named `control_error_c` with no remaining
+           `error_deg` references.
 
 Deliverables
 ------------

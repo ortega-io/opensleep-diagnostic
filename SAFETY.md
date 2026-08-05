@@ -67,11 +67,13 @@ enforced structurally in two independent layers (a closed `FrozenAction` enum wi
 
 ## Active-test limits (hard-coded; no CLI flag can override them)
 
-* Exactly one side per invocation; cooling only (no heating) in this first build.
+* Exactly one side per invocation; cooling only (no heating) in this first build. The other side is
+  explicitly disabled before the test starts and stays that way for the whole run.
 * Default cooling delta: 1.0C below the measured baseline. **Maximum permitted delta: 2.0C** —
   `safety::FrozenAction::enable_cooling` refuses to construct a command for a larger delta.
-* Default active duration: 15 seconds. **Absolute maximum: 30 seconds** —
-  `cool_test::run` refuses to start at all if `--duration-seconds` exceeds this.
+* Default active duration: **10 seconds**, chosen conservatively for a first test. **Absolute
+  maximum: 30 seconds** — `cool_test::run` refuses to start at all if `--duration-seconds` exceeds
+  this.
 * The baseline water temperature must fall within **15.00C–35.00C**
   (`cool_test::MIN_WATER_CENTIDEG`/`MAX_WATER_CENTIDEG`) before the test proceeds. This range is a
   conservative, compile-time choice (not derived from a documented firmware spec — see
@@ -79,6 +81,38 @@ enforced structurally in two independent layers (a closed `FrozenAction` enum wi
   reject a disconnected/faulted sensor (implausible highs/lows, `0`/`0xFFFF` sentinels) while still
   accepting any plausible indoor ambient-to-body-adjacent water temperature.
 * No `Prime`. No arbitrary/absolute commands.
+
+## Automatic abort conditions during the active phase
+
+The active phase aborts itself (and always runs safe-stop) on any of the following, in addition to
+Ctrl+C, SIGTERM/SIGHUP, and the duration expiring:
+
+* No fresh, valid unsolicited temperature update for more than 2 seconds.
+* The selected-side water temperature or the heatsink temperature leaves the compile-time safe
+  range, or changes implausibly fast in a single ~1-second tick.
+* A UART write or read failure, or the link to Frozen closing.
+* The selected-side pump still reports off/0V (via a decoded firmware message) more than 3 seconds
+  after the enable command was accepted. This only fires if the firmware has actually reported the
+  pump as off — it never fires merely because no pump message was seen at all.
+* A firmware message reports the selected TEC as locked.
+* Frozen reports the selected side disabled on its own, after this tool enabled it.
+* A firmware message contains a fault keyword (overtemperature, overcurrent, shutdown, fault,
+  failed, locked) more than 2 seconds into the active phase — giving a brief startup grace period
+  so ordinary boot-time chatter isn't mistaken for a fault.
+* **You type `ABORT` and press Enter** (or a report of a leak, smell, or noise — see below).
+
+Firmware messages reporting `[capwater]` or `[flowrate]` sensor unavailable are recorded as
+warnings, not treated as an automatic abort condition on their own — they have been observed with
+the cover connected and the reservoir filled, and flow itself is not exercised until a pump
+actually runs during an active test.
+
+### Typing ABORT during an active test
+
+Once the active phase starts, this tool prints a reminder and reads your terminal input in the
+background for the rest of the run. If you observe a leak, a burning smell, or abnormal mechanical
+noise, **type a word describing it (e.g. `LEAK`) or the literal word `ABORT`, then press Enter** —
+this stops the test immediately, exactly like Ctrl+C. Unrecognized input is ignored and logged; it
+does not abort the run.
 
 ## Required confirmations before `frozen-cool-test` can run
 
