@@ -1,11 +1,10 @@
 # TEST_RESULTS.md — opensleep-diagnostic
 
-All 141 unit/integration tests in `src/bin/opensleep-diagnostic/` pass, plus the 51 pre-existing
-`opensleep` library tests (unmodified, reused as-is) and 0 doc-tests — 192 total, 0 failed. This
-was verified on the host development machine (native target); see `build-report.txt` for the most
-recent verification inside the `messense/rust-musl-cross:aarch64-musl` builder image via
+All 142 unit/integration tests in `src/bin/opensleep-diagnostic/` pass, plus the 51 pre-existing
+`opensleep` library tests (unmodified, reused as-is) and 0 doc-tests — 193 total, 0 failed. This
+was verified inside the `messense/rust-musl-cross:aarch64-musl` builder image via
 `cargo test --locked` under its built-in QEMU aarch64 runner (the same environment the release
-binary is built in).
+binary is built in) as part of the actual release build -- see `build-report.txt`.
 
 ## Revision note: `--preserve-boot-state` replaced with `frozen-prime-opensleep-init`
 
@@ -31,18 +30,18 @@ empty" (only a genuine firmware-reported pump fault does, via this diagnostic's 
 `assert_reset` primitive). See SAFETY.md and `prime_opensleep_init.rs`'s module docs for the full
 design rationale and safety-model writeup.
 
-12 new tests were added (129 → 141 in this file's directory, after removing the 5
-`--preserve-boot-state` tests and adding 17 new ones): 7 in `prime_opensleep_init.rs` (preflight
-refusals, dry-run behavior, the narrow pump-fault matcher, and the in-memory `Config` construction
--- `away_mode` stays `false` and temperature targets are disabled via an empty profile instead,
-since `away_mode = true` would also block the Prime schedule), 4 in the new `log_tap.rs` (capture/
-checkpoint/exact-match behavior, including that `"done"` and `"done because empty"` are never
-confused), and 1 in the new `confirm.rs` (the interactive-phrase helper extracted out of
-`prime_test.rs` so both Prime-sending modes share one implementation). `main.rs`'s `guardrail_tests`
-were also rewritten: four tests that previously asserted Sensor/MQTT/the LED driver/the real Frozen
-manager are *never* referenced anywhere now assert they are referenced *only* by
-`prime_opensleep_init.rs` -- and that even that file never references the real config-file loader
-or `rumqttc` directly, since it still builds its own in-memory configuration.
+8 net new tests were added (129 → 142 in this file's directory, after removing the 5
+`--preserve-boot-state` tests and adding 13 new ones): 8 in `prime_opensleep_init.rs` (preflight
+refusals, dry-run behavior and its JSON output, the narrow pump-fault matcher, and the in-memory
+`Config` construction -- `away_mode` stays `false` and temperature targets are disabled via an
+empty profile instead, since `away_mode = true` would also block the Prime schedule), 4 in the new
+`log_tap.rs` (capture/checkpoint/exact-match behavior, including that `"done"` and `"done because
+empty"` are never confused), and 1 in the new `confirm.rs` (the interactive-phrase helper extracted
+out of `prime_test.rs` so both Prime-sending modes share one implementation). `main.rs`'s
+`guardrail_tests` were also rewritten: four tests that previously asserted Sensor/MQTT/the LED
+driver/the real Frozen manager are *never* referenced anywhere now assert they are referenced
+*only* by `prime_opensleep_init.rs` -- and that even that file never references the real
+config-file loader or `rumqttc` directly, since it still builds its own in-memory configuration.
 
 The real `opensleep::frozen::run`/`opensleep::sensor::run` futures turned out not to be `Send`
 (both hold a `tokio::sync::watch::Ref` internally), so unlike this binary's other mocked/spawned
@@ -55,10 +54,14 @@ returns.
 Because the real, unmodified upstream code hardcodes real serial ports and I2C devices with no
 mock transport to substitute, `frozen-prime-opensleep-init` cannot be exercised against a mock the
 way this binary's other `--dry-run` modes are; its own `--dry-run` only validates confirmations/
-arguments and skips real initialization entirely. Its happy-path behavior (successful Prime send,
-`"done because empty"`, capwater-abort) was verified by hand against real hardware evidence rather
-than by an automated mock-based test -- see the module docs for why no such mock exists for this
-mode specifically.
+arguments and skips real initialization entirely. **Its active-path behavior (a real Ping/Pong
+exchange, the real capwater/flowrate check, an actual Prime send, and the `"done"`/`"done because
+empty"` distinction) has not yet been exercised against real Frozen hardware or verified any other
+way** -- only the CLI surface (`--help`, argument/confirmation validation, `--dry-run`'s exit code
+and JSON output) has been smoke-tested against the actual cross-compiled binary so far (see
+`build-report.txt`), which is how three CLI-surface bugs were caught before this build shipped.
+Run this mode against real hardware and update this note with what was observed before relying on
+its active-path claims.
 
 ## Revision note: `frozen-prime-test` added
 
