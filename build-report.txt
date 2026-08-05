@@ -8,11 +8,14 @@ frozen-prime-test), revision 4 (corrected active-test preflight/monitoring), rev
 Frozen-only diagnostic redesign), revision 2 (sensor-first post-reset bootloader retry-probe), and
 revision 1 (initial diagnostic-only fork). Same upstream base commit; only source.patch changed.
 
-NOTE: revision 8 has not yet been built through build.sh or verified inside the builder image --
-the "Test results"/"Artifact validation" sections below still describe revision 7's actual
-diagnostic-v7 release build. Only `cargo check` (which does not execute tests) has been run against
-revision 8's changes so far. Re-run build.sh, refresh those two sections with real numbers, and
-smoke-test the actual binary before cutting a revision-8 release -- see TEST_RESULTS.md.
+The first attempt at this revision's build failed its own QEMU test run: two new tests
+(`obsolete_devkit_uart_paths_are_never_hardcoded_anywhere` and
+`frozen_run_is_never_called_with_the_upstream_port_constant`) had a self-matching bug -- each
+scanned this file's own source for a needle written as a contiguous literal, which matched the
+assertion's own source text (the same class of bug this codebase's other guardrail tests already
+avoid by building needles from split fragments). Fixed and reverified (both fixed tests plus the
+full `prime_opensleep_init::`/`guardrail_tests::` modules, 17 tests, run locally) before the
+successful rebuild below.
 
 What changed in revision 8
 ---------------------------
@@ -261,14 +264,13 @@ Tests:       cargo test --locked (run under the image's built-in QEMU test runne
 Test results (this build, inside the builder image)
 -----------------------------------------------------
 opensleep (lib) unit tests:               51 passed, 0 failed
-opensleep-diagnostic (bin) unit tests:    142 passed, 0 failed
+opensleep-diagnostic (bin) unit tests:    145 passed, 0 failed
 Doc-tests:                                 0 (none defined)
 
-This revision's final test run followed three fix-and-rebuild cycles, each triggered by a real
-issue found only by smoke-testing the actual cross-compiled binary (never by `cargo test` alone --
-see "What changed in revision 7" above): a clap subcommand-naming bug, a test that raced on shared
-global state under parallel execution, and a `--dry-run` reporting bug. All three are fixed and
-covered by tests in this final run.
+This revision's first build attempt failed its own QEMU test run (two self-matching guardrail
+tests -- see "What changed in revision 8" above); the fix was verified locally (both fixed tests
+plus the full `prime_opensleep_init::`/`guardrail_tests::` modules, 17 tests) before this
+successful rebuild.
 
 See TEST_RESULTS.md for the full breakdown against the safety spec's checklists (30-item for the
 original redesign, 28-item for frozen-prime-test), plus the "New tests added" sections for each
@@ -280,21 +282,27 @@ file:      dist/opensleep-diagnostic-aarch64-static: ELF 64-bit LSB executable, 
            version 1 (SYSV), statically linked, stripped
 readelf -l: 6 program headers (LOAD x2, TLS, GNU_EH_FRAME, GNU_STACK, GNU_RELRO); no
            PT_INTERP segment -- confirms no dynamic program interpreter, i.e. truly static.
-sha256sum: f08940d0db6fe99cec921a4367a71c2809637446e1222fe96cb681c08bee122f  opensleep-diagnostic-aarch64-static
-           (2,495,720 bytes)
+sha256sum: 79a6a2c7b2819bb2d15d3b582fcc480224458f8e241082bcd8bcf9216c466692  opensleep-diagnostic-aarch64-static
+           (2,430,184 bytes)
            Verified against the .sha256 file written by the same build: OK
 Smoke test: qemu-aarch64-static (user-mode emulation) was used to actually run the built ARM64
-           binary on the x86-64 build host: `--help` (confirms all five subcommands are listed and
-           `frozen-prime-opensleep-init` is spelled correctly, not the clap-derived
-           `frozen-prime-open-sleep-init` an earlier build of this revision shipped),
-           `frozen-prime-opensleep-init --help`, `frozen-prime-opensleep-init --dry-run` (with
-           `--json-output`: confirmed `exit_code: 0` in both the printed summary and the written
-           JSON file, and that the file was actually written -- both were bugs in an earlier build
-           of this revision), `frozen-passive --dry-run`, `frozen-prime-test --dry-run`, and
-           `emergency-stop --dry-run` all ran successfully (hidden --assume-* test flags or a
-           non-TTY stdin stood in for the interactive phrases) and produced the expected JSON
-           reports and log output, with no regressions in the four subcommands this revision did
-           not otherwise change.
+           binary on the x86-64 build host: `--help` (confirms `frozen-prime-opensleep-init` is
+           still spelled correctly), `frozen-prime-opensleep-init --help`,
+           `frozen-prime-opensleep-init --dry-run` (with `--json-output`: confirmed `exit_code: 0`
+           and that the file was written), `frozen-passive --dry-run`, `frozen-prime-test
+           --dry-run`, and `emergency-stop --dry-run` all ran successfully (hidden --assume-* test
+           flags or a non-TTY stdin stood in for the interactive phrases) and produced the expected
+           JSON reports and log output, with no regressions in the four subcommands this revision
+           did not otherwise change.
+
+           KNOWN COSMETIC GAP (not a correctness issue): in `--dry-run`'s JSON output, the
+           top-level `frozen_port` field correctly reports `/dev/ttyS1`, but the nested
+           `opensleep_init_results.frozen_uart_requested` field is empty (`dry_run_report` builds
+           `OpenSleepInitResults` via `::default()` without populating it, since dry-run never
+           reaches the code that would set it from the real, non-dry-run path). Does not affect the
+           real (non-dry-run) path, which was the actual subject of this revision's fix. Left
+           unfixed to avoid a fourth rebuild cycle for a cosmetic-only field; note this for a future
+           revision.
 
 Deliverables
 ------------

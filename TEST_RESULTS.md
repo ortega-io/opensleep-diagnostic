@@ -1,13 +1,13 @@
 # TEST_RESULTS.md — opensleep-diagnostic
 
-145 unit/integration tests now exist in `src/bin/opensleep-diagnostic/` (up from 142; see the
+All 145 unit/integration tests in `src/bin/opensleep-diagnostic/` pass (up from 142; see the
 revision note directly below), plus the 51 pre-existing `opensleep` library tests (unmodified,
-reused as-is) and 0 doc-tests. The 142/51/0 counts were verified inside the
+reused as-is) and 0 doc-tests — 196 total, 0 failed. Verified inside the
 `messense/rust-musl-cross:aarch64-musl` builder image via `cargo test --locked` under its built-in
-QEMU aarch64 runner (the same environment the release binary is built in) as part of the diagnostic-v7
-release build -- see `build-report.txt`. **The 3 tests added since then have not yet been run
-through that same builder-image verification** (only `cargo check`, which does not execute tests,
-has been run against them so far) -- do that before cutting the next release.
+QEMU aarch64 runner (the same environment the release binary is built in) as part of the
+diagnostic-v8 release build -- see `build-report.txt`. (The first build attempt at this revision
+failed its own QEMU test run over two self-matching guardrail tests, described in the revision note
+below; the fix is included in these final counts.)
 
 ## Revision note: fix Frozen/Sensor UART paths for this Hub variant
 
