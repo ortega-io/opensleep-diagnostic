@@ -36,8 +36,8 @@ verification, then move it into place):
 
 ```sh
 cd /tmp
-curl -L -O https://github.com/ortega-io/opensleep-diagnostic/releases/download/diagnostic-v10/opensleep-diagnostic-aarch64-static
-curl -L -O https://github.com/ortega-io/opensleep-diagnostic/releases/download/diagnostic-v10/opensleep-diagnostic-aarch64-static.sha256
+curl -L -O https://github.com/ortega-io/opensleep-diagnostic/releases/download/diagnostic-v11/opensleep-diagnostic-aarch64-static
+curl -L -O https://github.com/ortega-io/opensleep-diagnostic/releases/download/diagnostic-v11/opensleep-diagnostic-aarch64-static.sha256
 sha256sum -c opensleep-diagnostic-aarch64-static.sha256
 mv opensleep-diagnostic-aarch64-static /persistent/tools/opensleep-diagnostic
 ```
