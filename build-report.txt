@@ -486,14 +486,13 @@ Tests:       cargo test --locked (run under the image's built-in QEMU test runne
 Test results (this build, inside the builder image)
 -----------------------------------------------------
 opensleep (lib) unit tests:               51 passed, 0 failed
-opensleep-diagnostic (bin) unit tests:    186 passed, 0 failed
+opensleep-diagnostic (bin) unit tests:    218 passed, 0 failed
 Doc-tests:                                 0 (none defined)
 
-This revision's build succeeded on the first attempt. The bin test suite took noticeably longer
-under the builder image's QEMU aarch64 runner than prior revisions (68.45s vs ~44s for revision 11)
--- expected, since frozen-cool-test's own preflight now collects baseline samples over >=10 seconds
-per test (up from >=5s), and its test count grew accordingly; still comfortably within the build's
-normal time budget.
+This revision's build succeeded on the first attempt. The bin test suite finished in 73.13s under
+the builder image's QEMU aarch64 runner (68.45s for revision 12) -- expected, given 32 net new
+tests, several of which (the new end-to-end baseline tests) each wait out the real >=10s baseline
+window; still comfortably within the build's normal time budget.
 
 See TEST_RESULTS.md for the full breakdown against the safety spec's checklists (30-item for the
 original redesign, 28-item for frozen-prime-test), plus the "New tests added" sections for each
@@ -505,22 +504,23 @@ file:      dist/opensleep-diagnostic-aarch64-static: ELF 64-bit LSB executable, 
            version 1 (SYSV), statically linked, stripped
 readelf -l: 6 program headers (LOAD x2, TLS, GNU_EH_FRAME, GNU_STACK, GNU_RELRO); no
            PT_INTERP segment -- confirms no dynamic program interpreter, i.e. truly static.
-sha256sum: e33acc145a6aa8f7343742dc9208fa8875f3fab7bcfccbf066ee07a867fc607f  opensleep-diagnostic-aarch64-static
+sha256sum: 54f42e2beb33a878782ad2308b68ade303aae76cf2306dc74b87fc81eb284d58  opensleep-diagnostic-aarch64-static
            (2,561,320 bytes)
            Verified against the .sha256 file written by the same build: OK
 Smoke test: qemu-aarch64-static (user-mode emulation) was used to actually run the built ARM64
            binary on the x86-64 build host: top-level `--help` and `frozen-cool-test --help`
            (confirms `--duration-seconds` defaults to 120/caps at 300, and `--raw-serial-log` is
            present); `frozen-cool-test --side left --dry-run --duration-seconds 3` ran end to end
-           against the mocked I2C expander and mock Frozen device, through the exact same
-           three-write narrow pulse `--release-frozen-only` uses (register 0x02 asserted 0xFF,
-           register 0x06 configured 0xFF -> 0xFD with "bit 1 ... previously configured as: input",
-           register 0x02 released to 0xFD, pulse duration ~103ms -- confirmed byte-for-byte
-           identical to `--release-frozen-only`'s own log output), producing a full
-           `cool_test_results` block (`Shutdown verified: true`, `Emergency reset asserted: false`
-           for the normal `DurationExpired` stop, confirming no I2C write occurred on a clean
-           finish) and a written JSON report. `--raw-serial-log` was verified directly: 0 raw
-           RX/TX log lines with the flag absent, 50 with it present, on otherwise-identical runs.
+           against the mocked I2C expander and mock Frozen device, producing a full
+           `cool_test_results` block with the new baseline-reporting fields populated
+           (`baseline_samples_requested: 5`, `baseline_synchronous_samples_decoded: 12`,
+           `baseline_duplicate_samples_discarded: 12` -- the mock device pairs a solicited
+           `GetTemperature` reply with an unsolicited `TemperatureUpdate` push reporting the same
+           reading every tick, and the JSON confirms the second of each pair is correctly
+           recognized as a duplicate and discarded, not double-counted), `Shutdown verified: true`,
+           `Emergency reset asserted: false` for the normal `DurationExpired` stop (confirming no
+           I2C write occurred on a clean finish). `--raw-serial-log` was verified directly: 0 raw
+           RX/TX log lines with the flag absent, 52 with it present, on otherwise-identical runs.
            No regressions observed in the other subcommands (unchanged by this revision).
 
            KNOWN COSMETIC GAP (carried over from revision 8, not a correctness issue): in plain
