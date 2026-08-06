@@ -138,10 +138,10 @@ index 0000000..261be8d
 +}
 diff --git a/src/bin/opensleep-diagnostic/cli.rs b/src/bin/opensleep-diagnostic/cli.rs
 new file mode 100644
-index 0000000..2ee5e65
+index 0000000..1e767be
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/cli.rs
-@@ -0,0 +1,287 @@
+@@ -0,0 +1,288 @@
 +//! CLI surface. Every flag here maps to a fixed, validated field -- there is no flag that accepts
 +//! a raw opcode, a raw frame, or an arbitrary absolute temperature target. Side selection is a
 +//! closed `ValueEnum`; the cooling delta and duration are validated in `cool_test.rs` against
@@ -393,11 +393,12 @@ index 0000000..2ee5e65
 +    pub dry_run: bool,
 +
 +    /// Minimal startup mode: instead of the full upstream reset (ResetController) or the previous
-+    /// --preserve-boot-state behavior, release Frozen from reset by clearing only bit 1 of I2C
-+    /// expander register 0x02 (a read-modify-write that preserves every other bit), never writing
-+    /// registers 0x06/0x07. This replaces both the global OpenSleep reset and
-+    /// --preserve-boot-state; it does not call opensleep::reset::ResetController and does not run
-+    /// the real upstream Frozen or Sensor manager tasks.
++    /// --preserve-boot-state behavior, release Frozen from reset by pulsing only bit 1 of I2C
++    /// expander register 0x02 low->high->low (assert then release, each a read-modify-write that
++    /// preserves every other bit), never writing registers 0x06/0x07. This replaces both the
++    /// global OpenSleep reset and --preserve-boot-state; it does not call
++    /// opensleep::reset::ResetController and does not run the real upstream Frozen or Sensor
++    /// manager tasks.
 +    #[arg(long, default_value_t = false)]
 +    pub release_frozen_only: bool,
 +
@@ -2336,7 +2337,7 @@ index 0000000..666ce19
 +}
 diff --git a/src/bin/opensleep-diagnostic/i2c.rs b/src/bin/opensleep-diagnostic/i2c.rs
 new file mode 100644
-index 0000000..e5ded03
+index 0000000..9725bfa
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/i2c.rs
 @@ -0,0 +1,617 @@
@@ -2385,8 +2386,8 @@ index 0000000..e5ded03
 +    /// Reads a *specific* register's current value (a combined write-then-read transaction on real
 +    /// hardware), unlike [`Self::read_byte`] (a plain read at the device's current internal
 +    /// pointer, used only for simple presence-probing where the exact register doesn't matter).
-+    /// Needed for read-modify-write operations like [`release_frozen_reset_bit_only`], which must
-+    /// know the *current* value of register 0x02 before computing a new one.
++    /// Needed for read-modify-write operations like [`pulse_frozen_reset_bit`], which must know the
++    /// *current* value of register 0x02 before computing a new one.
 +    fn read_reg(&mut self, addr: u8, reg: u8) -> Result<u8, I2cIoError>;
 +    fn write_reg(&mut self, addr: u8, reg: u8, value: u8) -> Result<(), I2cIoError>;
 +}
@@ -2460,8 +2461,8 @@ index 0000000..e5ded03
 +    /// [`MockI2c::always_succeed`] and updated by every [`I2cPort::write_reg`] -- unlike
 +    /// [`Self::reads`] (a fixed table used only by [`I2cPort::read_byte`] for simple presence
 +    /// probing), this reflects writes, so a read-modify-write caller (like
-+    /// `release_frozen_reset_bit_only`) sees its own write reflected in a subsequent read, exactly
-+    /// as real hardware would.
++    /// `pulse_frozen_reset_bit`) sees its own write reflected in a subsequent read, exactly as real
++    /// hardware would.
 +    pub reg_state: std::collections::HashMap<(u8, u8), u8>,
 +    pub writes: Vec<(u8, u8, u8)>,
 +    pub fail_all_writes: bool,
@@ -2621,7 +2622,7 @@ index 0000000..e5ded03
 +}
 +
 +/// The result of a narrow, read-modify-write operation on register 0x02 -- see
-+/// [`release_frozen_reset_bit_only`]/[`assert_frozen_reset_bit_only`].
++/// [`pulse_frozen_reset_bit`]/[`assert_frozen_reset_bit_only`].
 +#[derive(Debug, Clone, Copy, Default)]
 +pub struct Reg02ReadModifyWriteResult {
 +    pub original: u8,
@@ -4703,10 +4704,10 @@ index 0000000..f4b95f7
 +}
 diff --git a/src/bin/opensleep-diagnostic/prime_opensleep_init.rs b/src/bin/opensleep-diagnostic/prime_opensleep_init.rs
 new file mode 100644
-index 0000000..ec57444
+index 0000000..ac53a77
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/prime_opensleep_init.rs
-@@ -0,0 +1,1459 @@
+@@ -0,0 +1,1460 @@
 +//! `frozen-prime-opensleep-init`: fills an empty or partially-filled hydraulic loop by sending
 +//! `Prime` exactly once, through the real, unmodified upstream OpenSleep initialization and Frozen
 +//! manager code -- `opensleep::reset::ResetController::reset_subsystems`, `opensleep::led`,
@@ -5000,14 +5001,15 @@ index 0000000..ec57444
 +/// `--release-frozen-only`: a minimal startup mode that replaces both the global upstream reset
 +/// (`opensleep::reset::ResetController`, used by [`run_core`] above) and the previous
 +/// `--preserve-boot-state` behavior. It never calls `ResetController` and never writes I2C
-+/// expander registers 0x06/0x07 -- see `i2c::release_frozen_reset_bit_only`'s doc comment for the
++/// expander registers 0x06/0x07 -- see `i2c::pulse_frozen_reset_bit`'s doc comment for the
 +/// real-hardware evidence behind this: the full reset sequence also reconfigures the
 +/// port-direction registers, which leaves the reservoir-fill indicator off and unresponsive even
 +/// though it does release Frozen. This mode releases Frozen with a narrow, single-bit
-+/// read-modify-write on register 0x02 instead, then drives Frozen through this diagnostic's own
-+/// audited `FrozenLink`/`AuditedTransport` (`Mode::PrimeTest`) -- not the real `frozen::run`
-+/// manager -- to Ping, jump to firmware if needed, observe startup messages, confirm the reservoir
-+/// indicator is still working, and send `Prime` exactly once.
++/// low->high->low **pulse** on register 0x02 instead (a one-shot clear was tried first and does
++/// not work -- see that function's doc comment for the real-hardware evidence why), then drives
++/// Frozen through this diagnostic's own audited `FrozenLink`/`AuditedTransport` (`Mode::PrimeTest`)
++/// -- not the real `frozen::run` manager -- to Ping, jump to firmware if needed, observe boot
++/// messages, confirm the reservoir indicator is still working, and send `Prime` exactly once.
 +async fn run_release_frozen_only(args: &PrimeOpenSleepInitArgs) -> (Report, u8) {
 +    if args.dry_run {
 +        log::warn!("--dry-run: no I2C or UART writes will be performed; using a mocked I2C expander and a mocked Frozen device");
@@ -7674,7 +7676,7 @@ index 0000000..99a38a0
 +}
 diff --git a/src/bin/opensleep-diagnostic/report.rs b/src/bin/opensleep-diagnostic/report.rs
 new file mode 100644
-index 0000000..cee34df
+index 0000000..8e58e8e
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/report.rs
 @@ -0,0 +1,632 @@
@@ -7925,7 +7927,7 @@ index 0000000..cee34df
 +/// `frozen-prime-opensleep-init --release-frozen-only`'s report: this mode never calls
 +/// `opensleep::reset::ResetController` and never runs the real upstream Frozen or Sensor manager
 +/// tasks -- it uses this diagnostic's own narrow I2C read-modify-write
-+/// (`i2c::release_frozen_reset_bit_only`) and its own audited Frozen transport instead. See
++/// (`i2c::pulse_frozen_reset_bit`) and its own audited Frozen transport instead. See
 +/// `prime_opensleep_init.rs` module docs for the full narrative.
 +#[derive(Debug, Clone, Serialize, Default)]
 +pub struct ReleaseFrozenOnlyResults {
