@@ -372,6 +372,18 @@ confirms **both pumps run together** during the purge/empty stages ("purge.empty
 12v") and that priming has **per-side sub-stages** ("purge.side (%s: %s)") even though the top-level
 `Prime` command itself is not per-side.
 
+**A second, distinct pump-*command* message format** was captured from a live `frozen-cool-test`
+run (the incident that motivated `--firmware-authoritative`, see SAFETY.md): a dash-and-arrow
+format, `"[pump-left] slow=>6.500000"` / `"[pump-left] default=>9.000000"`, alongside the
+already-documented bracket-and-`@` status format (`"pump[left] off @ 0.000000V"`) in the *same*
+captured sequence. These appear to be two different message classes from the same firmware (a
+command-issued event vs. a status/telemetry report), not two revisions of the same format —
+`cool_test::is_pump_command_event` recognizes the dash format as positive pump evidence in
+`--firmware-authoritative` mode, distinct from and in addition to `parse_pump_report`'s existing
+bracket-format parser. As with the bracket format, the dash format's default value ("default"
+literally contains "fault" as a substring) was the second real trigger for this codebase's
+word-exact fault-keyword matching (see `cool_test::WORD_EXACT_FAULT_KEYWORDS`).
+
 ### No solenoid/valve message exists in the reused source
 
 Despite the physical Pod 3 hydraulic loop plausibly containing a solenoid or float valve, **no

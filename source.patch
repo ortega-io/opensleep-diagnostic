@@ -144,10 +144,10 @@ index 0000000..be05be7
 +}
 diff --git a/src/bin/opensleep-diagnostic/cli.rs b/src/bin/opensleep-diagnostic/cli.rs
 new file mode 100644
-index 0000000..666fa36
+index 0000000..5bcfbfd
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/cli.rs
-@@ -0,0 +1,310 @@
+@@ -0,0 +1,368 @@
 +//! CLI surface. Every flag here maps to a fixed, validated field -- there is no flag that accepts
 +//! a raw opcode, a raw frame, or an arbitrary absolute temperature target. Side selection is a
 +//! closed `ValueEnum`; the cooling delta and duration are validated in `cool_test.rs` against
@@ -187,6 +187,14 @@ index 0000000..666fa36
 +    /// `frozen-prime-test`.
 +    #[command(name = "frozen-prime-opensleep-init")]
 +    FrozenPrimeOpenSleepInit(PrimeOpenSleepInitArgs),
++    /// Internal only, never documented in RUN_ON_POD.md: `frozen-cool-test --firmware-authoritative`'s
++    /// own independent shutdown guard, re-exec'd as a separate OS process (not merely a thread) so
++    /// it survives the main observer process crashing outright -- see `guard.rs` module docs. Reads
++    /// a single disarm byte from its own stdin pipe; if the arm window elapses (or that pipe closes
++    /// without the disarm byte first) before that happens, it opens the real Frozen UART/I2C itself
++    /// and runs the same disable sequence `cool_test.rs` uses.
++    #[command(name = "internal-cool-test-guard", hide = true)]
++    InternalCoolTestGuard(GuardArgs),
 +}
 +
 +#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,6 +322,21 @@ index 0000000..666fa36
 +    #[arg(long, default_value_t = false)]
 +    pub raw_serial_log: bool,
 +
++    /// After the target is successfully enabled, let Frozen firmware own pump sequencing, TEC
++    /// ramping, PID control, solenoid control, fan control, current safety, thermal regulation,
++    /// and target maintenance -- this binary becomes an observer plus a bounded stop timer. It
++    /// will not disable cooling merely because its own inferred pump/TEC/temperature state is
++    /// incomplete, delayed, reordered, or temporarily stale (the legacy active loop's host-side
++    /// heuristics -- pump-startup-not-confirmed, the communication/temperature watchdogs, generic
++    /// firmware-message keyword scanning, stopping early on target attainment -- are all disabled
++    /// in this mode); only an explicit TEC safety-lock message, an explicit recognized firmware
++    /// safety-fault message, the enabled target being explicitly lost, a fatal UART error, an
++    /// internal error, operator abort, a signal, or the requested duration expiring can end the
++    /// run. Does not change the default (120s) or hard-maximum (900s) duration, the 2.0C delta
++    /// cap, or any preflight/confirmation requirement. See SAFETY.md for the full rationale.
++    #[arg(long, default_value_t = false)]
++    pub firmware_authoritative: bool,
++
 +    /// Testing/CI escape hatch only: skips the interactive typed-phrase confirmations even when
 +    /// stdin is a TTY, by supplying the phrases directly. Never documented as a normal operator
 +    /// flag in RUN_ON_POD.md.
@@ -329,6 +352,11 @@ index 0000000..666fa36
 +    /// MINUTES" confirmation phrase required when `--duration-seconds` exceeds 300.
 +    #[arg(long, hide = true)]
 +    pub assume_extended_duration_phrase: Option<String>,
++    /// Testing/CI escape hatch only: skips spawning the real independent shutdown guard
++    /// subprocess (which would try to open real hardware) even for a non-`--dry-run` invocation.
++    /// Never set by RUN_ON_POD.md's documented usage.
++    #[arg(long, hide = true)]
++    pub skip_independent_guard: bool,
 +}
 +
 +#[derive(clap::Args, Debug, Clone)]
@@ -457,6 +485,36 @@ index 0000000..666fa36
 +    /// Perform no I2C or UART writes; print what would be sent instead
 +    #[arg(long, default_value_t = false)]
 +    pub dry_run: bool,
++}
++
++/// Args for the hidden `internal-cool-test-guard` subcommand -- see `guard.rs` module docs and
++/// `Commands::InternalCoolTestGuard`'s doc comment. Never invoked directly by an operator: only
++/// `cool_test.rs` spawns this, as a child process of itself, when `--firmware-authoritative` is
++/// used against real hardware.
++#[derive(clap::Args, Debug, Clone)]
++pub struct GuardArgs {
++    #[arg(long, default_value = "/dev/i2c-1")]
++    pub i2c_device: String,
++
++    #[arg(long, default_value = "/dev/ttyS1")]
++    pub frozen_port: String,
++
++    /// The single side the parent run enabled -- the guard's own disable sequence (borrowed
++    /// directly from `cool_test::run_cool_test_shutdown`) always addresses both sides regardless,
++    /// exactly like the parent's own shutdown; this is only used for that function's logging/audit
++    /// context.
++    #[arg(long, value_enum)]
++    pub side: Side,
++
++    /// How long, in seconds from process start, to wait for a disarm byte on stdin before opening
++    /// the real Frozen UART/I2C itself and running the disable sequence. Already includes the
++    /// parent's requested active-phase duration plus a small grace period -- see
++    /// `cool_test::spawn_independent_guard`.
++    #[arg(long)]
++    pub arm_seconds: f64,
++
++    #[arg(long, default_value_t = false)]
++    pub verbose: bool,
 +}
 diff --git a/src/bin/opensleep-diagnostic/compat_counters.rs b/src/bin/opensleep-diagnostic/compat_counters.rs
 new file mode 100644
@@ -645,10 +703,10 @@ index 0000000..9c6296b
 +}
 diff --git a/src/bin/opensleep-diagnostic/cool_test.rs b/src/bin/opensleep-diagnostic/cool_test.rs
 new file mode 100644
-index 0000000..84cc9c2
+index 0000000..cfe2839
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/cool_test.rs
-@@ -0,0 +1,3798 @@
+@@ -0,0 +1,4641 @@
 +//! `frozen-cool-test`: the one subcommand that intentionally activates a cooling channel. Every
 +//! hard limit here (max delta, max duration, baseline range, heatsink ceiling) is a compile-time
 +//! constant; no CLI flag can raise any of them. See SAFETY.md for the operator-facing version of
@@ -846,6 +904,27 @@ index 0000000..84cc9c2
 +/// reports while the TEC is active is itself safe.
 +const TEC_STOPPED_CURRENT_THRESHOLD_A: f64 = 0.5;
 +
++/// `--firmware-authoritative` mode's own, much longer, single communication-silence threshold --
++/// deliberately not the legacy loop's `ANY_VALID_RX_LIMIT` (5s) or the original, since-replaced
++/// `STALE_TELEMETRY_LIMIT` (2s): a live-hardware incident showed the legacy active loop treating
++/// pre-enable, already-buffered telemetry as active-phase evidence and stopping on it. Rather than
++/// adding more host-side clocks to a mode whose whole purpose is to stop second-guessing Frozen,
++/// this is the one remaining automatic communication check: a conservative, prominently-logged
++/// period with genuinely no packet of any kind, long enough that it cannot plausibly be confused
++/// with this firmware's own observed telemetry cadence (Message traffic every few seconds,
++/// TemperatureUpdate roughly every ~10s -- see `TEMPERATURE_FRESHNESS_LIMIT`'s doc comment).
++pub const FA_COMMUNICATION_SILENCE_LIMIT: Duration = Duration::from_secs(30);
++/// `--firmware-authoritative` mode polls `GetTemperatures` no faster than this -- observation
++/// only, never required for safety in this mode (Frozen owns thermal regulation and current
++/// safety entirely once enabled), so there is no reason to poll as aggressively as the legacy
++/// loop's ~1s tick.
++pub const FA_TEMPERATURE_POLL_INTERVAL: Duration = Duration::from_secs(5);
++/// How long past the requested active-phase duration the independent shutdown guard (`guard.rs`)
++/// stays armed before firing on its own -- gives the main observer's own normal shutdown sequence
++/// (repeated disable attempts, UART flush, verify window) time to complete and disarm the guard
++/// before it would otherwise fire redundantly.
++pub const FA_GUARD_GRACE: Duration = Duration::from_secs(30);
++
 +pub async fn run(args: &CoolTestArgs) -> (Report, u8) {
 +    // Recognizes the same, stable set of known-firmware-compatibility log lines this run's own
 +    // `frozen_compat::CompatFrameScanner` handles, and suppresses their noisy full-buffer dump --
@@ -903,10 +982,20 @@ index 0000000..84cc9c2
 +    if args.dry_run {
 +        log::warn!("--dry-run: no I2C or UART writes will be performed; using a mocked Frozen device");
 +        let mut i2c = MockI2c::always_succeed();
-+        let (client, task) = mock_frozen_link_pair();
++        // --firmware-authoritative gets its own mock device that specifically reproduces the
++        // pre-enable pump-off telemetry race item 12 asks this packaged build to be verified
++        // against -- see mock.rs module docs on spawn_mock_frozen_device_firmware_authoritative.
++        let (client, task) = if args.firmware_authoritative {
++            crate::mock::mock_frozen_link_pair_firmware_authoritative()
++        } else {
++            mock_frozen_link_pair()
++        };
 +        let capture: RawIoCapture = Default::default();
 +        let mut link = FrozenLink::wrap_capturing_with_raw_log(client, "dry-run", capture.clone(), args.raw_serial_log);
-+        let result = run_core(args, &mut i2c, &mut link, true, None, Some(capture)).await;
++        // The independent shutdown guard is never spawned for --dry-run: there is no real
++        // hardware for it to protect, and spawning a real re-exec'd process here would try (and
++        // fail, harmlessly but pointlessly) to open the real Frozen UART/I2C.
++        let result = run_core(args, &mut i2c, &mut link, true, None, Some(capture), false).await;
 +        drop(link);
 +        task.abort();
 +        return result;
@@ -937,7 +1026,7 @@ index 0000000..84cc9c2
 +        }
 +    };
 +
-+    run_core(args, &mut i2c, &mut link, false, None, Some(capture)).await
++    run_core(args, &mut i2c, &mut link, false, None, Some(capture), args.firmware_authoritative && !args.skip_independent_guard).await
 +}
 +
 +fn refuse_if_owned(args: &CoolTestArgs) -> Option<(Report, u8)> {
@@ -1010,6 +1099,39 @@ index 0000000..84cc9c2
 +    let num_str = after_at[..vpos].trim();
 +    let voltage: f64 = num_str.parse().ok()?;
 +    Some(voltage > 0.0005)
++}
++
++/// Parses the current (amps) component of a firmware pump message for the given side (e.g. `"FW:
++/// pump[left] default @ 9.000000V 0.200000A"`), side-scoped exactly like [`parse_pump_report`].
++/// `None` if this message is not about our side's pump, reports "off" (no voltage/current pair at
++/// all), or has no parseable amperage after the voltage. Purely descriptive, like
++/// [`parse_tec_current`] -- used only to report `CoolTestResults::pump_current_observed`.
++fn parse_pump_current(msg: &str, side_word: &str) -> Option<f64> {
++    let lower = msg.to_lowercase();
++    let marker = format!("pump[{side_word}]");
++    let idx = lower.find(&marker)?;
++    let rest = &lower[idx + marker.len()..];
++    if rest.trim_start().starts_with("off") {
++        return None;
++    }
++    let at = rest.find('@')?;
++    let after_at = &rest[at + 1..];
++    let vpos = after_at.find('v')?;
++    let after_v = &after_at[vpos + 1..];
++    let apos = after_v.find('a')?;
++    let num_str = after_v[..apos].trim();
++    num_str.parse().ok()
++}
++
++/// True iff `msg` is a firmware pump-*command* event for the given side in the `"[pump-<side>]
++/// <command>=><value>"` format (e.g. `"[pump-left] slow=>6.500000"`) -- distinct from
++/// [`parse_pump_report`]'s `"pump[<side>] ... @ <V>V <A>A"` voltage/current status format; both
++/// have been observed from real firmware in the same live-hardware incident. Positive evidence
++/// only, per item 4 of the `--firmware-authoritative` fix this was added for: this message's
++/// *absence* is never itself a fault in that mode.
++fn is_pump_command_event(msg: &str, side_word: &str) -> bool {
++    let lower = msg.to_lowercase();
++    lower.contains(&format!("[pump-{side_word}]"))
 +}
 +
 +/// The selected TEC's safety-interlock state, as reported in a firmware `Message`. Captured
@@ -1158,6 +1280,12 @@ index 0000000..84cc9c2
 +            | StopReason::UartWriteFailure
 +            | StopReason::Panic
 +            | StopReason::OperatorAbort
++            | StopReason::FirmwareSafetyFault
++            | StopReason::EnabledTargetStateLost
++            | StopReason::FatalUartError
++            | StopReason::InternalProcessError
++            | StopReason::CommunicationSilenceExceeded
++            | StopReason::IndependentGuardFired
 +    )
 +}
 +
@@ -1190,15 +1318,25 @@ index 0000000..84cc9c2
 +        StopReason::FirmwareFaultMessage => "thermal_safety_limit",
 +        StopReason::Panic => "internal_error",
 +        StopReason::PreflightRefused => "preflight_refused",
++        // --firmware-authoritative mode's own spec vocabulary -- see that mode's module docs.
++        StopReason::FirmwareSafetyFault => "explicit_firmware_safety_fault",
++        StopReason::EnabledTargetStateLost => "enabled_target_state_explicitly_lost",
++        StopReason::FatalUartError => "fatal_uart_write_or_read_error",
++        StopReason::InternalProcessError => "internal_process_error",
++        StopReason::CommunicationSilenceExceeded => "communication_silence_exceeded",
++        // Never appears in the main run's own stop_reason_code -- only in the independent
++        // guard's own separate-process log line, via this same function.
++        StopReason::IndependentGuardFired => "independent_guard_fired",
 +        // Never actually produced on any path this file's own code takes; kept for match
 +        // exhaustiveness across the enum shared with the other subcommands.
 +        _ => "internal_error",
 +    }
 +}
 +
-+/// The result of [`run_cool_test_shutdown`].
++/// The result of [`run_cool_test_shutdown`]. `pub(crate)`: also constructed by `guard.rs`'s own
++/// call into [`run_cool_test_shutdown`] from its separate process.
 +#[derive(Debug, Clone, Default)]
-+struct CoolTestShutdown {
++pub(crate) struct CoolTestShutdown {
 +    left_disable_attempts: Vec<bool>,
 +    right_disable_attempts: Vec<bool>,
 +    /// `true` iff a `TargetUpdate(enabled=false)` was observed for *both* sides within
@@ -1218,7 +1356,7 @@ index 0000000..84cc9c2
 +}
 +
 +impl CoolTestShutdown {
-+    fn verified(&self) -> bool {
++    pub(crate) fn verified(&self) -> bool {
 +        self.both_confirmed_disabled || self.emergency_reset_asserted
 +    }
 +}
@@ -1229,7 +1367,7 @@ index 0000000..84cc9c2
 +/// I2C register on a normal stop -- only if the UART-based confirmation above failed *and*
 +/// `stop_reason` is a genuine fault (see [`is_emergency_stop_reason`]) does it fall back to the
 +/// narrow, bit-1-only `i2c::assert_frozen_reset_bit_only`. See module docs.
-+async fn run_cool_test_shutdown<T, P>(
++pub(crate) async fn run_cool_test_shutdown<T, P>(
 +    link: Option<&mut FrozenLink<T>>,
 +    audit: &mut AuditedTransport,
 +    i2c: &mut P,
@@ -1374,6 +1512,14 @@ index 0000000..84cc9c2
 +    // normal decode path (unaffected: they never look for the 14-byte compat reply); `Some` for
 +    // every real run and for tests that specifically exercise `CompatFrameScanner` end to end.
 +    capture: Option<RawIoCapture>,
++    // Only ever `true` from `run()`'s real (non-dry-run) path when `--firmware-authoritative` was
++    // requested: spawns `guard.rs`'s independent shutdown guard as a real, separate re-exec'd OS
++    // process once the target is confirmed enabled. Always `false` in every test in this file --
++    // `std::env::current_exe()` under `cargo test` resolves to the *test* binary, which has no
++    // `internal-cool-test-guard` subcommand, so this must never be exercised as `true` outside a
++    // real packaged binary. See `guard.rs` module docs and item 9 of the fix this parameter was
++    // added for.
++    spawn_guard: bool,
 +) -> (Report, u8)
 +where
 +    T: AsyncRead + AsyncWrite + Unpin,
@@ -1397,6 +1543,7 @@ index 0000000..84cc9c2
 +        // entirely) get the same, correct answer: no prompt was needed unless the duration itself
 +        // exceeds the threshold.
 +        extended_test_confirmation_received: args.duration_seconds > EXTENDED_DURATION_THRESHOLD_SECONDS,
++        control_authority: if args.firmware_authoritative { "firmware" } else { "diagnostic" }.to_string(),
 +        ..Default::default()
 +    };
 +
@@ -1734,6 +1881,17 @@ index 0000000..84cc9c2
 +             (or press Ctrl+C) to stop immediately."
 +        );
 +    }
++    if args.firmware_authoritative {
++        return run_firmware_authoritative_phase(
++            args, i2c, link, &mut audit, &mut stats, &mut samples, side, side_tag, target_centideg, send_result,
++            &mut operator_abort_rx, &capture, &mut compat_scanner, &mut raw_scan_checkpoint,
++            &mut compat_get_temperature_14byte_frames, &mut compat_heartbeat_9byte_frames,
++            &mut compat_opcode_0x54_frames, &mut compat_opcode_0x55_frames, cr, ct, dry_run, expander_value, &led,
++            spawn_guard,
++        )
++        .await;
++    }
++
 +    let we_enabled_side = send_result.is_ok();
 +
 +    let active_start = Instant::now();
@@ -2174,6 +2332,592 @@ index 0000000..84cc9c2
 +        args, dry_run, &audit, &stats, samples, cr, ct, stop_reason, overall_pass, exit_code,
 +        expander_value, &led, true, true,
 +    )
++}
++
++/// The `--firmware-authoritative` active phase: item 2's sequence from "send exactly one enable
++/// target" onward. See `cli::CoolTestArgs::firmware_authoritative`'s doc comment and this module's
++/// top-level docs for the full rationale -- in short, once the target is confirmed enabled, Frozen
++/// firmware owns pump sequencing, TEC ramping, PID control, solenoid control, fan control, current
++/// safety, thermal regulation, and target maintenance; this function observes and logs, and only
++/// ever initiates a controlled shutdown for one of the small, closed set of reasons in
++/// `is_fa_legitimate_stop_reason`'s doc comment (duration expiry, operator abort, a signal, an
++/// explicit TEC safety lock, an explicit recognized firmware safety-fault message, the enabled
++/// target being explicitly lost, a fatal UART error, an internal error, or a very long
++/// communication silence) -- never from its own inference about incomplete, delayed, reordered, or
++/// temporarily stale pump/TEC/temperature telemetry.
++#[allow(clippy::too_many_arguments)]
++async fn run_firmware_authoritative_phase<T, P>(
++    args: &CoolTestArgs,
++    i2c: &mut P,
++    link: &mut FrozenLink<T>,
++    audit: &mut AuditedTransport,
++    stats: &mut PacketStats,
++    samples: &mut Vec<TemperatureSampleJson>,
++    side: BedSide,
++    side_tag: &'static str,
++    target_centideg: u16,
++    send_result: Result<PacketOutcome, LinkError>,
++    operator_abort_rx: &mut Option<mpsc::UnboundedReceiver<String>>,
++    capture: &Option<RawIoCapture>,
++    compat_scanner: &mut CompatFrameScanner,
++    raw_scan_checkpoint: &mut usize,
++    compat_get_temperature_14byte_frames: &mut u64,
++    compat_heartbeat_9byte_frames: &mut u64,
++    compat_opcode_0x54_frames: &mut u64,
++    compat_opcode_0x55_frames: &mut u64,
++    mut cr: ComponentResults,
++    mut ct: CoolTestResults,
++    dry_run: bool,
++    expander_value: u8,
++    led: &crate::i2c::ProbeResult,
++    spawn_guard: bool,
++) -> (Report, u8)
++where
++    T: AsyncRead + AsyncWrite + Unpin,
++    P: I2cPort,
++{
++    eprintln!(
++        "--firmware-authoritative: Frozen firmware now owns pump sequencing, TEC ramping, PID \
++         control, solenoid control, fan control, current safety, thermal regulation, and target \
++         maintenance. This binary observes and enforces only the requested duration and a small, \
++         closed set of explicit safety/communication conditions."
++    );
++    if send_result.is_ok() {
++        eprintln!(
++            "If you observe a leak, a burning smell, or abnormal noise, type ABORT and press Enter \
++             (or press Ctrl+C) to stop immediately."
++        );
++    }
++
++    let active_start = Instant::now();
++    let duration = Duration::from_secs(args.duration_seconds.min(HARD_MAX_DURATION_SECONDS));
++
++    let mut stop_reason = StopReason::Normal;
++    let mut telemetry_ok = true;
++
++    // Item 2 steps 6-8, and item 3: confirm the *specific* enabled TargetUpdate for our side, not
++    // merely "some reply arrived" -- the legacy loop's `send_result.is_ok()` shortcut is exactly
++    // the gap that let already-buffered pre-enable telemetry look like proof of enablement in the
++    // live-hardware incident this mode was added to fix. Anything else observed while waiting here
++    // is pre-enable telemetry: recorded into `stats`/`samples` for the raw report, never actioned
++    // as active-phase pump/TEC/fan/target state -- `active_generation`/`target_enabled_at` only
++    // begin once the real confirmation is seen.
++    let mut target_enabled_at: Option<Instant> = None;
++    let mut active_generation: u64 = 0;
++    // The original enable send's own single-packet reply may already *be* the enabling
++    // TargetUpdate -- the normal case, when no stray pre-enable telemetry happened to be queued
++    // ahead of it in the transport. Check that first; only fall through to draining further
++    // packets below if it wasn't (i.e. that one reply was itself pre-enable telemetry).
++    match &send_result {
++        Ok(PacketOutcome::Received(FrozenPacket::TargetUpdate((s, t)))) if *s == side && t.enabled => {
++            active_generation += 1;
++            target_enabled_at = Some(Instant::now());
++        }
++        Ok(PacketOutcome::Received(pkt)) => {
++            log::info!("firmware-authoritative: pre-enable telemetry (recorded, not actioned): {pkt:?}");
++            stats.record(pkt);
++        }
++        _ => {}
++    }
++    if target_enabled_at.is_none() && send_result.is_ok() {
++        let confirm_deadline = Instant::now() + COMMAND_TIMEOUT;
++        'confirm: loop {
++            let remaining = confirm_deadline.saturating_duration_since(Instant::now());
++            if remaining.is_zero() {
++                break;
++            }
++            match link.recv(remaining).await {
++                Ok(PacketOutcome::Received(FrozenPacket::TargetUpdate((s, t)))) if s == side && t.enabled => {
++                    stats.record(&FrozenPacket::TargetUpdate((s, t)));
++                    active_generation += 1;
++                    target_enabled_at = Some(Instant::now());
++                    break 'confirm;
++                }
++                Ok(PacketOutcome::Received(pkt)) => {
++                    log::info!("firmware-authoritative: pre-enable telemetry (recorded, not actioned): {pkt:?}");
++                    stats.record(&pkt);
++                }
++                Ok(PacketOutcome::TimedOut) => break,
++                Ok(PacketOutcome::Closed) => {
++                    stop_reason = StopReason::FatalUartError;
++                    telemetry_ok = false;
++                    break;
++                }
++                Err(e) => {
++                    log::error!("firmware-authoritative: UART error while confirming enable: {e}");
++                    stop_reason = StopReason::FatalUartError;
++                    telemetry_ok = false;
++                    break;
++                }
++            }
++        }
++    }
++    let we_enabled_side = target_enabled_at.is_some();
++    ct.target_enabled_at = target_enabled_at.map(|t| t.saturating_duration_since(active_start).as_secs_f64());
++
++    if !we_enabled_side && stop_reason == StopReason::Normal {
++        log::error!("firmware-authoritative: the selected side's enabled TargetUpdate was never confirmed");
++        stop_reason = StopReason::EnabledTargetStateLost;
++        telemetry_ok = false;
++    }
++
++    let mut active_left_c: Vec<f64> = Vec::new();
++    let mut active_right_c: Vec<f64> = Vec::new();
++    let mut min_left_c: Option<f64> = None;
++    let mut min_right_c: Option<f64> = None;
++    let mut final_left_c: Option<f64> = None;
++    let mut final_right_c: Option<f64> = None;
++    let mut final_heatsink_c: Option<f64> = None;
++    let mut max_heatsink_c: Option<f64> = None;
++    let mut target_reached_observed = false;
++    let mut pump_command_observed = false;
++    let mut pump_current_observed = false;
++    let mut tec_current_observed = false;
++    let mut tec_activity_seen = false;
++    let mut explicit_firmware_safety_passed = false;
++    let mut selected_tec_unlocking_observed = false;
++    let mut explicit_firmware_fault_observed = false;
++    let mut tec_current_first_a: Option<f64> = None;
++    let mut tec_current_min_a: Option<f64> = None;
++    let mut tec_current_max_a: Option<f64> = None;
++    let mut tec_current_last_a: Option<f64> = None;
++    let mut tec_current_samples: u64 = 0;
++    let mut left_pump_activity_observed = false;
++    let mut right_pump_activity_observed = false;
++    let mut telemetry_warning_count: u64 = 0;
++    let mut fan_seen = false;
++    let mut guard_handle: Option<crate::guard::GuardHandle> = None;
++
++    if we_enabled_side {
++        log::info!(
++            "firmware-authoritative: selected side confirmed enabled (generation {active_generation}); \
++             entering observation"
++        );
++
++        // Item 9: an independent shutdown guard, armed only for a real run (never --dry-run, and
++        // only now that the target is confirmed enabled) -- see guard.rs module docs.
++        if spawn_guard {
++            let arm_seconds = duration.as_secs_f64() + FA_GUARD_GRACE.as_secs_f64();
++            match crate::guard::spawn(&args.frozen_port, &args.i2c_device, side, arm_seconds) {
++                Ok(h) => {
++                    log::info!("firmware-authoritative: independent shutdown guard armed for {arm_seconds:.0}s");
++                    ct.independent_guard_armed = true;
++                    guard_handle = Some(h);
++                }
++                Err(e) => log::error!("firmware-authoritative: failed to spawn independent shutdown guard: {e}"),
++            }
++        } else {
++            log::info!("firmware-authoritative: independent shutdown guard not spawned (--dry-run or disabled)");
++        }
++
++        let mut last_any_valid_rx_at = Instant::now();
++        let mut last_temperature_poll_at: Option<Instant> = None;
++
++        'fa_active: loop {
++            if active_start.elapsed() >= duration {
++                stop_reason = StopReason::DurationExpired;
++                break;
++            }
++
++            // Item 6: observation only -- poll no faster than FA_TEMPERATURE_POLL_INTERVAL.
++            let should_poll = last_temperature_poll_at.is_none_or(|at| at.elapsed() >= FA_TEMPERATURE_POLL_INTERVAL);
++            if should_poll {
++                if let Err(e) = link.send_only(audit, FrozenAction::get_temperatures()).await {
++                    log::error!("firmware-authoritative: UART write failure: {e}");
++                    stop_reason = StopReason::FatalUartError;
++                    telemetry_ok = false;
++                    break 'fa_active;
++                }
++                last_temperature_poll_at = Some(Instant::now());
++            }
++
++            let drain_deadline = Instant::now() + TICK_DRAIN_WINDOW;
++            loop {
++                let remaining = drain_deadline.saturating_duration_since(Instant::now());
++                if remaining.is_zero() {
++                    break;
++                }
++                tokio::select! {
++                    biased;
++                    reason = wait_for_termination_signal() => {
++                        stop_reason = reason;
++                        break 'fa_active;
++                    }
++                    maybe_line = async {
++                        match operator_abort_rx.as_mut() {
++                            Some(rx) => rx.recv().await,
++                            None => std::future::pending().await,
++                        }
++                    } => {
++                        match maybe_line {
++                            Some(line) if is_operator_abort_line(&line) => {
++                                log::error!("operator-reported abort: {line:?}");
++                                stop_reason = StopReason::OperatorAbort;
++                                telemetry_ok = false;
++                                break 'fa_active;
++                            }
++                            Some(line) => {
++                                log::info!("ignoring unrecognized operator input during active phase: {line:?}");
++                            }
++                            None => {
++                                *operator_abort_rx = None;
++                            }
++                        }
++                    }
++                    outcome = link.recv(remaining) => {
++                        match outcome {
++                            Ok(PacketOutcome::Received(pkt)) => {
++                                last_any_valid_rx_at = Instant::now();
++                                match pkt {
++                                    FrozenPacket::TemperatureUpdate(u) => {
++                                        stats.record(&FrozenPacket::TemperatureUpdate(u.clone()));
++                                        let elapsed_ms = active_start.elapsed().as_millis() as u64;
++                                        samples.push((&sample_from_temperature_update(elapsed_ms, jiff::Timestamp::now().to_string(), &u)).into());
++                                        record_fa_temperature_sample(
++                                            side, u.left_temp, u.right_temp, u.heatsink_temp, target_centideg,
++                                            &mut active_left_c, &mut active_right_c, &mut min_left_c, &mut min_right_c,
++                                            &mut max_heatsink_c, &mut final_left_c, &mut final_right_c,
++                                            &mut final_heatsink_c, &mut target_reached_observed,
++                                        );
++                                    }
++                                    FrozenPacket::GetTemperature(g) => {
++                                        stats.record(&FrozenPacket::GetTemperature(g.clone()));
++                                        let elapsed_ms = active_start.elapsed().as_millis() as u64;
++                                        samples.push((&sample_from_get_temperature(elapsed_ms, jiff::Timestamp::now().to_string(), &g)).into());
++                                        record_fa_temperature_sample(
++                                            side, g.left_temp, g.right_temp, g.heatsink_temp, target_centideg,
++                                            &mut active_left_c, &mut active_right_c, &mut min_left_c, &mut min_right_c,
++                                            &mut max_heatsink_c, &mut final_left_c, &mut final_right_c,
++                                            &mut final_heatsink_c, &mut target_reached_observed,
++                                        );
++                                    }
++                                    FrozenPacket::Message(m) => {
++                                        stats.record(&FrozenPacket::Message(m.clone()));
++                                        if parse_pump_report(&m, side_tag).is_some() || is_pump_command_event(&m, side_tag) {
++                                            pump_command_observed = true;
++                                        }
++                                        if parse_pump_report(&m, "left") == Some(true) {
++                                            left_pump_activity_observed = true;
++                                        }
++                                        if parse_pump_report(&m, "right") == Some(true) {
++                                            right_pump_activity_observed = true;
++                                        }
++                                        if parse_pump_current(&m, side_tag).is_some() {
++                                            pump_current_observed = true;
++                                        }
++                                        if let Some(amps) = parse_tec_current(&m, side_tag) {
++                                            tec_current_samples += 1;
++                                            tec_current_first_a.get_or_insert(amps);
++                                            tec_current_min_a = Some(tec_current_min_a.map_or(amps, |v: f64| v.min(amps)));
++                                            tec_current_max_a = Some(tec_current_max_a.map_or(amps, |v: f64| v.max(amps)));
++                                            tec_current_last_a = Some(amps);
++                                            tec_current_observed = true;
++                                            tec_activity_seen = true;
++                                        } else if let Some(state) = parse_tec_safety_state(&m, side_tag) {
++                                            match state {
++                                                TecSafetyState::Locked => {
++                                                    log::error!("firmware-authoritative: firmware reported the selected TEC locked: {m:?}");
++                                                    stop_reason = StopReason::TecLocked;
++                                                    telemetry_ok = false;
++                                                    break 'fa_active;
++                                                }
++                                                TecSafetyState::UnsafeLocking => {
++                                                    log::error!(
++                                                        "firmware-authoritative: firmware reported the selected TEC transitioning unsafe (locking): {m:?}"
++                                                    );
++                                                    stop_reason = StopReason::TecUnsafeLocking;
++                                                    telemetry_ok = false;
++                                                    break 'fa_active;
++                                                }
++                                                TecSafetyState::SafeUnlocking => {
++                                                    explicit_firmware_safety_passed = true;
++                                                    selected_tec_unlocking_observed = true;
++                                                    tec_activity_seen = true;
++                                                }
++                                                TecSafetyState::Unlocked => {
++                                                    explicit_firmware_safety_passed = true;
++                                                    tec_activity_seen = true;
++                                                }
++                                                TecSafetyState::Unknown => {
++                                                    log::info!(
++                                                        "firmware-authoritative: unrecognized TEC safety-state message (not treated as a fault): {m:?}"
++                                                    );
++                                                }
++                                            }
++                                        }
++                                        if is_known_nonfatal_sensor_message(&m) {
++                                            log::warn!("firmware-authoritative: firmware sensor-unavailable message (non-fatal): {m:?}");
++                                            telemetry_warning_count += 1;
++                                        } else if active_start.elapsed() > FAULT_KEYWORD_GRACE && is_generic_fault_message(&m) {
++                                            log::error!("firmware-authoritative: explicit firmware safety fault message: {m:?}");
++                                            explicit_firmware_fault_observed = true;
++                                            stop_reason = StopReason::FirmwareSafetyFault;
++                                            telemetry_ok = false;
++                                            break 'fa_active;
++                                        }
++                                    }
++                                    FrozenPacket::TargetUpdate((s, target)) => {
++                                        stats.record(&FrozenPacket::TargetUpdate((s, target.clone())));
++                                        if s == side && !target.enabled {
++                                            log::error!("firmware-authoritative: Frozen reported the selected side's enabled target lost");
++                                            stop_reason = StopReason::EnabledTargetStateLost;
++                                            telemetry_ok = false;
++                                            break 'fa_active;
++                                        }
++                                    }
++                                    other => {
++                                        stats.record(&other);
++                                    }
++                                }
++                            }
++                            Ok(PacketOutcome::TimedOut) => break,
++                            Ok(PacketOutcome::Closed) => {
++                                stop_reason = StopReason::FatalUartError;
++                                telemetry_ok = false;
++                                break 'fa_active;
++                            }
++                            Err(e) => {
++                                log::error!("firmware-authoritative: UART error during observation: {e}");
++                                stop_reason = StopReason::FatalUartError;
++                                telemetry_ok = false;
++                                break 'fa_active;
++                            }
++                        }
++                    }
++                }
++            }
++
++            // Same raw-capture-based 14-byte GetTemperature recovery as the legacy loop -- see
++            // record_active_temperature_sample's doc comment for why a synchronous reply must not
++            // be "raw evidence only". No watchdog updates here: this mode deliberately has none of
++            // those (see FA_COMMUNICATION_SILENCE_LIMIT's doc comment for the one exception).
++            if let Some(capture) = capture {
++                let new_events = crate::io_logging::events_since(capture, raw_scan_checkpoint);
++                for event in new_events.iter().filter(|e| e.direction == "rx") {
++                    if let Some(bytes) = crate::io_logging::hex_to_bytes(&event.hex) {
++                        compat_scanner.feed(&bytes);
++                    }
++                }
++                for frame in compat_scanner.drain_frames() {
++                    match frame.opcode {
++                        crate::frozen_compat::GET_TEMPERATURE_OPCODE => {
++                            if let Some(g) = crate::frozen_compat::decode_get_temperature_14byte(&frame.payload) {
++                                *compat_get_temperature_14byte_frames += 1;
++                                last_any_valid_rx_at = Instant::now();
++                                let elapsed_ms = active_start.elapsed().as_millis() as u64;
++                                let sample = sample_from_get_temperature_compat14(elapsed_ms, jiff::Timestamp::now().to_string(), &g);
++                                samples.push((&sample).into());
++                                record_fa_temperature_sample(
++                                    side, g.left_temp, g.right_temp, g.heatsink_temp, target_centideg,
++                                    &mut active_left_c, &mut active_right_c, &mut min_left_c, &mut min_right_c,
++                                    &mut max_heatsink_c, &mut final_left_c, &mut final_right_c, &mut final_heatsink_c,
++                                    &mut target_reached_observed,
++                                );
++                            }
++                        }
++                        crate::frozen_compat::HEARTBEAT_OPCODE
++                            if frame.payload.len() == crate::frozen_compat::HEARTBEAT_OBSERVED_COMPAT_SIZE =>
++                        {
++                            *compat_heartbeat_9byte_frames += 1;
++                        }
++                        0x54 => *compat_opcode_0x54_frames += 1,
++                        0x55 => *compat_opcode_0x55_frames += 1,
++                        _ => {}
++                    }
++                }
++            }
++
++            // Item 5's own, much longer, separate silence threshold -- never the legacy 2s/5s
++            // heuristic.
++            if last_any_valid_rx_at.elapsed() > FA_COMMUNICATION_SILENCE_LIMIT {
++                log::error!(
++                    "firmware-authoritative: no valid packet of any kind for {:?} (limit {:?}) -- \
++                     attempting a controlled both-side disable",
++                    last_any_valid_rx_at.elapsed(), FA_COMMUNICATION_SILENCE_LIMIT
++                );
++                stop_reason = StopReason::CommunicationSilenceExceeded;
++                telemetry_ok = false;
++                break 'fa_active;
++            }
++        }
++
++        let side_bracket_tag = format!("[{side_tag}]");
++        fan_seen = stats.messages.iter().any(|m| m.to_lowercase().contains("fan") && m.contains(&side_bracket_tag));
++        tec_activity_seen = tec_activity_seen
++            || stats.messages.iter().any(|m| m.to_lowercase().contains("tec") && m.contains(&side_bracket_tag));
++        if !tec_current_observed {
++            log::warn!("firmware-authoritative: no TEC-current telemetry observed for the selected side (not treated as a fault)");
++            telemetry_warning_count += 1;
++        }
++        if !fan_seen {
++            log::warn!("firmware-authoritative: no fan telemetry observed for the selected side (not treated as a fault)");
++            telemetry_warning_count += 1;
++        }
++        if !pump_command_observed {
++            log::warn!("firmware-authoritative: no pump command message observed for the selected side (not treated as a fault)");
++            telemetry_warning_count += 1;
++        }
++    }
++
++    cr.telemetry_remained_valid = if telemetry_ok && !samples.is_empty() { Verdict::Pass } else { Verdict::Fail };
++
++    let shutdown = run_cool_test_shutdown(Some(link), audit, i2c, stop_reason, side).await;
++    cr.emergency_shutdown = if shutdown.verified() { Verdict::Pass } else { Verdict::Fail };
++
++    if let Some(mut handle) = guard_handle {
++        if shutdown.verified() {
++            ct.independent_guard_disarmed = handle.disarm();
++            if ct.independent_guard_disarmed {
++                log::info!("firmware-authoritative: independent shutdown guard disarmed");
++            } else {
++                log::error!(
++                    "firmware-authoritative: failed to disarm the independent shutdown guard -- it \
++                     remains armed and will fire on its own if not otherwise stopped"
++                );
++            }
++        } else {
++            log::error!(
++                "firmware-authoritative: shutdown could not be verified -- the independent shutdown \
++                 guard is intentionally left armed as a last-resort fallback"
++            );
++        }
++    }
++
++    cr.pump_operation = if pump_command_observed || left_pump_activity_observed || right_pump_activity_observed {
++        Verdict::Pass
++    } else {
++        Verdict::Unverified
++    };
++    cr.fan_operation = if fan_seen { Verdict::Pass } else { Verdict::Unverified };
++    cr.tec_cooling_operation = tec_trend_verdict(side, &active_left_c, &active_right_c, telemetry_ok);
++    cr.overall_selected_side_result = overall_verdict(&cr);
++    let overall_pass = cr.overall_selected_side_result == Verdict::Pass;
++
++    ct.minimum_left_c = min_left_c;
++    ct.minimum_right_c = min_right_c;
++    ct.maximum_heatsink_c = max_heatsink_c;
++    ct.final_left_c = final_left_c;
++    ct.final_right_c = final_right_c;
++    ct.final_heatsink_c = final_heatsink_c;
++    ct.selected_side_temperature_change_c = match side {
++        BedSide::Left => final_left_c.zip(ct.baseline_left_c).map(|(f, b)| f - b),
++        BedSide::Right => final_right_c.zip(ct.baseline_right_c).map(|(f, b)| f - b),
++    };
++    ct.opposite_side_temperature_change_c = match side {
++        BedSide::Left => final_right_c.zip(ct.baseline_right_c).map(|(f, b)| f - b),
++        BedSide::Right => final_left_c.zip(ct.baseline_left_c).map(|(f, b)| f - b),
++    };
++    ct.heatsink_temperature_change_c = final_heatsink_c.zip(ct.baseline_heatsink_c).map(|(f, b)| f - b);
++    ct.target_reached = target_reached_observed;
++    ct.target_reached_observed = target_reached_observed;
++    ct.selected_temperature_min_c = match side {
++        BedSide::Left => min_left_c,
++        BedSide::Right => min_right_c,
++    };
++    ct.selected_temperature_final_c = match side {
++        BedSide::Left => final_left_c,
++        BedSide::Right => final_right_c,
++    };
++    ct.opposite_temperature_min_c = match side {
++        BedSide::Left => min_right_c,
++        BedSide::Right => min_left_c,
++    };
++    ct.heatsink_temperature_max_c = max_heatsink_c;
++    ct.selected_tec_activity_observed = tec_activity_seen;
++    ct.selected_tec_safety_passed = explicit_firmware_safety_passed;
++    ct.explicit_firmware_safety_passed = explicit_firmware_safety_passed;
++    ct.selected_tec_unlocking_observed = selected_tec_unlocking_observed;
++    ct.left_pump_activity_observed = left_pump_activity_observed;
++    ct.right_pump_activity_observed = right_pump_activity_observed;
++    ct.selected_pump_activity_observed = match side {
++        BedSide::Left => left_pump_activity_observed,
++        BedSide::Right => right_pump_activity_observed,
++    };
++    ct.pump_command_observed = pump_command_observed;
++    ct.pump_current_observed = pump_current_observed;
++    ct.tec_current_observed = tec_current_observed;
++    ct.selected_tec_current_first_a = tec_current_first_a;
++    ct.selected_tec_current_min_a = tec_current_min_a;
++    ct.selected_tec_current_max_a = tec_current_max_a;
++    ct.selected_tec_current_last_a = tec_current_last_a;
++    ct.selected_tec_current_samples = tec_current_samples;
++    ct.explicit_firmware_fault_observed = explicit_firmware_fault_observed;
++    ct.telemetry_warning_count = telemetry_warning_count;
++    // This mode has no watchdog-style stop condition at all -- see FA_COMMUNICATION_SILENCE_LIMIT.
++    ct.telemetry_watchdog_triggered = false;
++    ct.communication_loss_observed = matches!(stop_reason, StopReason::FatalUartError | StopReason::CommunicationSilenceExceeded);
++    ct.operator_abort_observed = stop_reason == StopReason::OperatorAbort;
++    ct.both_targets_shutdown_confirmed = shutdown.both_confirmed_disabled;
++    ct.selected_pump_shutdown_observed = shutdown.selected_pump_shutdown_observed;
++    ct.selected_tec_shutdown_observed = shutdown.selected_tec_shutdown_observed;
++    ct.shutdown_verified = shutdown.verified();
++    ct.emergency_reset_asserted = shutdown.emergency_reset_asserted;
++    ct.actual_active_duration_seconds = active_start.elapsed().as_secs_f64();
++    ct.stop_reason = stop_reason.to_string();
++    ct.stop_reason_code = stop_reason_code(stop_reason).to_string();
++    ct.compat_get_temperature_14byte_frames = *compat_get_temperature_14byte_frames;
++    ct.compat_heartbeat_9byte_frames = *compat_heartbeat_9byte_frames;
++    ct.compat_opcode_0x54_frames = *compat_opcode_0x54_frames;
++    ct.compat_opcode_0x55_frames = *compat_opcode_0x55_frames;
++
++    let exit_code = if overall_pass {
++        0
++    } else if !shutdown.verified() {
++        21
++    } else {
++        1
++    };
++    finish(
++        args, dry_run, &*audit, &*stats, std::mem::take(samples), cr, ct, stop_reason, overall_pass, exit_code,
++        expander_value, led, true, true,
++    )
++}
++
++/// One tick's worth of temperature bookkeeping for `--firmware-authoritative` mode: unlike
++/// `record_active_temperature_sample`, this never returns a `StopReason` -- this mode does not use
++/// a host-side plausibility/range/heatsink ceiling check at all (Frozen owns thermal regulation
++/// and current safety once the target is enabled -- see module docs), and never stops merely
++/// because the target was reached (only observes and logs it once, the first time).
++#[allow(clippy::too_many_arguments)]
++fn record_fa_temperature_sample(
++    side: BedSide,
++    left_temp: u16,
++    right_temp: u16,
++    heatsink_temp: u16,
++    target_centideg: u16,
++    active_left_c: &mut Vec<f64>,
++    active_right_c: &mut Vec<f64>,
++    min_left_c: &mut Option<f64>,
++    min_right_c: &mut Option<f64>,
++    max_heatsink_c: &mut Option<f64>,
++    final_left_c: &mut Option<f64>,
++    final_right_c: &mut Option<f64>,
++    final_heatsink_c: &mut Option<f64>,
++    target_reached_observed: &mut bool,
++) {
++    let left_c = crate::telemetry::centideg_to_celsius(left_temp);
++    let right_c = crate::telemetry::centideg_to_celsius(right_temp);
++    let heatsink_c = crate::telemetry::centideg_to_celsius(heatsink_temp);
++    active_left_c.push(left_c);
++    active_right_c.push(right_c);
++    *min_left_c = Some(min_left_c.map_or(left_c, |m: f64| m.min(left_c)));
++    *min_right_c = Some(min_right_c.map_or(right_c, |m: f64| m.min(right_c)));
++    *max_heatsink_c = Some(max_heatsink_c.map_or(heatsink_c, |m: f64| m.max(heatsink_c)));
++    *final_left_c = Some(left_c);
++    *final_right_c = Some(right_c);
++    *final_heatsink_c = Some(heatsink_c);
++
++    let side_centideg = match side {
++        BedSide::Left => left_temp,
++        BedSide::Right => right_temp,
++    } as i32;
++    if !*target_reached_observed && side_centideg <= target_centideg as i32 {
++        *target_reached_observed = true;
++        log::info!(
++            "firmware-authoritative: selected side reached the requested target temperature; Frozen \
++             will continue maintaining it for the remaining requested duration"
++        );
++    }
 +}
 +
 +/// Pure, panic-free-by-design per-tick range/plausibility check, isolated so it can be run behind
@@ -2633,10 +3377,12 @@ index 0000000..84cc9c2
 +            verbose: false,
 +            dry_run,
 +            raw_serial_log: false,
++            firmware_authoritative: false,
 +            assume_interactive_phrase: Some(INTERACTIVE_PHRASE.to_string()),
 +            assume_start_phrase: Some("START LEFT COOLING TEST".to_string()),
 +            assume_reservoir_phrase: Some(RESERVOIR_PHRASE.to_string()),
 +            assume_extended_duration_phrase: Some(EXTENDED_DURATION_PHRASE.to_string()),
++            skip_independent_guard: true,
 +        }
 +    }
 +
@@ -3166,7 +3912,7 @@ index 0000000..84cc9c2
 +
 +        let mut a = args(Side::Left, false);
 +        a.duration_seconds = 10;
-+        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None).await;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None, false).await;
 +
 +        assert_eq!(report.stop_reason, StopReason::PumpNotConfirmedRunning.to_string());
 +        let ct = report.cool_test_results.expect("cool_test_results must be set");
@@ -3266,7 +4012,7 @@ index 0000000..84cc9c2
 +        let mut a = args(Side::Left, false);
 +        a.delta_c = 1.0; // baseline ~24.50C -> target ~23.50C (2350 centideg), well above the mock's post-enable 2200
 +        a.duration_seconds = 60; // long enough that DurationExpired is never what stops it
-+        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None).await;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None, false).await;
 +
 +        assert_eq!(report.stop_reason, StopReason::TargetTemperatureReached.to_string());
 +        let ct = report.cool_test_results.expect("cool_test_results must be set");
@@ -3405,7 +4151,7 @@ index 0000000..84cc9c2
 +
 +        let mut a = args(Side::Left, false);
 +        a.duration_seconds = 10;
-+        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None).await;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None, false).await;
 +
 +        // The disconnect can surface as either a closed read (`TelemetryLost`) or a failed write
 +        // to the now-gone peer (`UartWriteFailure`), depending on exactly when the duplex notices
@@ -3434,7 +4180,7 @@ index 0000000..84cc9c2
 +
 +        let mut a = args(Side::Left, false);
 +        a.duration_seconds = 10; // long enough that only the watchdog (not duration) ends the run
-+        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None).await;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None, false).await;
 +
 +        assert_eq!(report.stop_reason, StopReason::CommunicationWatchdogExpired.to_string());
 +        let ct = report.cool_test_results.expect("cool_test_results must be set");
@@ -3520,7 +4266,7 @@ index 0000000..84cc9c2
 +
 +        let mut a = args(Side::Left, false);
 +        a.duration_seconds = ACTIVE_STARTUP_GRACE.as_secs() + 5;
-+        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None).await;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None, false).await;
 +
 +        // The active phase's own temperature-freshness clock starts fresh (`None`) when it
 +        // begins -- baseline having already validated is not itself carried forward as an active-
@@ -3597,7 +4343,7 @@ index 0000000..84cc9c2
 +        let mut i2c = MockI2c::always_succeed();
 +
 +        let a = args(Side::Left, false);
-+        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, Some(capture)).await;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, Some(capture), false).await;
 +
 +        let ct = report.cool_test_results.expect("cool_test_results must be set");
 +        assert_ne!(report.stop_reason, StopReason::PreflightRefused.to_string(), "baseline must pass using only the 14-byte replies");
@@ -3693,7 +4439,7 @@ index 0000000..84cc9c2
 +        let mut i2c = MockI2c::always_succeed();
 +
 +        let a = args(Side::Left, false);
-+        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None).await;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None, false).await;
 +
 +        let ct = report.cool_test_results.expect("cool_test_results must be set");
 +        assert_ne!(report.stop_reason, StopReason::PreflightRefused.to_string());
@@ -3773,7 +4519,7 @@ index 0000000..84cc9c2
 +        let mut i2c = MockI2c::always_succeed();
 +
 +        let a = args(Side::Left, false);
-+        let (report, code) = run_core(&a, &mut i2c, &mut link, false, None, None).await;
++        let (report, code) = run_core(&a, &mut i2c, &mut link, false, None, None, false).await;
 +
 +        assert_eq!(report.stop_reason, StopReason::PreflightRefused.to_string());
 +        assert_eq!(report.enabled_target_command_count, 0, "cooling must never be enabled when baseline validation fails");
@@ -3855,7 +4601,7 @@ index 0000000..84cc9c2
 +
 +        let mut a = args(Side::Left, false);
 +        a.duration_seconds = 10;
-+        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None).await;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None, false).await;
 +
 +        assert_eq!(report.stop_reason, StopReason::TargetDisabledUnexpectedly.to_string());
 +        let ct = report.cool_test_results.expect("cool_test_results must be set");
@@ -3979,7 +4725,7 @@ index 0000000..84cc9c2
 +        // enough to land safely before either watchdog could fire on the silence that follows the
 +        // schedule's last entry (ANY_VALID_RX_LIMIT=5s after t=9.5s => ~14.5s).
 +        a.duration_seconds = 12;
-+        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None).await;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None, false).await;
 +
 +        assert_eq!(
 +            report.stop_reason,
@@ -4077,7 +4823,7 @@ index 0000000..84cc9c2
 +
 +        let mut a = args(Side::Left, false);
 +        a.duration_seconds = 10;
-+        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None).await;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None, false).await;
 +
 +        assert_eq!(report.stop_reason, StopReason::TecLocked.to_string());
 +
@@ -4097,7 +4843,7 @@ index 0000000..84cc9c2
 +
 +        let mut a = args(Side::Left, false);
 +        a.duration_seconds = 2;
-+        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None).await;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None, false).await;
 +
 +        assert_eq!(report.stop_reason, StopReason::DurationExpired.to_string());
 +        let ct = report.cool_test_results.expect("cool_test_results must be set");
@@ -4116,7 +4862,7 @@ index 0000000..84cc9c2
 +
 +        let mut a = args(Side::Left, false);
 +        a.duration_seconds = 10;
-+        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None).await;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None, false).await;
 +
 +        assert_eq!(report.stop_reason, StopReason::TecUnsafeLocking.to_string());
 +        let ct = report.cool_test_results.expect("cool_test_results must be set");
@@ -4140,7 +4886,7 @@ index 0000000..84cc9c2
 +
 +        let mut a = args(Side::Left, false);
 +        a.duration_seconds = 2;
-+        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None).await;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None, false).await;
 +
 +        assert_eq!(report.stop_reason, StopReason::DurationExpired.to_string());
 +
@@ -4159,7 +4905,7 @@ index 0000000..84cc9c2
 +
 +        let mut a = args(Side::Left, false);
 +        a.duration_seconds = 15;
-+        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None).await;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None, false).await;
 +
 +        assert_eq!(report.stop_reason, StopReason::FirmwareFaultMessage.to_string());
 +
@@ -4181,7 +4927,7 @@ index 0000000..84cc9c2
 +
 +        let mut a = args(Side::Left, false);
 +        a.duration_seconds = 10;
-+        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, Some(rx), None).await;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, Some(rx), None, false).await;
 +
 +        assert_eq!(report.stop_reason, StopReason::OperatorAbort.to_string());
 +
@@ -4204,7 +4950,7 @@ index 0000000..84cc9c2
 +        // Comfortably above STALE_TELEMETRY_LIMIT (2s) so ordinary scheduling jitter around the
 +        // per-tick drain window can't race the duration check against a false staleness abort.
 +        a.duration_seconds = 6;
-+        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, Some(rx), None).await;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, Some(rx), None, false).await;
 +
 +        assert_eq!(report.stop_reason, StopReason::DurationExpired.to_string());
 +
@@ -4261,7 +5007,7 @@ index 0000000..84cc9c2
 +        let (client, _unused_device_side) = tokio::io::duplex(64);
 +        let mut link = FrozenLink::wrap(client, "test");
 +        let a = args(Side::Left, false);
-+        let (report, code) = run_core(&a, &mut i2c, &mut link, false, None, None).await;
++        let (report, code) = run_core(&a, &mut i2c, &mut link, false, None, None, false).await;
 +        assert_eq!(code, 20);
 +        assert!(!report.overall_pass);
 +        assert_eq!(report.enabled_target_command_count, 0);
@@ -4274,7 +5020,7 @@ index 0000000..84cc9c2
 +        let mut link = FrozenLink::wrap(client, "test");
 +        let mut a = args(Side::Left, false);
 +        a.assume_reservoir_phrase = Some("wrong".to_string());
-+        let (report, code) = run_core(&a, &mut i2c, &mut link, false, None, None).await;
++        let (report, code) = run_core(&a, &mut i2c, &mut link, false, None, None, false).await;
 +        assert_eq!(code, 30);
 +        assert_eq!(report.enabled_target_command_count, 0, "cooling must never be enabled without the reservoir confirmation");
 +        drop(link);
@@ -4445,6 +5191,161 @@ index 0000000..84cc9c2
 +        // doesn't change that outgoing/reporting behavior, i.e. it completes normally either way.
 +        assert_eq!(report.stop_reason, StopReason::DurationExpired.to_string());
 +        assert!(report.cool_test_results.is_some());
++    }
++
++    /// Item 11's exact regression: `[pump-left] slow=>`/`[pump-left] default=>` command-format
++    /// events and several `pump[left] off @ 0.000000V` status-format reports arrive before, or
++    /// bundled into the very same write as, the enable acknowledgment -- reproducing the real
++    /// live-hardware race that motivated `--firmware-authoritative`. See this test's own
++    /// assertions for exactly what must (and must not) happen.
++    fn spawn_device_replaying_the_pre_enable_pump_race(mut device_side: tokio::io::DuplexStream) -> tokio::task::JoinHandle<()> {
++        use bytes::{Buf, BytesMut};
++        use tokio::io::{AsyncReadExt, AsyncWriteExt};
++
++        fn message_frame(text: &str) -> Vec<u8> {
++            let mut p = vec![0x07u8, 0x00];
++            p.extend_from_slice(text.as_bytes());
++            opensleep::common::codec::command(p)
++        }
++
++        tokio::spawn(async move {
++            let mut acc = BytesMut::new();
++            let mut read_buf = [0u8; 256];
++            let mut enabled = false;
++            let mut count: u8 = 0;
++            let mut baseline_ticks: u32 = 0;
++            let mut post_enable_ticks: u32 = 0;
++            loop {
++                if acc.len() >= 2 {
++                    let len = acc[1] as usize;
++                    let total = 1 + 1 + len + 2;
++                    if acc.len() >= total {
++                        let opcode = acc[2];
++                        let payload = acc[2..2 + len].to_vec();
++                        acc.advance(total);
++                        let mut frames: Vec<Vec<u8>> = Vec::new();
++                        match opcode {
++                            0x01 => frames.push(opensleep::common::codec::command(vec![0x81, 0x00, 0b0100_0110])),
++                            0x41 if !enabled => {
++                                count = count.wrapping_add(1);
++                                baseline_ticks += 1;
++                                frames.push(opensleep::common::codec::command(vec![
++                                    0x41, 0x09, 0x9A, 0x09, 0xA4, 0x0A, 0x28, 9, count,
++                                ]));
++                                // Two pre-enable pump-off reports, early in baseline collection --
++                                // read and harmlessly discarded (baseline never looks at Message
++                                // content), exactly like the real captured evidence.
++                                if baseline_ticks == 1 || baseline_ticks == 2 {
++                                    frames.push(message_frame("FW: pump[left] off @ 0.000000V"));
++                                }
++                            }
++                            0x41 if enabled => {
++                                post_enable_ticks += 1;
++                                count = count.wrapping_add(1);
++                                frames.push(opensleep::common::codec::command(vec![
++                                    0x41, 0x09, 0x9A, 0x09, 0xA4, 0x0A, 0x28, 9, count,
++                                ]));
++                                match post_enable_ticks {
++                                    1 => {
++                                        frames.push(message_frame("[pump-left] slow=>6.500000"));
++                                        frames.push(message_frame("[solenoid] on"));
++                                        frames.push(message_frame("FW: pid[left] 25.250000 -1.000000"));
++                                    }
++                                    2 => {
++                                        frames.push(message_frame("[pump-left] default=>9.000000"));
++                                    }
++                                    // No further pump-current/command telemetry for several ticks
++                                    // -- item 11's "no fresh pump-current report for 10 seconds",
++                                    // which must produce at most a warning.
++                                    _ => {}
++                                }
++                            }
++                            0x40 if payload.len() == 5 => {
++                                if payload[2] == 1 && !enabled {
++                                    enabled = true;
++                                    // The third pre-enable pump-off report, bundled into the
++                                    // *same write* as the enable acknowledgment -- still unread
++                                    // when the enable-confirmation loop starts reading, the exact
++                                    // race this test exists to reproduce.
++                                    frames.push(message_frame("FW: pump[left] off @ 0.000000V"));
++                                }
++                                frames.push(opensleep::common::codec::command(vec![
++                                    0xC0, 0x00, payload[1], payload[2], payload[3], payload[4],
++                                ]));
++                            }
++                            _ => {}
++                        }
++                        for f in frames {
++                            if device_side.write_all(&f).await.is_err() {
++                                return;
++                            }
++                        }
++                        continue;
++                    }
++                }
++                match device_side.read(&mut read_buf).await {
++                    Ok(0) | Err(_) => break,
++                    Ok(n) => acc.extend_from_slice(&read_buf[..n]),
++                }
++            }
++        })
++    }
++
++    #[tokio::test]
++    async fn pre_enable_pump_off_telemetry_does_not_stop_firmware_authoritative_cooling() {
++        let (client, device) = tokio::io::duplex(8192);
++        let device_task = spawn_device_replaying_the_pre_enable_pump_race(device);
++        let mut link = FrozenLink::wrap(client, "test");
++        let mut i2c = MockI2c::always_succeed();
++
++        let mut a = args(Side::Left, false);
++        a.firmware_authoritative = true;
++        a.duration_seconds = 15;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None, false).await;
++
++        assert_eq!(
++            report.stop_reason,
++            StopReason::DurationExpired.to_string(),
++            "pre-enable telemetry -- however it happened to be ordered relative to the enable \
++             acknowledgment -- must never itself stop a firmware-authoritative run"
++        );
++        let ct = report.cool_test_results.expect("cool_test_results must be set");
++        assert_ne!(ct.stop_reason_code, "pump_startup_failure");
++        assert_eq!(ct.control_authority, "firmware");
++        assert!(ct.target_enabled_at.is_some(), "the enabled TargetUpdate must have been confirmed");
++        assert!(
++            ct.pump_command_observed,
++            "the [pump-left] slow=>/default=> command events must be recognized as positive pump evidence"
++        );
++        assert!(!ct.communication_loss_observed);
++        assert!(ct.both_targets_shutdown_confirmed);
++        assert!(!ct.independent_guard_armed, "spawn_guard is false in this test, so the guard must never be spawned");
++
++        drop(link);
++        device_task.abort();
++    }
++
++    #[tokio::test]
++    async fn tec_unsafe_locking_triggers_immediate_shutdown_in_firmware_authoritative_mode() {
++        let (client, device) = tokio::io::duplex(8192);
++        let device_task = spawn_device_with_a_message(device, "FW: tec[left] unsafe, locking", 3);
++        let mut link = FrozenLink::wrap(client, "test");
++        let mut i2c = MockI2c::always_succeed();
++
++        let mut a = args(Side::Left, false);
++        a.firmware_authoritative = true;
++        a.duration_seconds = 30;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None, false).await;
++
++        assert_eq!(report.stop_reason, StopReason::TecUnsafeLocking.to_string());
++        let ct = report.cool_test_results.expect("cool_test_results must be set");
++        assert_eq!(ct.stop_reason_code, "explicit_tec_unsafe_locking");
++        assert!(!ct.explicit_firmware_safety_passed);
++        assert!(ct.shutdown_verified);
++        assert!(!ct.emergency_reset_asserted, "UART-based shutdown must succeed against the mock device");
++
++        drop(link);
++        device_task.abort();
 +    }
 +}
 diff --git a/src/bin/opensleep-diagnostic/emergency_stop.rs b/src/bin/opensleep-diagnostic/emergency_stop.rs
@@ -5273,6 +6174,282 @@ index 0000000..c3f544e
 +        assert!(result.started_successfully());
 +        drop(link);
 +        task.abort();
++    }
++}
+diff --git a/src/bin/opensleep-diagnostic/guard.rs b/src/bin/opensleep-diagnostic/guard.rs
+new file mode 100644
+index 0000000..8bf2989
+--- /dev/null
++++ b/src/bin/opensleep-diagnostic/guard.rs
+@@ -0,0 +1,270 @@
++//! `frozen-cool-test --firmware-authoritative`'s independent shutdown guard: protects against the
++//! *main observer process itself* crashing, hanging, or being killed during a long active-phase
++//! run, when no other part of this binary would be left running to disable cooling.
++//!
++//! This is deliberately a **separate OS process**, not a thread or spawned task: an in-process
++//! construct shares fate with the process it is meant to protect against. A panic that unwinds
++//! past `main` (Rust's default `fn main()` panic behavior exits the whole process), a segfault, an
++//! OOM kill, or an operator's `kill -9` all take every thread and task in that process down
++//! together. Only a genuinely separate process can keep running once the parent is gone.
++//!
++//! ## Mechanism
++//!
++//! Once `cool_test.rs`'s firmware-authoritative active phase confirms the selected side's enabled
++//! `TargetUpdate`, it re-execs the current binary (`std::env::current_exe()`) with the hidden
++//! `internal-cool-test-guard` subcommand (see `cli::Commands::InternalCoolTestGuard`), piping the
++//! child's stdin. The child ([`run`]) races an arm timer (`--arm-seconds`: the parent's requested
++//! active-phase duration plus [`crate::cool_test::FA_GUARD_GRACE`]) against reading one byte from
++//! that stdin pipe -- see [`wait_for_disarm_or_arm_expiry`]:
++//!
++//!   - reading [`DISARM_BYTE`] (or any byte at all) before the timer fires means the parent's own
++//!     verified shutdown completed and explicitly told this guard to stand down -- exit
++//!     immediately without touching hardware.
++//!   - EOF (the pipe closed, e.g. the parent process exited without writing anything) means the
++//!     parent is gone *unexpectedly* -- fire immediately rather than waiting out the rest of the
++//!     timer.
++//!   - the timer elapsing first (parent neither disarmed nor exited) means the parent is hung --
++//!     fire.
++//!
++//! "Firing" means opening the real Frozen UART and I2C device directly and running the exact same
++//! [`crate::cool_test::run_cool_test_shutdown`] the main run's own shutdown path uses: repeated
++//! both-side disable commands confirmed from each command's own reply, falling back to the narrow,
++//! bit-1-only emergency reset only if that could not be confirmed -- never the global subsystem
++//! reset outside that existing, already-audited fallback.
++//!
++//! ## What is and isn't covered by automated tests
++//!
++//! [`wait_for_disarm_or_arm_expiry`] -- the safety-critical fire-or-stand-down decision -- is a
++//! pure function tested directly against an in-memory duplex stream (see this module's own tests).
++//! The real-hardware plumbing around it ([`run`]: opening a real serial port and I2C device,
++//! re-exec'ing the real packaged binary as a child process, writing the disarm byte across a real
++//! OS pipe) cannot be exercised by `cargo test`: `std::env::current_exe()` under `cargo test`
++//! resolves to the *test* binary, which has no `internal-cool-test-guard` subcommand at all, and
++//! there is no real Frozen UART/I2C device available in a test environment regardless. This
++//! mirrors the same, already-documented gap `prime_opensleep_init.rs`'s real (non-mocked)
++//! initialization path has -- see TEST_RESULTS.md for what was and wasn't verified this way for
++//! both.
++
++use std::time::Duration;
++
++use opensleep::common::packet::BedSide;
++use tokio::io::{AsyncRead, AsyncReadExt};
++
++use crate::cli::GuardArgs;
++use crate::i2c::RealI2c;
++use crate::link::FrozenLink;
++use crate::safety::{AuditedTransport, Mode};
++use crate::signals::StopReason;
++
++/// The byte the parent writes to disarm the guard. Any other byte value read from the pipe before
++/// EOF is treated identically (the parent explicitly wrote *something*, proving it is alive and
++/// telling this guard to stand down) -- only genuine EOF-with-nothing-read, or the arm timer
++/// elapsing first, means fire. Chosen only for readability in a hex/log dump; the guard does not
++/// otherwise interpret pipe contents.
++pub const DISARM_BYTE: u8 = b'D';
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum GuardOutcome {
++    /// The parent wrote a byte before the arm timer elapsed: stand down, touch nothing.
++    Disarmed,
++    /// The stdin pipe closed (EOF) with nothing ever read: the parent is gone unexpectedly.
++    ParentGone,
++    /// The arm timer elapsed with the pipe still open and nothing read: the parent is hung.
++    ArmExpired,
++}
++
++/// Pure decision logic, independent of real hardware or a real child process: races `arm` against
++/// reading a single byte from `stdin`. Generic over the stdin type so tests can substitute an
++/// in-memory duplex stream instead of a real OS pipe -- this is the one function in this module
++/// that automated tests can and do exercise directly (see this module's own `tests` below).
++pub async fn wait_for_disarm_or_arm_expiry<R>(mut stdin: R, arm: Duration) -> GuardOutcome
++where
++    R: AsyncRead + Unpin,
++{
++    let mut buf = [0u8; 1];
++    tokio::select! {
++        biased;
++        result = stdin.read(&mut buf) => match result {
++            Ok(0) => GuardOutcome::ParentGone,
++            Ok(_) => GuardOutcome::Disarmed,
++            Err(_) => GuardOutcome::ParentGone,
++        },
++        _ = tokio::time::sleep(arm) => GuardOutcome::ArmExpired,
++    }
++}
++
++/// Real entry point for the hidden `internal-cool-test-guard` subcommand -- see module docs for
++/// why this specific function (as opposed to [`wait_for_disarm_or_arm_expiry`]) is not exercised
++/// by `cargo test`. Returns a process exit code (0 = stood down cleanly, or fired and the disable
++/// sequence was verified; 1 = fired but disable could not be verified, or a real I2C/UART device
++/// could not even be opened).
++pub async fn run(args: &GuardArgs) -> u8 {
++    let side: BedSide = args.side.into();
++    let arm = Duration::from_secs_f64(args.arm_seconds.max(0.0));
++    log::info!("independent shutdown guard: armed for {arm:?} (side={side:?})");
++
++    let outcome = wait_for_disarm_or_arm_expiry(tokio::io::stdin(), arm).await;
++    match outcome {
++        GuardOutcome::Disarmed => {
++            log::info!("independent shutdown guard: disarmed by parent; exiting without touching hardware");
++            return 0;
++        }
++        GuardOutcome::ParentGone => {
++            log::error!(
++                "independent shutdown guard: the main observer process's stdin pipe closed without a \
++                 disarm signal -- it appears to have exited unexpectedly. Asserting both-side disable now."
++            );
++        }
++        GuardOutcome::ArmExpired => {
++            log::error!(
++                "independent shutdown guard: arm window elapsed without being disarmed -- the main \
++                 observer process may be hung. Asserting both-side disable now."
++            );
++        }
++    }
++
++    let mut i2c = match RealI2c::open(&args.i2c_device) {
++        Ok(dev) => dev,
++        Err(e) => {
++            log::error!("independent shutdown guard: failed to open I2C device {}: {e}", args.i2c_device);
++            return 1;
++        }
++    };
++    let mut audit = AuditedTransport::new(Mode::CoolTest { side });
++    let mut link = match FrozenLink::<tokio_serial::SerialStream>::open(&args.frozen_port) {
++        Ok(l) => Some(l),
++        Err(e) => {
++            log::error!("independent shutdown guard: failed to open Frozen UART {}: {e}", args.frozen_port);
++            None
++        }
++    };
++
++    let shutdown =
++        crate::cool_test::run_cool_test_shutdown(link.as_mut(), &mut audit, &mut i2c, StopReason::IndependentGuardFired, side)
++            .await;
++    if shutdown.verified() {
++        log::warn!("independent shutdown guard: fired, and the disable sequence was verified");
++        0
++    } else {
++        log::error!("independent shutdown guard: fired, but the disable sequence could NOT be verified");
++        1
++    }
++}
++
++/// Parent-side handle for a spawned guard process -- see [`spawn`]. Dropping this without calling
++/// [`disarm`](Self::disarm) leaves the child's stdin pipe open and the child still armed; only an
++/// explicit disarm (or the arm timer itself) ends the child's wait.
++pub struct GuardHandle {
++    child: std::process::Child,
++    stdin: Option<std::process::ChildStdin>,
++}
++
++impl GuardHandle {
++    /// Best-effort: writes the disarm byte to the child's stdin pipe. Returns whether the write
++    /// itself succeeded -- callers should treat a `false` return as "the guard may still fire" and
++    /// log accordingly (see `cool_test.rs`'s own caller), never as evidence that it did not.
++    pub fn disarm(&mut self) -> bool {
++        use std::io::Write;
++        let Some(stdin) = self.stdin.take() else {
++            return false;
++        };
++        let mut stdin = stdin;
++        stdin.write_all(&[DISARM_BYTE]).is_ok()
++    }
++}
++
++impl Drop for GuardHandle {
++    fn drop(&mut self) {
++        // Best-effort cleanup only: a `GuardHandle` dropped without an explicit `disarm()` call
++        // (e.g. an early return on a code path that forgot to) should not leak a lingering armed
++        // child process indefinitely. This is *not* the guard's primary disarm mechanism -- normal
++        // shutdown always calls `disarm()` explicitly first, which is what lets the child log and
++        // exit cleanly instead of merely being reaped here.
++        let _ = self.child.try_wait();
++    }
++}
++
++/// Spawns the independent shutdown guard as a real, separate OS process: re-execs the current
++/// binary (`std::env::current_exe()`) with the hidden `internal-cool-test-guard` subcommand,
++/// piping its stdin so [`GuardHandle::disarm`] can later signal it. Only ever called from
++/// `cool_test.rs`'s real (non-dry-run) `--firmware-authoritative` path, once the target is
++/// confirmed enabled -- never from a test (see module docs for why `cargo test` cannot exercise
++/// this function meaningfully).
++pub fn spawn(frozen_port: &str, i2c_device: &str, side: BedSide, arm_seconds: f64) -> std::io::Result<GuardHandle> {
++    let exe = std::env::current_exe()?;
++    let side_word = match side {
++        BedSide::Left => "left",
++        BedSide::Right => "right",
++    };
++    let mut child = std::process::Command::new(exe)
++        .arg("internal-cool-test-guard")
++        .arg("--frozen-port")
++        .arg(frozen_port)
++        .arg("--i2c-device")
++        .arg(i2c_device)
++        .arg("--side")
++        .arg(side_word)
++        .arg("--arm-seconds")
++        .arg(arm_seconds.to_string())
++        .stdin(std::process::Stdio::piped())
++        .stdout(std::process::Stdio::null())
++        .stderr(std::process::Stdio::inherit())
++        .spawn()?;
++    let stdin = child.stdin.take();
++    Ok(GuardHandle { child, stdin })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[tokio::test]
++    async fn disarm_byte_written_before_the_timer_wins() {
++        let (mut parent, child) = tokio::io::duplex(8);
++        tokio::spawn(async move {
++            use tokio::io::AsyncWriteExt;
++            let _ = parent.write_all(&[DISARM_BYTE]).await;
++        });
++        let outcome = wait_for_disarm_or_arm_expiry(child, Duration::from_secs(5)).await;
++        assert_eq!(outcome, GuardOutcome::Disarmed);
++    }
++
++    #[tokio::test]
++    async fn any_byte_at_all_counts_as_disarm_not_only_the_named_constant() {
++        let (mut parent, child) = tokio::io::duplex(8);
++        tokio::spawn(async move {
++            use tokio::io::AsyncWriteExt;
++            let _ = parent.write_all(&[0x00]).await;
++        });
++        let outcome = wait_for_disarm_or_arm_expiry(child, Duration::from_secs(5)).await;
++        assert_eq!(outcome, GuardOutcome::Disarmed);
++    }
++
++    #[tokio::test]
++    async fn pipe_closing_with_nothing_read_means_parent_gone() {
++        let (parent, child) = tokio::io::duplex(8);
++        drop(parent); // simulates the parent process exiting without writing the disarm byte
++        let outcome = wait_for_disarm_or_arm_expiry(child, Duration::from_secs(5)).await;
++        assert_eq!(outcome, GuardOutcome::ParentGone);
++    }
++
++    #[tokio::test]
++    async fn arm_timer_elapsing_with_the_pipe_still_open_means_expired() {
++        let (parent, child) = tokio::io::duplex(8);
++        let outcome = wait_for_disarm_or_arm_expiry(child, Duration::from_millis(50)).await;
++        assert_eq!(outcome, GuardOutcome::ArmExpired);
++        drop(parent); // kept alive (not dropped) until after the wait, so this is a genuine timeout
++    }
++
++    #[tokio::test]
++    async fn disarm_arriving_just_before_expiry_still_wins() {
++        let (mut parent, child) = tokio::io::duplex(8);
++        tokio::spawn(async move {
++            tokio::time::sleep(Duration::from_millis(10)).await;
++            use tokio::io::AsyncWriteExt;
++            let _ = parent.write_all(&[DISARM_BYTE]).await;
++        });
++        let outcome = wait_for_disarm_or_arm_expiry(child, Duration::from_millis(200)).await;
++        assert_eq!(outcome, GuardOutcome::Disarmed);
 +    }
 +}
 diff --git a/src/bin/opensleep-diagnostic/i2c.rs b/src/bin/opensleep-diagnostic/i2c.rs
@@ -6830,10 +8007,10 @@ index 0000000..216770e
 +}
 diff --git a/src/bin/opensleep-diagnostic/main.rs b/src/bin/opensleep-diagnostic/main.rs
 new file mode 100644
-index 0000000..10b2951
+index 0000000..9fff56f
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/main.rs
-@@ -0,0 +1,309 @@
+@@ -0,0 +1,312 @@
 +//! opensleep-diagnostic: a staged, Frozen-only hardware diagnostic for an Eight Sleep Pod 3 Hub.
 +//!
 +//! Five subcommands, each with its own fixed command whitelist (see `safety.rs`):
@@ -6866,6 +8043,7 @@ index 0000000..10b2951
 +mod frozen_compat;
 +mod frozen_ops;
 +mod frozen_startup;
++mod guard;
 +mod i2c;
 +mod io_logging;
 +mod link;
@@ -6893,6 +8071,7 @@ index 0000000..10b2951
 +        Commands::EmergencyStop(a) => a.verbose,
 +        Commands::FrozenPrimeTest(a) => a.verbose,
 +        Commands::FrozenPrimeOpenSleepInit(a) => a.verbose,
++        Commands::InternalCoolTestGuard(a) => a.verbose,
 +    };
 +    buildinfo::init_logging(verbose);
 +    signals::install_panic_hook();
@@ -6937,6 +8116,7 @@ index 0000000..10b2951
 +                let (_, code) = prime_opensleep_init::run(&args).await;
 +                code
 +            }
++            Commands::InternalCoolTestGuard(args) => guard::run(&args).await,
 +        }
 +    });
 +
@@ -7145,10 +8325,10 @@ index 0000000..10b2951
 +}
 diff --git a/src/bin/opensleep-diagnostic/mock.rs b/src/bin/opensleep-diagnostic/mock.rs
 new file mode 100644
-index 0000000..fe4933f
+index 0000000..263fd77
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/mock.rs
-@@ -0,0 +1,288 @@
+@@ -0,0 +1,403 @@
 +//! Mock Frozen device used by `--dry-run` (so dry-run is testable on a normal development
 +//! computer with no real hardware attached) and reused directly by integration tests. Speaks the
 +//! exact real wire framing (`opensleep::common::codec::command`) on one end of a
@@ -7354,6 +8534,121 @@ index 0000000..fe4933f
 +pub fn mock_frozen_link_pair() -> (DuplexStream, tokio::task::JoinHandle<()>) {
 +    let (client, device) = tokio::io::duplex(8192);
 +    let task = spawn_mock_frozen_device(device);
++    (client, task)
++}
++
++/// `frozen-cool-test --firmware-authoritative --dry-run`'s own mock device: unlike
++/// [`spawn_mock_frozen_device`] (shared with every other mode's dry-run/tests), this one
++/// deliberately reproduces the exact live-hardware race that motivated
++/// `--firmware-authoritative`'s item 12 packaged-binary check -- several `"pump[<side>] off @
++/// 0.000000V"` reports bundled into the *same write* as the enable command's own `TargetUpdate`
++/// acknowledgment, so they are still sitting unread in the transport when the enable confirmation
++/// is processed, exactly reproducing "arrived in the startup burst before or around target
++/// activation" -- plus the `"[pump-<side>] slow=>..."`/`"[pump-<side>] default=>..."`
++/// dash-and-arrow pump-*command* format (distinct from the bracket-and-`@` status format above)
++/// also captured in that incident. A healthy `--firmware-authoritative` run must not terminate
++/// because of any of this. Kept separate from `spawn_mock_frozen_device` rather than adding this
++/// injection there: that device is shared by every other mode's dry-run and tests, and this
++/// exact-ordering race is specific to what `--firmware-authoritative` is being checked against.
++pub fn spawn_mock_frozen_device_firmware_authoritative(mut device_side: DuplexStream) -> tokio::task::JoinHandle<()> {
++    tokio::spawn(async move {
++        let mut acc = BytesMut::new();
++        let mut read_buf = [0u8; 256];
++        let mut temperature_update_count: u8 = 0;
++        let mut enabled_side_word: Option<&'static str> = None;
++        let mut post_enable_ticks: u32 = 0;
++        loop {
++            if acc.len() >= 2 {
++                let len = acc[1] as usize;
++                let total = 1 + 1 + len + 2;
++                if acc.len() >= total {
++                    let opcode = acc[2];
++                    let payload = acc[2..2 + len].to_vec();
++                    acc.advance(total);
++                    if opcode == 0x41 {
++                        temperature_update_count = temperature_update_count.wrapping_add(1);
++                        let mut combined = mock_get_temperature_frame();
++                        combined.extend(mock_temperature_update_frame(
++                            MOCK_BASELINE_LEFT_CENTIDEG,
++                            MOCK_BASELINE_RIGHT_CENTIDEG,
++                            MOCK_HEATSINK_CENTIDEG,
++                            9,
++                            temperature_update_count,
++                        ));
++                        if enabled_side_word.is_none() {
++                            // Pre-enable pump-off telemetry, buffered well before any enable
++                            // command is even sent -- read and harmlessly discarded during
++                            // baseline collection (which never looks at Message content), exactly
++                            // like real captured evidence.
++                            combined.extend(mock_message_frame("FW: pump[left] off @ 0.000000V"));
++                        }
++                        if let Some(side_word) = enabled_side_word {
++                            post_enable_ticks += 1;
++                            match post_enable_ticks {
++                                1 => {
++                                    combined.extend(mock_message_frame(&format!("[pump-{side_word}] slow=>6.500000")));
++                                    combined.extend(mock_message_frame("[solenoid] on"));
++                                    combined.extend(mock_message_frame(&format!("FW: pid[{side_word}] 25.250000 -1.000000")));
++                                }
++                                2 => {
++                                    combined.extend(mock_message_frame(&format!("[pump-{side_word}] default=>9.000000")));
++                                }
++                                // No further pump-current/command telemetry for several ticks --
++                                // item 11's "no fresh pump-current report for 10 seconds": this
++                                // mode must not treat that absence as a fault.
++                                _ => {}
++                            }
++                        }
++                        if device_side.write_all(&combined).await.is_err() {
++                            break;
++                        }
++                        continue;
++                    }
++                    let response = match opcode {
++                        0x01 => Some(mock_pong_frame(true)),
++                        0x02 => Some(mock_hardware_info_frame()),
++                        0x04 => Some(opensleep::common::codec::command(vec![0x84])),
++                        0x10 => Some(opensleep::common::codec::command(vec![0x90, 0x00])),
++                        0x40 if payload.len() == 5 => {
++                            let side = payload[1];
++                            let enabled = payload[2] != 0;
++                            let temp = u16::from_be_bytes([payload[3], payload[4]]);
++                            let mut combined = Vec::new();
++                            if enabled {
++                                let side_word = if side == 0 { "left" } else { "right" };
++                                enabled_side_word = Some(side_word);
++                                // Bundled into the *same write* as the enable acknowledgment, so
++                                // these are still unread when the enable confirmation loop starts
++                                // -- the exact race this device exists to reproduce.
++                                combined.extend(mock_message_frame(&format!("FW: pump[{side_word}] off @ 0.000000V")));
++                                combined.extend(mock_message_frame(&format!("FW: pump[{side_word}] off @ 0.000000V")));
++                            }
++                            combined.extend(mock_target_update_frame(side, enabled, temp));
++                            Some(combined)
++                        }
++                        _ => None,
++                    };
++                    if let Some(resp) = response
++                        && device_side.write_all(&resp).await.is_err()
++                    {
++                        break;
++                    }
++                    continue;
++                }
++            }
++            match device_side.read(&mut read_buf).await {
++                Ok(0) | Err(_) => break,
++                Ok(n) => acc.extend_from_slice(&read_buf[..n]),
++            }
++        }
++    })
++}
++
++/// Same as [`mock_frozen_link_pair`], but for `--firmware-authoritative --dry-run` -- see
++/// [`spawn_mock_frozen_device_firmware_authoritative`].
++pub fn mock_frozen_link_pair_firmware_authoritative() -> (DuplexStream, tokio::task::JoinHandle<()>) {
++    let (client, device) = tokio::io::duplex(8192);
++    let task = spawn_mock_frozen_device_firmware_authoritative(device);
 +    (client, task)
 +}
 +
@@ -10923,10 +12218,10 @@ index 0000000..e668cde
 +}
 diff --git a/src/bin/opensleep-diagnostic/report.rs b/src/bin/opensleep-diagnostic/report.rs
 new file mode 100644
-index 0000000..7f04686
+index 0000000..b58394c
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/report.rs
-@@ -0,0 +1,933 @@
+@@ -0,0 +1,1029 @@
 +//! Structured JSON/CSV/text reporting shared by all three subcommands. Machine evidence (audit
 +//! log, decoded telemetry) is always kept in separate fields from operator-entered observations,
 +//! per the safety model: a component may only be marked PASS from decoded evidence or an explicit
@@ -11419,6 +12714,65 @@ index 0000000..7f04686
 +    /// unreachable from this file -- see `main.rs`'s guardrail tests), reported explicitly rather
 +    /// than left implicit.
 +    pub startup_mode: String,
++
++    // ---- --firmware-authoritative mode only (blank/default for a legacy-mode run) ----
++    /// `"firmware"` for a `--firmware-authoritative` run, `"diagnostic"` otherwise -- who owns
++    /// pump sequencing, TEC ramping, thermal regulation, and current safety once the target is
++    /// enabled. See `cool_test.rs` module docs.
++    pub control_authority: String,
++    /// Seconds from the active phase starting to the selected side's enabled `TargetUpdate`
++    /// actually being confirmed (not merely "some reply arrived to our enable command") --
++    /// `--firmware-authoritative` only. `None` if that confirmation was never received.
++    pub target_enabled_at: Option<f64>,
++    /// `--firmware-authoritative` only: `true` iff the selected side's live temperature reached
++    /// the computed target at any point -- logged, but unlike legacy `target_reached`, never
++    /// itself a reason to stop; Frozen continues maintaining the target for the rest of the
++    /// requested duration.
++    pub target_reached_observed: bool,
++    /// `--firmware-authoritative` only: the selected side's lowest observed temperature.
++    pub selected_temperature_min_c: Option<f64>,
++    /// `--firmware-authoritative` only: the selected side's last observed temperature.
++    pub selected_temperature_final_c: Option<f64>,
++    /// `--firmware-authoritative` only: the non-selected side's lowest observed temperature
++    /// (expected to stay near baseline; that side's target is never enabled).
++    pub opposite_temperature_min_c: Option<f64>,
++    /// `--firmware-authoritative` only: the highest observed heatsink temperature -- observational
++    /// only in this mode (never an independent host-side shutdown threshold; Frozen owns thermal
++    /// regulation once enabled).
++    pub heatsink_temperature_max_c: Option<f64>,
++    /// `--firmware-authoritative` only: `true` iff at least one firmware pump command/status
++    /// message for the selected side was observed (positive evidence only -- its *absence* is
++    /// never itself a reason to stop in this mode).
++    pub pump_command_observed: bool,
++    /// `--firmware-authoritative` only: `true` iff at least one firmware pump message for the
++    /// selected side carried a parseable current (amps) component.
++    pub pump_current_observed: bool,
++    /// `--firmware-authoritative` only: `true` iff at least one firmware TEC-current message for
++    /// the selected side was observed. Equivalent evidence to `selected_tec_current_samples > 0`,
++    /// reported as its own boolean per this mode's spec.
++    pub tec_current_observed: bool,
++    /// `--firmware-authoritative` only: `true` iff a firmware message reported the selected TEC's
++    /// safety interlock in a safe state (`"safe, unlocking"` or `"unlocked"`) -- the
++    /// firmware-authoritative counterpart of `selected_tec_safety_passed` (which this mode also
++    /// populates identically; both fields are set together).
++    pub explicit_firmware_safety_passed: bool,
++    /// `--firmware-authoritative` only: `true` iff a recognized negative firmware safety-fault
++    /// message (see `cool_test::is_generic_fault_message`) was observed -- always accompanies a
++    /// `FirmwareSafetyFault` stop when `true`, never inferred from missing telemetry.
++    pub explicit_firmware_fault_observed: bool,
++    /// `--firmware-authoritative` only: how many non-fatal "missing telemetry" warnings this run
++    /// logged (sensor-unavailable messages observed, or no TEC-current/fan/pump-command telemetry
++    /// observed at all by the end of the run) -- never itself a reason to stop.
++    pub telemetry_warning_count: u64,
++    /// `--firmware-authoritative` only: `true` iff the independent shutdown guard (`guard.rs`) was
++    /// spawned as a separate process for this run. Always `false` for `--dry-run` (no real
++    /// hardware for it to protect) and for legacy-mode runs.
++    pub independent_guard_armed: bool,
++    /// `--firmware-authoritative` only: `true` iff this run's own verified shutdown successfully
++    /// disarmed the independent guard. `false` while `independent_guard_armed` is also `false`
++    /// (nothing to disarm), or if shutdown could not be verified (the guard is deliberately left
++    /// armed in that case -- see `cool_test.rs`) or the disarm write itself failed.
++    pub independent_guard_disarmed: bool,
 +}
 +
 +/// One decoded firmware pump message (`FW: pump[<side>] ... @ <V>V <A>A`), kept separate from
@@ -11671,6 +13025,21 @@ index 0000000..7f04686
 +            csv_field!("both_targets_shutdown_confirmed", ct.both_targets_shutdown_confirmed);
 +            csv_field!("selected_pump_shutdown_observed", ct.selected_pump_shutdown_observed);
 +            csv_field!("selected_tec_shutdown_observed", ct.selected_tec_shutdown_observed);
++            csv_field!("control_authority", ct.control_authority);
++            csv_field!("target_enabled_at", ct.target_enabled_at.map(|v| v.to_string()).unwrap_or_default());
++            csv_field!("target_reached_observed", ct.target_reached_observed);
++            csv_field!("selected_temperature_min_c", ct.selected_temperature_min_c.map(|v| v.to_string()).unwrap_or_default());
++            csv_field!("selected_temperature_final_c", ct.selected_temperature_final_c.map(|v| v.to_string()).unwrap_or_default());
++            csv_field!("opposite_temperature_min_c", ct.opposite_temperature_min_c.map(|v| v.to_string()).unwrap_or_default());
++            csv_field!("heatsink_temperature_max_c", ct.heatsink_temperature_max_c.map(|v| v.to_string()).unwrap_or_default());
++            csv_field!("pump_command_observed", ct.pump_command_observed);
++            csv_field!("pump_current_observed", ct.pump_current_observed);
++            csv_field!("tec_current_observed", ct.tec_current_observed);
++            csv_field!("explicit_firmware_safety_passed", ct.explicit_firmware_safety_passed);
++            csv_field!("explicit_firmware_fault_observed", ct.explicit_firmware_fault_observed);
++            csv_field!("telemetry_warning_count", ct.telemetry_warning_count);
++            csv_field!("independent_guard_armed", ct.independent_guard_armed);
++            csv_field!("independent_guard_disarmed", ct.independent_guard_disarmed);
 +        }
 +        Ok(())
 +    }
@@ -11825,6 +13194,28 @@ index 0000000..7f04686
 +            log::info!("  Emergency reset asserted:         {}", ct.emergency_reset_asserted);
 +            log::info!("  Reservoir status:                 {}", ct.reservoir_status);
 +            log::info!("  Startup mode:                     {}", ct.startup_mode);
++            if ct.control_authority == "firmware" {
++                log::info!("  -- firmware-authoritative --");
++                log::info!(
++                    "  Target enabled at:                {:?}s | target reached (observed, non-terminal): {}",
++                    ct.target_enabled_at, ct.target_reached_observed
++                );
++                log::info!(
++                    "  Selected min/final (C):           {:?}/{:?} | opposite min (C): {:?} | max heatsink (C): {:?}",
++                    ct.selected_temperature_min_c, ct.selected_temperature_final_c, ct.opposite_temperature_min_c,
++                    ct.heatsink_temperature_max_c
++                );
++                log::info!(
++                    "  Pump command/current observed: {}/{} | TEC current observed: {} | firmware safety passed/fault: {}/{}",
++                    ct.pump_command_observed, ct.pump_current_observed, ct.tec_current_observed,
++                    ct.explicit_firmware_safety_passed, ct.explicit_firmware_fault_observed
++                );
++                log::info!("  Telemetry warnings logged:        {}", ct.telemetry_warning_count);
++                log::info!(
++                    "  Independent shutdown guard armed/disarmed: {}/{}",
++                    ct.independent_guard_armed, ct.independent_guard_disarmed
++                );
++            }
 +        }
 +        if let Some(ct) = &self.cool_test_results {
 +            log::info!("stop reason: {} (code: {})", self.stop_reason, ct.stop_reason_code);
@@ -12727,10 +14118,10 @@ index 0000000..a2a5a23
 +}
 diff --git a/src/bin/opensleep-diagnostic/signals.rs b/src/bin/opensleep-diagnostic/signals.rs
 new file mode 100644
-index 0000000..edcc6b3
+index 0000000..6796b85
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/signals.rs
-@@ -0,0 +1,232 @@
+@@ -0,0 +1,279 @@
 +//! Everything that can cut an active phase short. `StopReason` is the vocabulary every abort path
 +//! (Ctrl+C, SIGTERM/SIGHUP, timeout, communication/telemetry error, panic, ...) reduces to before
 +//! `safe_stop::run_safe_stop` runs and the report is written.
@@ -12848,8 +14239,43 @@ index 0000000..edcc6b3
 +    PrimingCompleted,
 +    /// `frozen-cool-test` only: not an error -- the selected side's live temperature reached the
 +    /// computed target (`baseline - requested delta`) before the configured duration elapsed, so
-+    /// the test stopped early rather than continuing to cool further than requested.
++    /// the test stopped early rather than continuing to cool further than requested. Never
++    /// produced by `--firmware-authoritative` mode: that mode logs target attainment but lets
++    /// Frozen continue maintaining it for the remaining requested duration instead of stopping.
 +    TargetTemperatureReached,
++    /// `frozen-cool-test --firmware-authoritative` only: a firmware `Message` matched
++    /// `cool_test::is_generic_fault_message` (a recognized, word-scoped negative keyword --
++    /// never inferred from missing or delayed telemetry). Kept distinct from the legacy active
++    /// loop's `FirmwareFaultMessage` so `cool_test::stop_reason_code` can report the two under
++    /// the exact, separate codes their respective specs asked for
++    /// (`explicit_firmware_safety_fault` vs. `thermal_safety_limit`).
++    FirmwareSafetyFault,
++    /// `frozen-cool-test --firmware-authoritative` only: Frozen's own `TargetUpdate` reported the
++    /// selected side's enabled target lost (disabled) after this run had confirmed it enabled --
++    /// the firmware-authoritative counterpart of `TargetDisabledUnexpectedly`, reported under its
++    /// own spec code (`enabled_target_state_explicitly_lost`).
++    EnabledTargetStateLost,
++    /// `frozen-cool-test --firmware-authoritative` only: a UART write or read failure, or the
++    /// link closing outright, during firmware-authoritative observation -- deliberately one
++    /// combined reason (unlike the legacy loop's separate `UartWriteFailure`/`UartReadFailure`/
++    /// `TelemetryLost`), matching that mode's own spec vocabulary (`fatal_uart_write_or_read_error`).
++    FatalUartError,
++    /// `frozen-cool-test --firmware-authoritative` only: an internal panic or task failure during
++    /// firmware-authoritative observation -- the firmware-authoritative counterpart of `Panic`,
++    /// reported under that mode's own spec code (`internal_process_error`).
++    InternalProcessError,
++    /// `frozen-cool-test --firmware-authoritative` only: no valid packet of any kind was received
++    /// for longer than a conservative, prominently-warned-about silence window (see
++    /// `cool_test::FA_COMMUNICATION_SILENCE_LIMIT`) -- deliberately a much longer, separate
++    /// threshold from the legacy loop's `CommunicationWatchdogExpired` (5s): firmware-authoritative
++    /// mode's own spec explicitly forbids "the old two-second or five-second heuristic".
++    CommunicationSilenceExceeded,
++    /// Not reported in the main run's own `stop_reason` field -- this is the independent shutdown
++    /// guard's (`guard.rs`) own internal reason for the disable sequence it performs in its own
++    /// separate process, reusing `cool_test::run_cool_test_shutdown` exactly as the main run does.
++    /// Kept in this shared enum (rather than a parallel type local to `guard.rs`) purely so the
++    /// guard can reuse that one function without needing its own reason type.
++    IndependentGuardFired,
 +}
 +
 +impl StopReason {
@@ -12887,6 +14313,12 @@ index 0000000..edcc6b3
 +            StopReason::I2cFailureDuringPriming => "I2C access failed after priming started",
 +            StopReason::PrimingCompleted => "firmware reported priming complete",
 +            StopReason::TargetTemperatureReached => "selected side reached the requested target temperature",
++            StopReason::FirmwareSafetyFault => "firmware reported an explicit safety fault message",
++            StopReason::EnabledTargetStateLost => "Frozen reported the selected side's enabled target lost",
++            StopReason::FatalUartError => "fatal UART write or read error",
++            StopReason::InternalProcessError => "internal process error",
++            StopReason::CommunicationSilenceExceeded => "no valid packet of any kind for longer than the communication silence limit",
++            StopReason::IndependentGuardFired => "independent shutdown guard fired",
 +        }
 +    }
 +}
@@ -12958,6 +14390,12 @@ index 0000000..edcc6b3
 +            StopReason::I2cFailureDuringPriming,
 +            StopReason::PrimingCompleted,
 +            StopReason::TargetTemperatureReached,
++            StopReason::FirmwareSafetyFault,
++            StopReason::EnabledTargetStateLost,
++            StopReason::FatalUartError,
++            StopReason::InternalProcessError,
++            StopReason::CommunicationSilenceExceeded,
++            StopReason::IndependentGuardFired,
 +        ] {
 +            assert!(!reason.description().is_empty());
 +        }

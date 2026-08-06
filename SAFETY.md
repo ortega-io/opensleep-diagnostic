@@ -409,6 +409,61 @@ this stops the test immediately, exactly like Ctrl+C. Unrecognized input is igno
 does not abort the run. (`frozen-prime-test` does not have this typed-input path — see below for
 why watching the reservoir and pressing Ctrl+C is that mode's primary operator-stop mechanism.)
 
+## `--firmware-authoritative`: an optional, narrower active-phase mode
+
+A live cooling test enabled the selected side successfully — the pump was commanded, the solenoid
+opened, and the operator physically heard water flowing — but the run stopped seconds later with
+`pump_startup_failure`. Root cause: three `pump[left] off @ 0.000000V` reports were sitting in the
+host's own read buffer from *before* the enable command was even acknowledged, and the active loop
+had no way to distinguish that stale, pre-enable evidence from a genuine post-enable failure. This
+is a host-side telemetry race, not evidence the pump actually failed — the same class of problem
+(the diagnostic second-guessing Frozen firmware based on incomplete or misordered telemetry) as the
+TEC false positive above, but this time in the pump-confirmation logic instead of the TEC-state
+parser.
+
+`--firmware-authoritative` is an opt-in flag for `frozen-cool-test` that removes this entire class
+of host-side inference. Every requirement above this section — the four required `--confirm-*`
+flags, both typed confirmation phrases, the baseline collection and validation, the 2.0C delta cap,
+the 120s default / 900s hard-maximum duration, the extended-duration confirmation above 300s — is
+completely unchanged. What changes is what happens *after* the target is confirmed enabled:
+
+* Frozen firmware becomes the sole authority on pump sequencing, TEC ramping, PID control, solenoid
+  control, fan control, current safety, thermal regulation, and target maintenance. This tool
+  becomes an observer plus a bounded stop timer.
+* **Telemetry received before the enabled `TargetUpdate` is actually confirmed — not merely "some
+  reply arrived" — is tagged pre-enable and never actioned as active-phase state.** This is the
+  direct fix for the incident above: an internal generation counter and timestamp only begin once
+  the real confirmation is seen; a stale `pump[left] off` report from before that point is recorded
+  in the raw report but can never trigger a shutdown.
+* The host-side heuristics that used to be able to end a legacy run — pump-startup-not-confirmed,
+  the communication watchdog (5s), the temperature watchdog (20s) and startup grace (15s), and the
+  generic firmware fault-keyword scan — are all disabled in this mode. Reaching the computed target
+  temperature is logged but no longer stops the test: Frozen continues maintaining it for the rest
+  of the requested duration.
+* In their place, this mode recognizes a small, closed set of legitimate automatic stop conditions:
+  the requested duration expiring, operator abort (typed or Ctrl+C/SIGTERM/SIGHUP), an explicit TEC
+  safety-lock message (`"unsafe, locking"` or exactly `"locked"` — same word-exact parser as the
+  legacy loop), an explicit recognized firmware safety-fault message, the enabled target being
+  explicitly lost, a fatal UART error, an internal error, and one remaining communication check: no
+  valid packet of *any* kind for 30 seconds (a deliberately much longer, single threshold than the
+  legacy loop's 5s/20s watchdogs — long enough that it cannot plausibly be confused with this
+  firmware's own telemetry cadence, but still a backstop against a truly dead link).
+* Positive evidence is still tracked and reported even though its *absence* is never a fault: pump
+  command/status messages (both the `"pump[<side>] ... @ <V>V <A>A"` format and the
+  `"[pump-<side>] <command>=><value>"` format — both captured from the same incident), TEC current
+  and safety-interlock messages, and observed target attainment. Missing TEC-current, fan, or pump
+  telemetry produces a logged warning, never a stop.
+* An independent shutdown guard, armed only once the target is confirmed enabled (never for
+  `--dry-run`), runs as a genuinely separate OS process — not a thread — so it survives the main
+  process crashing, hanging, or being killed outright, which an in-process construct cannot. It
+  uses the same disable-first, narrow-emergency-reset-only-as-last-resort sequence as every other
+  shutdown path in this tool, and only fires if the main process's own verified shutdown never
+  disarms it before its own timer (the requested duration plus a 30-second grace period) elapses.
+
+`--firmware-authoritative` does not change the required confirmations, the hard limits, or the
+guaranteed shutdown sequence below — it changes what the active phase watches for and what it does
+about what it sees.
+
 ## Automatic abort conditions during `frozen-prime-test`'s active phase
 
 The active phase aborts itself (and always runs safe-stop) on any of the following, in addition to

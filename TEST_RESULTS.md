@@ -1,11 +1,80 @@
 # TEST_RESULTS.md — opensleep-diagnostic
 
-All 244 unit/integration tests in `src/bin/opensleep-diagnostic/` pass (up from 240; see the
+All 251 unit/integration tests in `src/bin/opensleep-diagnostic/` pass (up from 244; see the
 revision note directly below), plus the 51 pre-existing `opensleep` library tests (unmodified,
-reused as-is) and 0 doc-tests — 295 total, 0 failed. Verified inside the
+reused as-is) and 0 doc-tests — 302 total, 0 failed. Verified inside the
 `messense/rust-musl-cross:aarch64-musl` builder image via `cargo test --locked` under its built-in
 QEMU aarch64 runner (the same environment the release binary is built in) as part of the
-diagnostic-v15 release build -- see `build-report.txt`.
+diagnostic-v16 release build -- see `build-report.txt`.
+
+## Revision note: add `--firmware-authoritative`, an optional narrower active-phase mode
+
+A live cooling test enabled the selected side successfully -- the pump was commanded, the solenoid
+opened, and the operator physically heard water flowing -- but the run stopped seconds later with
+`pump_startup_failure`. Root cause: three `"pump[left] off @ 0.000000V"` reports were already
+sitting in the host's own read buffer from *before* the enable command was even acknowledged; the
+active loop had no way to distinguish that stale, pre-enable evidence from a genuine post-enable
+failure. A host-side telemetry race, not credible evidence the pump had failed -- the same class of
+bug (the diagnostic second-guessing Frozen firmware on incomplete or misordered telemetry) as the
+TEC false positive documented below, this time in the pump-confirmation path.
+
+Rather than patching the legacy active loop's heuristics again, this revision adds an entirely
+separate, opt-in active-phase mode -- `--firmware-authoritative` -- alongside the legacy loop,
+which is otherwise completely unchanged (every existing test in this file, unmodified, still
+passes). See SAFETY.md's own new section for the full operator-facing rationale; summary of what's
+new here:
+
+* **Enable confirmation now waits for the *specific* enabled `TargetUpdate`**, not merely "some
+  reply arrived to the enable command" (the legacy loop's `send_result.is_ok()` shortcut, which is
+  exactly the gap that let already-buffered pre-enable telemetry look like proof of enablement).
+  Anything else observed while confirming is tagged pre-enable: recorded in the raw report, never
+  actioned as active-phase pump/TEC/fan/target state. A genuine implementation bug was caught by
+  this revision's own regression test while building this: the *original* enable send's own
+  single-packet reply can itself already *be* the real `TargetUpdate` (the normal case, when no
+  stray telemetry happens to be queued ahead of it) -- the first draft discarded that reply and
+  waited for a second packet that would never arrive, timing out and misreporting
+  `enabled_target_state_explicitly_lost`. Fixed by checking that original reply first.
+* **The legacy loop's host-side heuristics are all disabled in this mode**: pump-startup-not-
+  confirmed, the communication watchdog (5s), the temperature watchdog (20s)/startup grace (15s),
+  and the generic firmware fault-keyword scan's grace-gated substring behavior. Reaching the
+  computed target no longer stops the test either -- it's logged, and Frozen keeps maintaining it
+  for the rest of the requested duration.
+* **A small, closed set of legitimate automatic stop conditions replaces them**: duration expiry,
+  operator abort, a signal, an explicit TEC safety lock (`"unsafe, locking"`/exactly `"locked"`,
+  same word-exact parser), an explicit recognized firmware safety-fault message, the enabled target
+  being explicitly lost, a fatal UART error, an internal error, and one remaining communication
+  check -- no valid packet of *any* kind for 30 seconds (`FA_COMMUNICATION_SILENCE_LIMIT`), a single,
+  deliberately much longer threshold than the legacy loop's 5s/20s watchdogs.
+* **A second, previously undocumented pump-message format was captured from the same incident**:
+  `"[pump-left] slow=>6.500000"` / `"[pump-left] default=>9.000000"` -- a dash-and-arrow
+  pump-*command* format, distinct from the existing bracket-and-`@` status format. New
+  `is_pump_command_event` recognizes it as positive pump evidence. Its `"default"` value was a
+  second real trigger for the word-exact fault-keyword fix from the previous revision (`"fault"` is
+  a literal substring of `"default"`) -- confirmed still correctly non-triggering.
+* **An independent shutdown guard** (new `guard.rs`, and a hidden `internal-cool-test-guard`
+  subcommand), armed only once the target is confirmed enabled and only for a real (non-dry-run)
+  run: re-execs the packaged binary as a genuinely separate OS process -- deliberately not a thread,
+  since an in-process construct shares fate with whatever it's meant to protect against (a panic
+  that unwinds past `main`, a segfault, an OOM kill, `kill -9`). It races an arm timer (requested
+  duration + 30s grace) against reading a disarm byte from its own stdin pipe; if the main process's
+  own verified shutdown never disarms it in time, it opens the real Frozen UART/I2C itself and runs
+  the exact same `run_cool_test_shutdown` every other path in this tool uses.
+* **Unchanged**: the default duration (120s), hard maximum (900s), the 2.0C delta cap, all four
+  required `--confirm-*` flags, both typed confirmation phrases, baseline collection/validation, and
+  the extended-duration confirmation above 300s.
+
+7 net new tests (251 total, up from 244): the exact pre-enable race replayed end to end
+(`pre_enable_pump_off_telemetry_does_not_stop_firmware_authoritative_cooling`), TEC unsafe-locking
+still triggers immediate shutdown in this mode
+(`tec_unsafe_locking_triggers_immediate_shutdown_in_firmware_authoritative_mode`), and 5 tests
+against the independent guard's pure fire-or-stand-down decision logic
+(`guard::tests::*` -- disarm-byte-wins, any-byte-counts-as-disarm, pipe-closing-means-parent-gone,
+arm-expiry-means-fired, and a race between disarm and expiry). See "What is and isn't covered by
+automated tests" in `guard.rs`'s own module docs, and the known-gaps section below, for what the
+independent guard's *real* process-spawning/hardware-opening path could not be exercised by
+`cargo test` -- the same category of gap `frozen-prime-opensleep-init`'s real (non-mocked) path
+already has, for the same underlying reason (no real hardware, and in this case no real re-exec'able
+packaged binary, available in a test environment).
 
 ## Revision note: the fixed TEC-lock parser still aborted -- a caller bug and a watchdog mismatch
 
@@ -839,3 +908,10 @@ executable, falsifiable version of the "which modes permit it" table in PROTOCOL
   hardware) — this is a real, stated hardware/firmware limitation, not a gap in this tool's own
   logic, and is why the operator watching the reservoir is documented as the primary interlock
   (SAFETY.md) rather than this tool inferring emptiness from pump current or any other proxy.
+* `guard.rs`'s real entry point (`guard::run`) — opening a real Frozen UART/I2C device and being
+  re-exec'd as an actual child process of the packaged binary — is not exercised by `cargo test`:
+  `std::env::current_exe()` under `cargo test` resolves to the *test* binary, which has no
+  `internal-cool-test-guard` subcommand, and no real hardware is available in a test environment
+  regardless. Only the pure fire-or-stand-down decision logic
+  (`guard::wait_for_disarm_or_arm_expiry`) is covered by automated tests. This mirrors the same,
+  already-stated gap in `frozen-prime-opensleep-init`'s real (non-mocked) initialization path.

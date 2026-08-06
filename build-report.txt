@@ -1,8 +1,9 @@
 opensleep-diagnostic — build report
 ====================================
 
-Patch revision: 15 (fixes a watchdog-clock mismatch and a caller-side TEC control-flow bug)
-Supersedes revision 14 (fixed a false TEC-lock abort; extended the active phase to 15 minutes),
+Patch revision: 16 (adds --firmware-authoritative, an optional narrower active-phase mode)
+Supersedes revision 15 (fixes a watchdog-clock mismatch and a caller-side TEC control-flow bug),
+revision 14 (fixed a false TEC-lock abort; extended the active phase to 15 minutes),
 revision 13 (decoded the 14-byte GetTemperature reply; fixed a premature 40s baseline cutoff),
 revision 12 (reworked frozen-cool-test onto the narrow startup model; fixed an unbounded-write
 hang), revision 11 (fixed --release-frozen-only to configure the reset pin as an output before
@@ -14,6 +15,54 @@ frozen-prime-test, now removed), revision 5 (added frozen-prime-test), revision 
 active-test preflight/monitoring), revision 3 (staged, Frozen-only diagnostic redesign), revision 2
 (sensor-first post-reset bootloader retry-probe), and revision 1 (initial diagnostic-only fork).
 Same upstream base commit; only source.patch changed.
+
+What changed in revision 16
+----------------------------
+A live cooling test enabled the selected side successfully -- pump commanded, solenoid opened,
+water audibly flowing -- but stopped seconds later with pump_startup_failure. Root cause: three
+"pump[left] off @ 0.000000V" reports were already sitting in the host's read buffer from before the
+enable command was even acknowledged; the active loop had no way to tell that stale, pre-enable
+evidence apart from a genuine post-enable failure. A host-side telemetry race, not evidence the pump
+had actually failed.
+
+Rather than patch the legacy active loop's heuristics again, this revision adds a completely
+separate, opt-in active-phase mode -- --firmware-authoritative -- alongside the legacy loop, which
+is otherwise entirely unchanged (every pre-existing test, unmodified, still passes).
+
+  - Enable confirmation now waits for the specific enabled TargetUpdate, not merely "some reply
+    arrived" (the legacy loop's send_result.is_ok() shortcut -- exactly the gap that let buffered
+    pre-enable telemetry look like proof of enablement). Anything else observed while confirming is
+    tagged pre-enable: recorded in the raw report, never actioned as active-phase state. Caught a
+    real bug in this revision's own regression test along the way: the original enable send's own
+    single-packet reply can itself already be the real TargetUpdate; an early draft discarded it and
+    waited for a second packet that would never come, timing out instead of confirming.
+  - In --firmware-authoritative mode, Frozen firmware becomes the sole authority on pump sequencing,
+    TEC ramping, PID control, solenoid control, fan control, current safety, thermal regulation, and
+    target maintenance. The legacy loop's host-side heuristics (pump-startup-not-confirmed, the
+    5s/20s/15s communication and temperature watchdogs, the generic fault-keyword scan, stopping
+    early on target attainment) are all disabled in this mode -- replaced by a small, closed set of
+    legitimate automatic stops: duration expiry, operator abort, a signal, an explicit TEC safety
+    lock, an explicit recognized firmware safety-fault message, the enabled target being explicitly
+    lost, a fatal UART error, an internal error, and one remaining, much longer (30s) communication-
+    silence check.
+  - A second, previously undocumented pump-message format was captured from the same incident:
+    "[pump-left] slow=>6.500000" / "[pump-left] default=>9.000000" -- a dash-and-arrow
+    pump-*command* format, distinct from the existing bracket-and-@ status format. Recognized as
+    positive pump evidence; its "default" value re-confirms the word-exact fault-keyword fix from
+    revision 15 still holds ("fault" is a literal substring of "default").
+  - New independent shutdown guard (guard.rs, hidden internal-cool-test-guard subcommand): armed
+    only once the target is confirmed enabled and only for a real run, it re-execs the packaged
+    binary as a genuinely separate OS process -- not a thread, since an in-process construct shares
+    fate with whatever it's meant to protect against. Races an arm timer (requested duration + 30s
+    grace) against a disarm byte on its own stdin pipe; if the main process's own verified shutdown
+    never disarms it, it opens the real Frozen UART/I2C itself and runs the same disable sequence
+    every other shutdown path in this tool uses.
+  - Unchanged: default duration (120s), hard maximum (900s), 2.0C delta cap, all required
+    confirmations, baseline collection/validation.
+
+7 net new tests (251 total, up from 244). See TEST_RESULTS.md for the full writeup, including what
+the independent guard's real process-spawning/hardware-opening path could not be exercised by
+cargo test (only its pure decision logic could).
 
 What changed in revision 15
 ----------------------------
@@ -561,14 +610,13 @@ Tests:       cargo test --locked (run under the image's built-in QEMU test runne
 Test results (this build, inside the builder image)
 -----------------------------------------------------
 opensleep (lib) unit tests:               51 passed, 0 failed
-opensleep-diagnostic (bin) unit tests:    244 passed, 0 failed
+opensleep-diagnostic (bin) unit tests:    251 passed, 0 failed
 Doc-tests:                                 0 (none defined)
 
-This revision's build succeeded on the first attempt. The bin test suite finished in 92.54s under
-the builder image's QEMU aarch64 runner (86.22s for revision 14) -- expected, given the new
-exact-incident-timing regression test and several other watchdog-timing tests that wait out real
-wall-clock durations (up to ~35s in one case); still comfortably within the build's normal time
-budget.
+This revision's build succeeded on the first attempt. The bin test suite finished in 97.37s under
+the builder image's QEMU aarch64 runner (92.54s for revision 15) -- expected, given the new
+pre-enable-race regression test's own real-duration active phase and the 5 new independent-guard
+decision-logic tests; still comfortably within the build's normal time budget.
 
 See TEST_RESULTS.md for the full breakdown against the safety spec's checklists (30-item for the
 original redesign, 28-item for frozen-prime-test), plus the "New tests added" sections for each
