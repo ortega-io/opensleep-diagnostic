@@ -14,7 +14,7 @@ Five subcommands:
 * `opensleep-diagnostic frozen-prime-opensleep-init` — the same Prime-once operation, but through
   the real, unmodified upstream OpenSleep initialization and Frozen manager code instead. **Read
   SAFETY.md before running this.** Add `--release-frozen-only` for a third, narrower startup mode
-  that releases Frozen from reset with a single-bit I2C write instead of the full upstream reset
+  that releases Frozen from reset with a single-bit I2C pulse instead of the full upstream reset
   sequence — see that flag's own section below and in SAFETY.md.
 * `opensleep-diagnostic frozen-cool-test` — intentionally activates one cooling channel; requires
   a connected, *already-filled* hydraulic loop and multiple explicit confirmations. **Read
@@ -36,8 +36,8 @@ verification, then move it into place):
 
 ```sh
 cd /tmp
-curl -L -O https://github.com/ortega-io/opensleep-diagnostic/releases/download/diagnostic-v9/opensleep-diagnostic-aarch64-static
-curl -L -O https://github.com/ortega-io/opensleep-diagnostic/releases/download/diagnostic-v9/opensleep-diagnostic-aarch64-static.sha256
+curl -L -O https://github.com/ortega-io/opensleep-diagnostic/releases/download/diagnostic-v10/opensleep-diagnostic-aarch64-static
+curl -L -O https://github.com/ortega-io/opensleep-diagnostic/releases/download/diagnostic-v10/opensleep-diagnostic-aarch64-static.sha256
 sha256sum -c opensleep-diagnostic-aarch64-static.sha256
 mv opensleep-diagnostic-aarch64-static /persistent/tools/opensleep-diagnostic
 ```
