@@ -117,55 +117,74 @@ Real hardware evidence drove this: after a normal boot, the reservoir-fill indic
 Frozen doesn't answer `Ping`; running the full reset sequence *does* release Frozen (it answers
 `Ping` afterward), but it also turns the reservoir indicator off and leaves it unresponsive —
 firmware then reports `[fdc1004] failed to write config` and `[capwater] sensor unavailable`. The
-full reset sequence writes four I2C registers on the `0x20` expander (`0x06`, `0x07`, then `0x02`
-twice); tracing which writes actually release Frozen showed it is the *last two* — `0x02` written
-first to `0xFF` (bit 1 high) and then to `0xFD` (bit 1 low) — a low→high→low **pulse**, not a
-one-shot clear. Registers `0x06` and `0x07` (port direction/config) are never involved in releasing
-Frozen at all; changing them is suspected to be what disturbs the reservoir indicator.
+full reset sequence writes four I2C registers on the `0x20` expander — `0x06` (direction/config,
+port 0), `0x07` (direction/config, port 1), then `0x02` (output) twice; tracing which writes
+actually release Frozen showed it is the *last three* — `0x06` written to `0xFC` (configuring bits
+0 and 1 as outputs), then `0x02` written to `0xFF` (bit 1 high) and then to `0xFD` (bit 1 low) — a
+low→high→low **pulse** on the output latch, *after* the pin is actually configured as an output.
+Register `0x07` (port 1's direction/config, unrelated to Frozen's reset bit) is never involved in
+releasing Frozen at all; changing it is suspected to be what disturbs the reservoir indicator.
 
-**A one-shot clear is not sufficient.** An earlier revision of this mode only cleared bit 1
-(`released = original & !0x02`) without first asserting it. A live run found register `0x02`
-already reading `0xFD` (bit 1 already low) at that point, so the clear was a no-op with no edge on
-the pin, and Frozen never responded. Release is a *transition*, not a *level* — this mode always
-asserts before releasing, regardless of what bit 1 already reads as.
+**Two revisions of this mode failed on real hardware before this one, for two different reasons:**
+
+* **A one-shot clear is not sufficient.** The first revision only cleared bit 1
+  (`released = original & !0x02`) without first asserting it. A live run found register `0x02`
+  already reading `0xFD` (bit 1 already low) at that point, so the clear was a no-op with no edge
+  on the pin, and Frozen never responded. Release is a *transition*, not a *level* — this mode
+  always asserts before releasing, regardless of what bit 1 already reads as.
+* **The output register alone is not sufficient either.** The second revision pulsed register
+  `0x02` correctly (readbacks all verified, `0xFD → 0xFF → 0xFD`) and Frozen *still* never
+  responded, because register `0x06` — which pin is configured as an output vs. an input/high-Z —
+  was never touched. On the PCAL6416A, a pin configured as an input (the power-on-reset default)
+  ignores its output-latch value entirely: writing register `0x02` changes what the chip *would*
+  drive if it were an output, not the physical pin. This mode now configures only bit 1 of register
+  `0x06` as an output before pulsing register `0x02`, and — since the reset line must stay actively
+  driven, not float back to high-impedance — never restores it afterward.
 
 **What this mode does, in order:**
 
-1. Opens `/dev/i2c-1` and reads the PCAL6416A (`0x20`) register `0x02` — never registers `0x06` or
-   `0x07`, and never `opensleep::reset::ResetController`.
-2. Computes `asserted = original | 0x02` and `released = asserted & !0x02` — both derived from what
-   was actually read, never a hardcoded constant — and verifies mathematically, before either write
-   is issued, that neither can change any bit other than bit 1 (this can never actually fail by
-   construction, but is asserted, not merely assumed).
-3. Writes `asserted` to register `0x02`, reads it back to verify, waits 100ms, then writes
-   `released` and reads it back to verify. Original, asserted, the asserted readback, released, the
-   released readback, both changed-bit masks, and the pulse duration are all logged. **If either
-   readback doesn't match what was written, or if any bit other than bit 1 ever changed, the run
-   aborts before ever touching the Frozen UART.**
-4. Waits up to 2 seconds, draining and logging any unsolicited boot messages Frozen sends, then
+1. Opens `/dev/i2c-1` and reads the PCAL6416A (`0x20`) register `0x02` — never
+   `opensleep::reset::ResetController`.
+2. Writes `asserted = original | 0x02` to register `0x02` and reads it back to verify — preparing
+   the output latch's asserted level *before* bit 1 becomes an output (next step), so the instant
+   the pin starts being driven it drives the already-intended level, avoiding an unintended release
+   glitch.
+3. Reads register `0x06`, computes `config = original & !0x02` — preserving bit 0 and every other
+   bit exactly as read, never a hardcoded constant — verifies mathematically, before writing, that
+   this can only ever change bit 1, writes it, and reads it back to verify. Whether bit 1 was
+   previously input or output is logged.
+4. Now that the pin is actually driven, holds the asserted level for 100ms, then computes
+   `released = asserted & !0x02`, writes it to register `0x02`, and reads it back to verify.
+   Register `0x06`'s original/target/readback, register `0x02`'s original/asserted/released values
+   and readbacks, both changed-bit masks, and the pulse duration are all logged. **If any of the
+   three readbacks doesn't match what was written, or if any bit other than bit 1 ever changed in
+   either register, the run aborts before ever touching the Frozen UART.**
+5. Waits up to 2 seconds, draining and logging any unsolicited boot messages Frozen sends, then
    Pings repeatedly for up to 10 more seconds. `Pong(false)` (bootloader) is followed by
    `JumpToFirmware`, then re-Pinging — tolerating any interleaved startup messages in between,
    rather than failing on the first non-`Pong` packet — until `Pong(true)`; `Pong(true)` directly
    means firmware was already running. **If Frozen never answers at all, the run aborts without
    ever sending `Prime`** — this is not treated as a fault and does not trigger an emergency reset
    (see below): Frozen is simply left released, in case it is merely slow to respond.
-5. Requires typing `RESERVOIR INDICATOR IS STILL WORKING` — a **third** confirmation phrase,
+6. Requires typing `RESERVOIR INDICATOR IS STILL WORKING` — a **third** confirmation phrase,
    distinct from the two `frozen-prime-opensleep-init` already requires — but only once Frozen has
    reached application firmware, immediately before `Prime`. The report's `reservoir_status` field
    records the outcome explicitly as one of `confirmed`, `failed_by_operator_observation` (the
    phrase was asked and not matched), or `unverified` (the run aborted before ever asking) — it is
    never reported as a false negative merely because the confirmation was never reached.
-6. Sends `Prime` exactly once, through this binary's own audited `FrozenLink`/`AuditedTransport`
+7. Sends `Prime` exactly once, through this binary's own audited `FrozenLink`/`AuditedTransport`
    (`Mode::PrimeTest` — the same runtime mode `frozen-prime-test` uses, not the real upstream
    scheduler this file's `frozen-prime-opensleep-init` section above uses). Distinguishes
    `"[priming] done"` from `"[priming] done because empty"` exactly as every other priming mode
    does, over the firmware's up-to-600000ms observation window.
-7. **On normal completion, "done because empty", or a preflight failure once Frozen has answered,
-   performs no I2C write at all** — it does not restore register `0x02`, does not re-run any reset,
-   and does not touch the port in any way. Frozen is left released and running.
-8. **The only exception:** a genuine firmware-reported pump fault re-asserts *only* bit 1 of
+8. **On normal completion, "done because empty", or a preflight failure once Frozen has answered,
+   performs no further I2C write at all** — it does not restore either register, does not re-run
+   any reset, and does not touch the port in any way. Frozen is left released, configured as an
+   output, and running.
+9. **The only exception:** a genuine firmware-reported pump fault re-asserts *only* bit 1 of
    register `0x02` via another narrow read-modify-write (`asserted = current | 0x02`, preserving
-   every other bit) — never the four-register full reset, and never registers `0x06`/`0x07`.
+   every other bit) — never the four-register full reset, never register `0x06` again (it is
+   already configured as an output from step 3 and is left that way), and never register `0x07`.
 
 Because this mode uses this binary's own `AuditedTransport` (unlike the rest of
 `frozen-prime-opensleep-init`, which never touches it — see "Command whitelist" below), `Prime` is

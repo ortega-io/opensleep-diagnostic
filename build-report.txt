@@ -1,14 +1,44 @@
 opensleep-diagnostic — build report
 ====================================
 
-Patch revision: 10 (fixes --release-frozen-only to pulse the reset bit instead of one-shot clearing it)
-Supersedes revision 9 (added --release-frozen-only: minimal Frozen release, no global reset),
+Patch revision: 11 (fixes --release-frozen-only to configure the reset pin as an output before pulsing it)
+Supersedes revision 10 (fixed --release-frozen-only to pulse the reset bit instead of one-shot
+clearing it), revision 9 (added --release-frozen-only: minimal Frozen release, no global reset),
 revision 8 (fixed Frozen/Sensor UART paths for this Hub variant), revision 7 (replaced
 --preserve-boot-state with frozen-prime-opensleep-init), revision 6 (added --preserve-boot-state to
 frozen-prime-test, now removed), revision 5 (added frozen-prime-test), revision 4 (corrected
 active-test preflight/monitoring), revision 3 (staged, Frozen-only diagnostic redesign), revision 2
 (sensor-first post-reset bootloader retry-probe), and revision 1 (initial diagnostic-only fork).
 Same upstream base commit; only source.patch changed.
+
+What changed in revision 11
+----------------------------
+A live run of revision 10's --release-frozen-only pulsed register 0x02 correctly (readbacks all
+verified, 0xFD -> 0xFF -> 0xFD) and Frozen still never responded. Register 0x06 (direction/config)
+was never touched by that revision. On the PCAL6416A, register 0x06 selects per-bit whether a pin
+is an input/high-impedance (1) or an output (0); the power-on-reset default is every bit an input,
+which ignores its output-latch value (register 0x02) entirely -- so revision 10's pulse changed
+what the chip would drive if bit 1 were an output, not the physical pin. The original,
+confirmed-working upstream reset sequence writes register 0x06 to 0xFC (bits 0 and 1 as outputs) as
+one of its first two writes; this mode's narrow, bit-1-only analog of that write was missing.
+
+  - `i2c::pulse_frozen_reset_bit` now does three writes instead of two: (1) prepares register
+    0x02's output latch to the asserted level before bit 1 becomes an output, avoiding an
+    unintended glitch; (2) configures only bit 1 of register 0x06 as an output, preserving bit 0
+    and every other bit; (3) holds the now-actually-driven level for 100ms, then releases it.
+    Every write's target is verified mathematically before being issued (generalized from a
+    register-0x02-only helper to a shared one accepting either register) and every readback is
+    verified after. Register 0x06 is deliberately never restored -- the reset line must stay
+    actively driven -- and register 0x07 is still never written.
+  - `report::ReleaseFrozenOnlyResults` gained `original_register_0x06`/`config_register_0x06`/
+    `config_readback_register_0x06`/`config_readback_matches`/
+    `bit1_was_already_configured_as_output`.
+  - 4 net new tests (166 total in this directory, up from 162), all in `i2c.rs`: the two starting
+    cases explicitly requested (config register 0x06 = 0xFF -> 0xFD, and 0xFC -> unchanged), an
+    exhaustive 256-value sweep proving the configuration write can only ever change bit 1, an
+    ordering test proving the output-latch write happens strictly before the direction write, and
+    a renamed/updated test proving register 0x07 is never written across the same sweep. See
+    TEST_RESULTS.md for the full writeup.
 
 What changed in revision 10
 ----------------------------

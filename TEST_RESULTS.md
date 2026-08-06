@@ -1,11 +1,61 @@
 # TEST_RESULTS.md — opensleep-diagnostic
 
-All 162 unit/integration tests in `src/bin/opensleep-diagnostic/` pass (up from 158; see the
+All 166 unit/integration tests in `src/bin/opensleep-diagnostic/` pass (up from 162; see the
 revision note directly below), plus the 51 pre-existing `opensleep` library tests (unmodified,
-reused as-is) and 0 doc-tests — 213 total, 0 failed. Verified inside the
+reused as-is) and 0 doc-tests — 217 total, 0 failed. Verified inside the
 `messense/rust-musl-cross:aarch64-musl` builder image via `cargo test --locked` under its built-in
 QEMU aarch64 runner (the same environment the release binary is built in) as part of the
-diagnostic-v10 release build -- see `build-report.txt`.
+diagnostic-v11 release build -- see `build-report.txt`.
+
+## Revision note: fix `--release-frozen-only` to configure the reset pin as an output before pulsing it
+
+A live run of revision 10's `--release-frozen-only` pulsed register `0x02` correctly (readbacks all
+verified, `0xFD → 0xFF → 0xFD`) and Frozen *still* never responded. Register `0x06` (direction/
+config) was never touched by that revision. On the PCAL6416A, register `0x06` selects, per bit,
+whether a pin is an input/high-impedance (`1`) or an output (`0`); the power-on-reset default is
+every bit an input. A bit configured as an input ignores its output-latch value (register `0x02`)
+entirely -- so revision 10's pulse changed what the chip *would* drive if bit 1 were an output, not
+the physical pin. The original, confirmed-working upstream reset sequence writes register `0x06` to
+`0xFC` (configuring bits 0 and 1 as outputs) as one of its first two writes -- this revision's
+narrow, bit-1-only analog was missing entirely.
+
+`i2c::pulse_frozen_reset_bit` now does three writes instead of two, in this order: (1) prepares
+register `0x02`'s output latch to the asserted level (`asserted = original | 0x02`) *before* bit 1
+becomes an output, so the instant the pin starts being driven it drives the already-intended level
+rather than glitching on whatever the latch happened to already read; (2) configures only bit 1 of
+register `0x06` as an output (`config = original & !0x02`), preserving bit 0 and every other bit;
+(3) holds the now-actually-driven asserted level for 100ms, then releases it (`released = asserted &
+!0x02`). Every write's target is verified mathematically before it is issued (an `assert_eq!` inside
+the shared `read_modify_write_reg` helper, generalized from register-0x02-only to accept either
+register), and every write's readback is verified after. Register `0x06` is deliberately never
+restored afterward -- the reset line must stay actively driven, not float back to high-impedance --
+and register `0x07` is still never written at all.
+
+`ReleaseFrozenOnlyResults` gained `original_register_0x06`/`config_register_0x06`/
+`config_readback_register_0x06`/`config_readback_matches`/`bit1_was_already_configured_as_output`,
+alongside the existing register-0x02 fields (now describing the output-latch-prep and release
+writes specifically, not "assert"/"release" generically).
+
+**4 net new tests (166 total, up from 162), all in `i2c.rs` (`i2c::tests`):**
+
+* `config_register_0xff_configures_bit_1_as_output_target_0xfd` and
+  `config_register_0xfc_remains_0xfc` -- the two starting cases explicitly requested (register 0x06
+  starting at the power-on-reset default vs. already correctly configured).
+* `config_register_sweep_preserves_every_bit_except_bit_1` -- an exhaustive 256-value sweep over
+  every possible original register-0x06 value, proving the configuration write can only ever change
+  bit 1, and that `bit1_was_already_output` correctly reflects the original state.
+* `output_latch_set_to_asserted_before_direction_becomes_output` -- proves the register-0x02 write
+  is issued strictly before the register-0x06 write (checked via write-order indices in the mock's
+  write log), and that the very first write is specifically the asserted value.
+* `pulse_never_writes_register_0x07` (renamed from `pulse_never_writes_registers_0x06_or_0x07`,
+  since register 0x06 is now legitimately written once per pulse) -- the same 256-value sweep,
+  now asserting exactly three writes per pulse (register 0x02 twice, register 0x06 once) and that
+  register 0x07 never appears.
+
+The two starting-case pulse tests (`pulse_from_0xfd_...`/`pulse_from_0xff_...`) and the end-to-end
+`prime_opensleep_init.rs` tests were updated in place for the new three-write sequence and field
+names, without changing their count. Smoke-tested against the real cross-compiled binary via
+qemu-aarch64-static -- see `build-report.txt` for the full account.
 
 ## Revision note: fix `--release-frozen-only` to pulse the reset bit instead of one-shot clearing it
 

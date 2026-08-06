@@ -298,13 +298,22 @@ real serial ports and I2C devices and has no mock transport to substitute one in
 Add `--release-frozen-only` to `frozen-prime-opensleep-init` when you specifically want to release
 Frozen from reset **without** running the full upstream I2C reset sequence and **without** the
 earlier `--preserve-boot-state` flag (removed; this flag replaces it). Real hardware evidence: the
-full reset does release Frozen, but it also reconfigures I2C expander registers `0x06`/`0x07` and
-leaves the reservoir-fill indicator off and unresponsive afterward. This mode instead **pulses**
-only bit 1 of register `0x02` — writes `asserted = original | 0x02`, verifies the readback, waits
-100ms, then writes `released = asserted & !0x02` and verifies that readback too — and never touches
-`0x06`/`0x07` at all. The pulse matters: a one-shot clear (no preceding assert) was tried first and
-failed on real hardware, because register `0x02` was already reading `0xFD` (bit 1 already low), so
-clearing it again was a no-op with no edge and Frozen never responded. **Read the
+full reset does release Frozen, but it also reconfigures I2C expander register `0x07` (unrelated to
+Frozen's reset bit) and leaves the reservoir-fill indicator off and unresponsive afterward. This
+mode instead touches only bit 1 of two registers, and never register `0x07` at all:
+
+1. Configures only bit 1 of register `0x06` (direction/config) as an output — `config = original &
+   !0x02`, preserving bit 0 and every other bit — since on the PCAL6416A a bit configured as an
+   input (the power-on-reset default) ignores its output-latch value entirely.
+2. **Pulses** only bit 1 of register `0x02` (output) — writes `asserted = original | 0x02`,
+   verifies the readback, waits 100ms, then writes `released = asserted & !0x02` and verifies that
+   readback too.
+
+Both steps matter, and were found the hard way on real hardware: a one-shot clear of register
+`0x02` (no preceding assert) failed because the register was already reading `0xFD` (bit 1 already
+low), so clearing it again was a no-op with no edge. A register-`0x02`-only pulse (assert then
+release, correctly) *also* failed, because register `0x06` was never touched — bit 1 was never
+actually configured as an output, so the chip never physically drove the pin at all. **Read the
 `--release-frozen-only` section of SAFETY.md before using this — it is a third, narrower safety
 model, not a relaxed one.**
 
@@ -337,11 +346,12 @@ asked and did not), or `unverified` (the run aborted before ever asking — neve
 negative just because the confirmation was never reached).
 
 * On normal completion, `"done because empty"`, or a preflight failure once Frozen has answered,
-  this mode performs **no I2C write at all** on exit — it does not restore register `0x02` and does
-  not run any reset. Frozen is left released and running. If priming does not visibly stop, reboot
-  the Hub or disconnect Hub power.
+  this mode performs **no further I2C write at all** on exit — it does not restore either register
+  and does not run any reset. Frozen is left released, configured as an output, and running. If
+  priming does not visibly stop, reboot the Hub or disconnect Hub power.
 * The only exception is a genuine firmware-reported pump fault, which re-asserts bit 1 of register
-  `0x02` only (never the full four-register reset, never `0x06`/`0x07`).
+  `0x02` only (never the full four-register reset, never register `0x06` again -- it stays
+  configured as an output from step 1 above -- and never register `0x07`).
 * Unlike plain `frozen-prime-opensleep-init --dry-run` above, `--release-frozen-only --dry-run`
   *can* run end to end against a mocked I2C expander and a mocked Frozen device — it never calls
   into code that hardcodes real serial ports or I2C devices:
@@ -357,10 +367,12 @@ negative just because the confirmation was never reached).
 
   ```
   Register 0x02 original:          0b11111111
-  Asserted: target=0b11111111 readback=0b11111111 matches=true
+  Asserted (output latch, pre-direction): target=0b11111111 readback=0b11111111 matches=true
+  Register 0x06 original:          0b11111111
+  Register 0x06 configured-as-output: target=0b11111101 readback=0b11111101 matches=true (bit 1 was previously input)
   Released: target=0b11111101 readback=0b11111101 matches=true
-  Only bit 1 changed (both halves): true
-  Pulse duration:                  100 ms
+  Only bit 1 changed (all three writes): true
+  Pulse duration (driven):         100 ms
   Frozen UART opened:              true/false
   Frozen reached firmware:         true/false
   [capwater] unavailable observed: true/false

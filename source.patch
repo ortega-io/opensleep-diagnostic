@@ -138,7 +138,7 @@ index 0000000..261be8d
 +}
 diff --git a/src/bin/opensleep-diagnostic/cli.rs b/src/bin/opensleep-diagnostic/cli.rs
 new file mode 100644
-index 0000000..1e767be
+index 0000000..a4c2058
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/cli.rs
 @@ -0,0 +1,288 @@
@@ -395,10 +395,10 @@ index 0000000..1e767be
 +    /// Minimal startup mode: instead of the full upstream reset (ResetController) or the previous
 +    /// --preserve-boot-state behavior, release Frozen from reset by pulsing only bit 1 of I2C
 +    /// expander register 0x02 low->high->low (assert then release, each a read-modify-write that
-+    /// preserves every other bit), never writing registers 0x06/0x07. This replaces both the
-+    /// global OpenSleep reset and --preserve-boot-state; it does not call
-+    /// opensleep::reset::ResetController and does not run the real upstream Frozen or Sensor
-+    /// manager tasks.
++    /// preserves every other bit), first configuring only bit 1 of register 0x06 as an output (so
++    /// the pin is actually driven), and never writing register 0x07. This replaces both the global
++    /// OpenSleep reset and --preserve-boot-state; it does not call opensleep::reset::ResetController
++    /// and does not run the real upstream Frozen or Sensor manager tasks.
 +    #[arg(long, default_value_t = false)]
 +    pub release_frozen_only: bool,
 +
@@ -2337,10 +2337,10 @@ index 0000000..666ce19
 +}
 diff --git a/src/bin/opensleep-diagnostic/i2c.rs b/src/bin/opensleep-diagnostic/i2c.rs
 new file mode 100644
-index 0000000..9725bfa
+index 0000000..c9c0db5
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/i2c.rs
-@@ -0,0 +1,617 @@
+@@ -0,0 +1,782 @@
 +//! I2C access, generic over an [`I2cPort`] trait so the exact same probe/reset code runs against
 +//! the real `/dev/i2c-1` bus, a scripted mock in tests, and the always-succeeding mock used by
 +//! `--dry-run`.
@@ -2351,8 +2351,9 @@ index 0000000..9725bfa
 +//! (b) the single fixed "assert reset" write (`reg 0x02 <- 0xFF`) used by safe-stop and
 +//! `emergency-stop`; and (c) the narrow, read-modify-write single-bit operations used by
 +//! `frozen-prime-opensleep-init --release-frozen-only` ([`pulse_frozen_reset_bit`]/
-+//! [`assert_frozen_reset_bit_only`]), which only ever touch bit 1 of register 0x02 and never write
-+//! 0x06/0x07 at all. No other register, on `0x20` or any other address, is ever written.
++//! [`assert_frozen_reset_bit_only`]), which only ever touch bit 1 of registers 0x02 (output) and,
++//! for [`pulse_frozen_reset_bit`] only, 0x06 (direction/config) -- and never write 0x07 at all. No
++//! other register, on `0x20` or any other address, is ever written.
 +
 +use std::time::Duration;
 +use tokio::time::{Instant, sleep};
@@ -2481,6 +2482,11 @@ index 0000000..9725bfa
 +        // Real hardware evidence: after a normal Hub reboot, Frozen is held in reset -- register
 +        // 0x02 reads 0xFF (every output bit, including bit 1, asserted).
 +        reg_state.insert((RESET_EXPANDER_ADDR, 0x02), 0xFF);
++        // PCAL6416A power-on-reset default: every pin configured as an input (register 0x06 =
++        // 0xFF) until something explicitly configures it as an output -- real-hardware evidence
++        // this default is why a pulse on the *output* latch alone (register 0x02) produced no
++        // physical edge and no response from Frozen: bit 1 was never actually driven.
++        reg_state.insert((RESET_EXPANDER_ADDR, 0x06), 0xFF);
 +        Self {
 +            reads,
 +            reg_state,
@@ -2624,7 +2630,7 @@ index 0000000..9725bfa
 +/// The result of a narrow, read-modify-write operation on register 0x02 -- see
 +/// [`pulse_frozen_reset_bit`]/[`assert_frozen_reset_bit_only`].
 +#[derive(Debug, Clone, Copy, Default)]
-+pub struct Reg02ReadModifyWriteResult {
++pub struct RegBitReadModifyWriteResult {
 +    pub original: u8,
 +    pub target: u8,
 +    pub changed_mask: u8,
@@ -2637,30 +2643,37 @@ index 0000000..9725bfa
 +    pub only_bit1_changed: bool,
 +}
 +
-+async fn read_modify_write_reg02<P: I2cPort>(
++/// Shared by register 0x02 (output latch) and register 0x06 (direction/config): reads `reg`,
++/// computes a new value via `transform`, verifies mathematically (before writing) that the change
++/// touches only bit 1, writes it, and reads it back to verify. `reg_label` is used only in log
++/// lines (e.g. `"0x02"`/`"0x06"`).
++async fn read_modify_write_reg<P: I2cPort>(
 +    dev: &mut P,
++    reg: u8,
++    reg_label: &str,
 +    transform: impl FnOnce(u8) -> u8,
 +    target_label: &str,
-+) -> Result<Reg02ReadModifyWriteResult, I2cIoError> {
-+    let original = dev.read_reg(RESET_EXPANDER_ADDR, REG_OUTPUT_PORT_0)?;
++) -> Result<RegBitReadModifyWriteResult, I2cIoError> {
++    let original = dev.read_reg(RESET_EXPANDER_ADDR, reg)?;
 +    let target = transform(original);
 +    let changed_mask = original ^ target;
-+    log::info!("original register 0x02: 0b{original:08b} (0x{original:02X})");
-+    log::info!("{target_label} register 0x02: 0b{target:08b} (0x{target:02X})");
++    log::info!("original register {reg_label}: 0b{original:08b} (0x{original:02X})");
++    log::info!("{target_label} register {reg_label}: 0b{target:08b} (0x{target:02X})");
 +    log::info!("changed-bit mask: 0b{changed_mask:08b} (0x{changed_mask:02X})");
-+    // Verified mathematically, before any write is issued: `target` is computed as either
-+    // `original | FROZEN_RESET_BIT` or `original & !FROZEN_RESET_BIT`, both of which can only ever
-+    // differ from `original` in bit 1 -- this can never actually fail, but is asserted (not merely
-+    // logged) as a structural proof of that claim rather than an assumption.
++    // Verified mathematically, before any write is issued: every `transform` this function is
++    // ever called with is either `original | FROZEN_RESET_BIT` or `original & !FROZEN_RESET_BIT`,
++    // both of which can only ever differ from `original` in bit 1 -- this can never actually fail,
++    // but is asserted (not merely logged) as a structural proof of that claim rather than an
++    // assumption.
 +    assert_eq!(
 +        changed_mask & !FROZEN_RESET_BIT,
 +        0,
-+        "computed target for register 0x02 would change a bit other than bit 1 (original=0b{original:08b} target=0b{target:08b})"
++        "computed target for register {reg_label} would change a bit other than bit 1 (original=0b{original:08b} target=0b{target:08b})"
 +    );
-+    dev.write_reg(RESET_EXPANDER_ADDR, REG_OUTPUT_PORT_0, target)?;
-+    let readback = dev.read_reg(RESET_EXPANDER_ADDR, REG_OUTPUT_PORT_0)?;
++    dev.write_reg(RESET_EXPANDER_ADDR, reg, target)?;
++    let readback = dev.read_reg(RESET_EXPANDER_ADDR, reg)?;
 +    log::info!("readback result: 0b{readback:08b} (0x{readback:02X})");
-+    Ok(Reg02ReadModifyWriteResult {
++    Ok(RegBitReadModifyWriteResult {
 +        original,
 +        target,
 +        changed_mask,
@@ -2670,54 +2683,120 @@ index 0000000..9725bfa
 +    })
 +}
 +
-+/// The result of [`pulse_frozen_reset_bit`]: both the assert and release halves of the pulse,
-+/// verified independently, plus how long bit 1 was actually held asserted.
++async fn read_modify_write_reg02<P: I2cPort>(
++    dev: &mut P,
++    transform: impl FnOnce(u8) -> u8,
++    target_label: &str,
++) -> Result<RegBitReadModifyWriteResult, I2cIoError> {
++    read_modify_write_reg(dev, REG_OUTPUT_PORT_0, "0x02", transform, target_label).await
++}
++
++/// The result of the register-0x06 direction/config half of [`pulse_frozen_reset_bit`]: whether
++/// bit 1 was already configured as an output before this write (`0` = output, `1` = input/high-Z
++/// on the PCAL6416A), which is exactly the evidence that explains why an earlier revision's
++/// output-register-only pulse produced no physical edge -- the pin was never actually driven.
++#[derive(Debug, Clone, Copy, Default)]
++pub struct Reg06ConfigResult {
++    pub inner: RegBitReadModifyWriteResult,
++    /// `true` iff bit 1 of register 0x06 already read `0` (output) before this write; `false` iff
++    /// it read `1` (input/high-Z), meaning this write is what first enables the pin to be driven.
++    pub bit1_was_already_output: bool,
++}
++
++/// The result of [`pulse_frozen_reset_bit`]: the output-latch prep, the direction/config write, and
++/// the release, each verified independently, plus how long bit 1 was actually held asserted *while
++/// configured as an output* (i.e. while physically driven).
 +#[derive(Debug, Clone, Copy, Default)]
 +pub struct Reg02PulseResult {
-+    pub assert_step: Reg02ReadModifyWriteResult,
-+    pub release_step: Reg02ReadModifyWriteResult,
++    /// Prepares the output latch to the asserted level *before* the pin is configured as an output
++    /// (see [`pulse_frozen_reset_bit`]'s doc comment for why this ordering avoids a glitch).
++    pub assert_output_step: RegBitReadModifyWriteResult,
++    /// Configures only bit 1 of register 0x06 as an output; never touches bit 0 or any other bit.
++    pub config_step: Reg06ConfigResult,
++    pub release_step: RegBitReadModifyWriteResult,
 +    pub pulse_duration: Duration,
 +}
 +
 +impl Reg02PulseResult {
-+    /// `true` iff both halves of the pulse verified: each write's readback matched what was
-+    /// written, and each write changed only bit 1.
++    /// `true` iff every step verified: each write's readback matched what was written, and each
++    /// write changed only bit 1 (of its own register).
 +    pub fn fully_verified(&self) -> bool {
-+        self.assert_step.readback_matches
-+            && self.assert_step.only_bit1_changed
++        self.assert_output_step.readback_matches
++            && self.assert_output_step.only_bit1_changed
++            && self.config_step.inner.readback_matches
++            && self.config_step.inner.only_bit1_changed
 +            && self.release_step.readback_matches
 +            && self.release_step.only_bit1_changed
 +    }
 +}
 +
-+/// Releases Frozen from reset with a low->high->low **pulse** of *only* bit 1 of register 0x02,
-+/// preserving every other bit exactly as read at each step -- never the four-register full reset
-+/// sequence ([`run_reset_sequence`]) used elsewhere in this binary, and never
-+/// `opensleep::reset::ResetController`. Real hardware evidence: the full reset also reconfigures
-+/// the port-direction registers (0x06/0x07), which leaves the filled-reservoir indicator off and
-+/// unresponsive even though it does release Frozen (`[fdc1004] failed to write config` /
-+/// `[capwater] sensor unavailable` were observed afterward). Separately, a live run that only
-+/// *cleared* bit 1 (without first asserting it) found register 0x02 already read as `0xFD` --
-+/// clearing an already-clear bit is a no-op with no edge, and Frozen did not respond, because
-+/// release is a transition, not a level: the known-working sequence always asserts (`reg 0x02 |=
-+/// 0x02`) before releasing (`reg 0x02 &= !0x02`), regardless of the bit's state when read. This
-+/// function never touches 0x06/0x07 at all, and computes both the asserted and released values
-+/// from what was actually read at each step (never a hardcoded constant), verifying the readback
-+/// and re-checking that only bit 1 changed after every single write. Callers must check the
-+/// returned result's [`Reg02PulseResult::fully_verified`] before proceeding, and must not treat a
-+/// successful I2C transaction alone as sufficient confirmation.
++/// Releases Frozen from reset with a low->high->low **pulse** of *only* bit 1 of register 0x02
++/// (the output latch) -- but first, only bit 1 of register 0x06 (direction/config) is configured
++/// as an output, since on the PCAL6416A a bit configured as an input (the power-on-reset default)
++/// ignores its output-latch value entirely: writing register 0x02 alone changes what the chip
++/// *would* drive if configured as an output, not the physical pin. Real hardware evidence: an
++/// earlier revision pulsed only register 0x02 (readbacks all verified, `0xFD -> 0xFF -> 0xFD`) and
++/// Frozen still never responded -- register 0x06 was never written, so bit 1 was never actually an
++/// output. The original, confirmed-working upstream reset sequence writes register 0x06 to `0xFC`
++/// (bits 0 and 1 as outputs) as one of its first two writes, which this function's own bit-1-only
++/// analog now mirrors, alongside never touching the four-register full reset sequence
++/// ([`run_reset_sequence`]) or `opensleep::reset::ResetController`, and never register 0x07 at all.
++///
++/// Ordering matters: bit 1's output latch (register 0x02) is set to the *asserted* level first,
++/// before bit 1 becomes an output (register 0x06) -- so the instant the pin starts being driven, it
++/// drives the already-intended asserted level, rather than whatever register 0x02 happened to
++/// already read (avoiding an unintended release glitch on the line). Only once the pin is
++/// confirmed configured as an output is the assert level actually held for [`PULSE_SETTLE`] and
++/// then released. Register 0x06 is deliberately **not** restored to its original value afterward:
++/// the reset line must remain actively driven (an output), not float back to high-impedance.
++///
++/// Every value written to either register is computed from what was actually read at that step
++/// (never a hardcoded constant), each write's readback is verified, and each write is re-checked
++/// to have changed only bit 1 of its own register (see [`read_modify_write_reg`]'s `assert_eq!`).
++/// Callers must check the returned result's [`Reg02PulseResult::fully_verified`] before proceeding,
++/// and must not treat a successful I2C transaction alone as sufficient confirmation.
 +pub async fn pulse_frozen_reset_bit<P: I2cPort>(dev: &mut P) -> Result<Reg02PulseResult, I2cIoError> {
-+    let assert_step = read_modify_write_reg02(dev, |original| original | FROZEN_RESET_BIT, "asserted").await?;
++    // Prepare the output latch to the asserted level before the pin becomes an output.
++    let assert_output_step =
++        read_modify_write_reg02(dev, |original| original | FROZEN_RESET_BIT, "asserted (output latch, pre-direction)").await?;
++
++    // Configure only bit 1 of register 0x06 as an output (0 = output on the PCAL6416A); never bit
++    // 0 or any other bit.
++    let config_original = dev.read_reg(RESET_EXPANDER_ADDR, REG_CONFIG_PORT_0)?;
++    let bit1_was_already_output = (config_original & FROZEN_RESET_BIT) == 0;
++    log::info!(
++        "bit 1 of register 0x06 was previously configured as: {}",
++        if bit1_was_already_output { "output" } else { "input" }
++    );
++    let config_inner = read_modify_write_reg(
++        dev,
++        REG_CONFIG_PORT_0,
++        "0x06",
++        |original| original & !FROZEN_RESET_BIT,
++        "configured-as-output",
++    )
++    .await?;
++    let config_step = Reg06ConfigResult {
++        inner: config_inner,
++        bit1_was_already_output,
++    };
++
++    // Only now is the pin actually driven -- hold the asserted level.
 +    let pulse_start = Instant::now();
 +    sleep(PULSE_SETTLE).await;
 +    let pulse_duration = pulse_start.elapsed();
++
++    // Release. Register 0x06 is deliberately left configured as an output (see doc comment).
 +    let release_step = read_modify_write_reg02(dev, |original| original & !FROZEN_RESET_BIT, "released").await?;
++
 +    log::info!(
-+        "pulse duration (asserted -> released): {pulse_duration:?} -- changed masks: assert=0b{:08b} release=0b{:08b}",
-+        assert_step.changed_mask, release_step.changed_mask
++        "pulse duration (driven asserted -> released): {pulse_duration:?} -- changed masks: \
++         output-latch-prep=0b{:08b} config=0b{:08b} release=0b{:08b}",
++        assert_output_step.changed_mask, config_step.inner.changed_mask, release_step.changed_mask
 +    );
 +    Ok(Reg02PulseResult {
-+        assert_step,
++        assert_output_step,
++        config_step,
 +        release_step,
 +        pulse_duration,
 +    })
@@ -2728,7 +2807,7 @@ index 0000000..9725bfa
 +/// [`assert_reset`] (used by every other mode's safe-stop/`emergency-stop`), which unconditionally
 +/// writes the hardcoded value `0xFF` regardless of the register's current contents. Never touches
 +/// 0x06/0x07.
-+pub async fn assert_frozen_reset_bit_only<P: I2cPort>(dev: &mut P) -> Result<Reg02ReadModifyWriteResult, I2cIoError> {
++pub async fn assert_frozen_reset_bit_only<P: I2cPort>(dev: &mut P) -> Result<RegBitReadModifyWriteResult, I2cIoError> {
 +    read_modify_write_reg02(dev, |original| original | FROZEN_RESET_BIT, "asserted").await
 +}
 +
@@ -2809,59 +2888,121 @@ index 0000000..9725bfa
 +        mock
 +    }
 +
-+    /// Item 14, case 1: register 0x02 already reads `0xFD` (Frozen already released, or a prior
++    fn mock_with_reg02_and_reg06(reg02: u8, reg06: u8) -> MockI2c {
++        let mut mock = mock_with_reg02(reg02);
++        mock.reg_state.insert((RESET_EXPANDER_ADDR, REG_CONFIG_PORT_0), reg06);
++        mock
++    }
++
++    /// Item, case 1: register 0x02 already reads `0xFD` (Frozen already released, or a prior
 +    /// clear-only attempt that produced no edge) -- the pulse must still assert to `0xFF` before
 +    /// releasing back to `0xFD`, i.e. it must never skip the assert half just because bit 1 already
-+    /// reads low.
++    /// reads low. Register 0x06 defaults to `0xFF` (PCAL6416A power-on-reset: every pin an input),
++    /// so this also exercises the direction write actually changing something.
 +    #[tokio::test]
 +    async fn pulse_from_0xfd_asserts_to_0xff_then_releases_to_0xfd() {
 +        let mut mock = mock_with_reg02(0xFD);
 +        let r = pulse_frozen_reset_bit(&mut mock).await.unwrap();
-+        assert_eq!(r.assert_step.original, 0xFD);
-+        assert_eq!(r.assert_step.target, 0xFF);
++        assert_eq!(r.assert_output_step.original, 0xFD);
++        assert_eq!(r.assert_output_step.target, 0xFF);
++        assert_eq!(r.config_step.inner.original, 0xFF);
++        assert_eq!(r.config_step.inner.target, 0xFD);
++        assert!(!r.config_step.bit1_was_already_output);
 +        assert_eq!(r.release_step.original, 0xFF);
 +        assert_eq!(r.release_step.target, 0xFD);
 +        assert!(r.fully_verified());
 +        assert_eq!(mock.writes, vec![
 +            (RESET_EXPANDER_ADDR, REG_OUTPUT_PORT_0, 0xFF),
++            (RESET_EXPANDER_ADDR, REG_CONFIG_PORT_0, 0xFD),
 +            (RESET_EXPANDER_ADDR, REG_OUTPUT_PORT_0, 0xFD),
 +        ]);
 +    }
 +
-+    /// Item 14, case 2: register 0x02 reads `0xFF` (Frozen held in reset, the normal post-boot
++    /// Item, case 2: register 0x02 reads `0xFF` (Frozen held in reset, the normal post-boot
 +    /// state) -- assert is a no-op write to the same value, then release clears bit 1 to `0xFD`.
 +    #[tokio::test]
 +    async fn pulse_from_0xff_asserts_stays_0xff_then_releases_to_0xfd() {
 +        let mut mock = mock_with_reg02(0xFF);
 +        let r = pulse_frozen_reset_bit(&mut mock).await.unwrap();
-+        assert_eq!(r.assert_step.original, 0xFF);
-+        assert_eq!(r.assert_step.target, 0xFF);
++        assert_eq!(r.assert_output_step.original, 0xFF);
++        assert_eq!(r.assert_output_step.target, 0xFF);
 +        assert_eq!(r.release_step.original, 0xFF);
 +        assert_eq!(r.release_step.target, 0xFD);
 +        assert!(r.fully_verified());
 +        assert_eq!(mock.writes, vec![
 +            (RESET_EXPANDER_ADDR, REG_OUTPUT_PORT_0, 0xFF),
++            (RESET_EXPANDER_ADDR, REG_CONFIG_PORT_0, 0xFD),
 +            (RESET_EXPANDER_ADDR, REG_OUTPUT_PORT_0, 0xFD),
 +        ]);
 +    }
 +
-+    /// Item 14, case 3: for every possible original register value, both halves of the pulse must
-+    /// preserve every bit except bit 1 -- the assert half always ends with bit 1 set, the release
-+    /// half always ends with bit 1 clear, and neither half ever touches any other bit.
++    /// Item, case: register 0x06 = 0xFF (every pin an input, the PCAL6416A power-on-reset default)
++    /// must be configured to 0xFD -- bit 1 as an output, every other bit unchanged.
++    #[tokio::test]
++    async fn config_register_0xff_configures_bit_1_as_output_target_0xfd() {
++        let mut mock = mock_with_reg02_and_reg06(0xFF, 0xFF);
++        let r = pulse_frozen_reset_bit(&mut mock).await.unwrap();
++        assert_eq!(r.config_step.inner.original, 0xFF);
++        assert_eq!(r.config_step.inner.target, 0xFD);
++        assert!(r.config_step.inner.readback_matches);
++        assert!(!r.config_step.bit1_was_already_output);
++    }
++
++    /// Item, case: register 0x06 = 0xFC (bits 0 and 1 already outputs -- the value the real,
++    /// confirmed-working upstream reset sequence itself writes) must remain 0xFC: bit 1 is already
++    /// an output, so this write is a no-op for the register's value (though still issued and
++    /// verified, per the "never skip a step" design -- see doc comment).
++    #[tokio::test]
++    async fn config_register_0xfc_remains_0xfc() {
++        let mut mock = mock_with_reg02_and_reg06(0xFF, 0xFC);
++        let r = pulse_frozen_reset_bit(&mut mock).await.unwrap();
++        assert_eq!(r.config_step.inner.original, 0xFC);
++        assert_eq!(r.config_step.inner.target, 0xFC);
++        assert!(r.config_step.inner.readback_matches);
++        assert!(r.config_step.bit1_was_already_output);
++    }
++
++    /// Item, case: for every possible original register 0x06 value, the configuration write must
++    /// preserve every bit except bit 1 -- bit 1 always ends up `0` (output), and `bit1_was_already_
++    /// output` must correctly reflect whether it already was before the write.
++    #[tokio::test]
++    async fn config_register_sweep_preserves_every_bit_except_bit_1() {
++        for reg06_original in 0u8..=255 {
++            let mut mock = mock_with_reg02_and_reg06(0xFF, reg06_original);
++            let r = pulse_frozen_reset_bit(&mut mock).await.unwrap();
++            assert_eq!(r.config_step.inner.original, reg06_original, "reg06_original=0b{reg06_original:08b}");
++            assert_eq!(r.config_step.inner.target & FROZEN_RESET_BIT, 0, "reg06_original=0b{reg06_original:08b}");
++            assert_eq!(
++                r.config_step.inner.target & !FROZEN_RESET_BIT, reg06_original & !FROZEN_RESET_BIT,
++                "reg06_original=0b{reg06_original:08b}"
++            );
++            assert!(r.config_step.inner.only_bit1_changed, "reg06_original=0b{reg06_original:08b}");
++            assert!(r.config_step.inner.readback_matches, "reg06_original=0b{reg06_original:08b}");
++            assert_eq!(
++                r.config_step.bit1_was_already_output, (reg06_original & FROZEN_RESET_BIT) == 0,
++                "reg06_original=0b{reg06_original:08b}"
++            );
++        }
++    }
++
++    /// Item, case 3: for every possible original register 0x02 value, both the output-latch-prep
++    /// and release halves must preserve every bit except bit 1 -- the prep half always ends with
++    /// bit 1 set, the release half always ends with bit 1 clear, and neither half ever touches any
++    /// other bit.
 +    #[tokio::test]
 +    async fn pulse_preserves_every_bit_except_bit_1_for_every_possible_original() {
 +        for original in 0u8..=255 {
 +            let mut mock = mock_with_reg02(original);
 +            let r = pulse_frozen_reset_bit(&mut mock).await.unwrap();
 +
-+            assert_eq!(r.assert_step.original, original, "original=0b{original:08b}");
-+            assert_eq!(r.assert_step.target & FROZEN_RESET_BIT, FROZEN_RESET_BIT, "original=0b{original:08b}");
++            assert_eq!(r.assert_output_step.original, original, "original=0b{original:08b}");
++            assert_eq!(r.assert_output_step.target & FROZEN_RESET_BIT, FROZEN_RESET_BIT, "original=0b{original:08b}");
 +            assert_eq!(
-+                r.assert_step.target & !FROZEN_RESET_BIT, original & !FROZEN_RESET_BIT,
++                r.assert_output_step.target & !FROZEN_RESET_BIT, original & !FROZEN_RESET_BIT,
 +                "original=0b{original:08b}"
 +            );
-+            assert!(r.assert_step.only_bit1_changed, "original=0b{original:08b}");
-+            assert!(r.assert_step.readback_matches, "original=0b{original:08b}");
++            assert!(r.assert_output_step.only_bit1_changed, "original=0b{original:08b}");
++            assert!(r.assert_output_step.readback_matches, "original=0b{original:08b}");
 +
 +            let after_assert = original | FROZEN_RESET_BIT;
 +            assert_eq!(r.release_step.original, after_assert, "original=0b{original:08b}");
@@ -2877,20 +3018,44 @@ index 0000000..9725bfa
 +        }
 +    }
 +
-+    /// Item 5/14: neither half of the pulse may ever write registers 0x06 or 0x07 -- checked
-+    /// across the same full sweep as the bit-preservation test above.
++    /// Item: the output latch (register 0x02) must be set to the asserted level *before* bit 1
++    /// becomes an output (register 0x06) -- i.e. the register-0x02 write is issued strictly before
++    /// the register-0x06 write, so the pin drives the already-intended level the instant it starts
++    /// being driven, rather than glitching on whatever the latch happened to already read.
 +    #[tokio::test]
-+    async fn pulse_never_writes_registers_0x06_or_0x07() {
++    async fn output_latch_set_to_asserted_before_direction_becomes_output() {
++        let mut mock = mock_with_reg02_and_reg06(0xFD, 0xFF);
++        pulse_frozen_reset_bit(&mut mock).await.unwrap();
++        let reg02_write_index = mock.writes.iter().position(|(_, reg, _)| *reg == REG_OUTPUT_PORT_0);
++        let reg06_write_index = mock.writes.iter().position(|(_, reg, _)| *reg == REG_CONFIG_PORT_0);
++        assert!(reg02_write_index.is_some() && reg06_write_index.is_some());
++        assert!(
++            reg02_write_index < reg06_write_index,
++            "register 0x02 (output latch) must be written before register 0x06 (direction): writes={:?}",
++            mock.writes
++        );
++        // And the very first write must specifically be the asserted value, not the original.
++        assert_eq!(mock.writes[0], (RESET_EXPANDER_ADDR, REG_OUTPUT_PORT_0, 0xFF));
++    }
++
++    /// Item: register 0x07 must never be written by the pulse, regardless of the starting state of
++    /// either register 0x02 or 0x06 -- checked across the same full sweep used for register 0x02's
++    /// own bit-preservation test above.
++    #[tokio::test]
++    async fn pulse_never_writes_register_0x07() {
 +        for original in 0u8..=255 {
 +            let mut mock = mock_with_reg02(original);
 +            pulse_frozen_reset_bit(&mut mock).await.unwrap();
 +            for (_, reg, _) in &mock.writes {
-+                assert_ne!(*reg, REG_CONFIG_PORT_0, "must never write register 0x06 (original=0b{original:08b})");
 +                assert_ne!(*reg, REG_CONFIG_PORT_1, "must never write register 0x07 (original=0b{original:08b})");
 +            }
-+            // Exactly two register-0x02 writes per pulse: the assert, then the release.
-+            assert_eq!(mock.writes.len(), 2, "original=0b{original:08b}");
-+            assert!(mock.writes.iter().all(|(_, reg, _)| *reg == REG_OUTPUT_PORT_0), "original=0b{original:08b}");
++            // Exactly three writes per pulse: output-latch prep (0x02), direction (0x06), release
++            // (0x02) -- and never any register other than those two.
++            assert_eq!(mock.writes.len(), 3, "original=0b{original:08b}");
++            assert!(
++                mock.writes.iter().all(|(_, reg, _)| *reg == REG_OUTPUT_PORT_0 || *reg == REG_CONFIG_PORT_0),
++                "original=0b{original:08b} writes={:?}", mock.writes
++            );
 +        }
 +    }
 +
@@ -2953,7 +3118,7 @@ index 0000000..9725bfa
 +        // (also stuck at 0xFF) does not match the intended release target (0xFD).
 +        let mut stale = StaleReadback { inner: mock, stale_value: 0xFF };
 +        let r = pulse_frozen_reset_bit(&mut stale).await.unwrap();
-+        assert!(r.assert_step.readback_matches);
++        assert!(r.assert_output_step.readback_matches);
 +        assert!(!r.release_step.readback_matches);
 +        assert!(!r.fully_verified());
 +    }
@@ -4704,10 +4869,10 @@ index 0000000..f4b95f7
 +}
 diff --git a/src/bin/opensleep-diagnostic/prime_opensleep_init.rs b/src/bin/opensleep-diagnostic/prime_opensleep_init.rs
 new file mode 100644
-index 0000000..ac53a77
+index 0000000..f48654c
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/prime_opensleep_init.rs
-@@ -0,0 +1,1460 @@
+@@ -0,0 +1,1481 @@
 +//! `frozen-prime-opensleep-init`: fills an empty or partially-filled hydraulic loop by sending
 +//! `Prime` exactly once, through the real, unmodified upstream OpenSleep initialization and Frozen
 +//! manager code -- `opensleep::reset::ResetController::reset_subsystems`, `opensleep::led`,
@@ -5001,15 +5166,16 @@ index 0000000..ac53a77
 +/// `--release-frozen-only`: a minimal startup mode that replaces both the global upstream reset
 +/// (`opensleep::reset::ResetController`, used by [`run_core`] above) and the previous
 +/// `--preserve-boot-state` behavior. It never calls `ResetController` and never writes I2C
-+/// expander registers 0x06/0x07 -- see `i2c::pulse_frozen_reset_bit`'s doc comment for the
-+/// real-hardware evidence behind this: the full reset sequence also reconfigures the
-+/// port-direction registers, which leaves the reservoir-fill indicator off and unresponsive even
-+/// though it does release Frozen. This mode releases Frozen with a narrow, single-bit
-+/// low->high->low **pulse** on register 0x02 instead (a one-shot clear was tried first and does
-+/// not work -- see that function's doc comment for the real-hardware evidence why), then drives
-+/// Frozen through this diagnostic's own audited `FrozenLink`/`AuditedTransport` (`Mode::PrimeTest`)
-+/// -- not the real `frozen::run` manager -- to Ping, jump to firmware if needed, observe boot
-+/// messages, confirm the reservoir indicator is still working, and send `Prime` exactly once.
++/// expander register 0x07 -- see `i2c::pulse_frozen_reset_bit`'s doc comment for the real-hardware
++/// evidence behind this: the full reset sequence writes all four registers unconditionally, which
++/// leaves the reservoir-fill indicator off and unresponsive even though it does release Frozen.
++/// This mode instead touches only bit 1 of register 0x02 (a narrow, low->high->low **pulse** --
++/// a one-shot clear was tried first and does not work) and only bit 1 of register 0x06 (configuring
++/// it as an output, since an input-configured pin ignores its output-latch value entirely -- see
++/// that function's doc comment for the real-hardware evidence behind both), then drives Frozen
++/// through this diagnostic's own audited `FrozenLink`/`AuditedTransport` (`Mode::PrimeTest`) -- not
++/// the real `frozen::run` manager -- to Ping, jump to firmware if needed, observe boot messages,
++/// confirm the reservoir indicator is still working, and send `Prime` exactly once.
 +async fn run_release_frozen_only(args: &PrimeOpenSleepInitArgs) -> (Report, u8) {
 +    if args.dry_run {
 +        log::warn!("--dry-run: no I2C or UART writes will be performed; using a mocked I2C expander and a mocked Frozen device");
@@ -5090,30 +5256,41 @@ index 0000000..ac53a77
 +            return (finish_release_only(args, results, StopReason::PreflightRefused, 20, dry_run), 20);
 +        }
 +    };
-+    results.original_register_0x02 = pulse.assert_step.original;
-+    results.asserted_register_0x02 = pulse.assert_step.target;
-+    results.asserted_readback_register_0x02 = pulse.assert_step.readback;
-+    results.asserted_readback_matches = pulse.assert_step.readback_matches;
++    results.original_register_0x02 = pulse.assert_output_step.original;
++    results.asserted_register_0x02 = pulse.assert_output_step.target;
++    results.asserted_readback_register_0x02 = pulse.assert_output_step.readback;
++    results.asserted_readback_matches = pulse.assert_output_step.readback_matches;
++    results.original_register_0x06 = pulse.config_step.inner.original;
++    results.config_register_0x06 = pulse.config_step.inner.target;
++    results.config_readback_register_0x06 = pulse.config_step.inner.readback;
++    results.config_readback_matches = pulse.config_step.inner.readback_matches;
++    results.bit1_was_already_configured_as_output = pulse.config_step.bit1_was_already_output;
 +    results.released_register_0x02 = pulse.release_step.target;
 +    results.released_readback_register_0x02 = pulse.release_step.readback;
 +    results.released_readback_matches = pulse.release_step.readback_matches;
-+    results.only_bit1_changed = pulse.assert_step.only_bit1_changed && pulse.release_step.only_bit1_changed;
++    results.only_bit1_changed = pulse.assert_output_step.only_bit1_changed
++        && pulse.config_step.inner.only_bit1_changed
++        && pulse.release_step.only_bit1_changed;
 +    results.pulse_duration_ms = pulse.pulse_duration.as_millis() as u64;
 +
-+    // Abort if either half of the pulse did not verify -- either a readback disagreed with what
-+    // was written, or (should be impossible by construction) a bit other than bit 1 changed.
++    // Abort if any of the three writes did not verify -- either a readback disagreed with what was
++    // written, or (should be impossible by construction) a bit other than bit 1 changed.
 +    if !pulse.fully_verified() {
 +        log::error!(
-+            "aborting: register 0x02 pulse did not verify (asserted_readback_matches={} \
-+             asserted_only_bit1_changed={} released_readback_matches={} released_only_bit1_changed={})",
-+            pulse.assert_step.readback_matches, pulse.assert_step.only_bit1_changed,
++            "aborting: register 0x02/0x06 pulse did not verify (asserted_readback_matches={} \
++             asserted_only_bit1_changed={} config_readback_matches={} config_only_bit1_changed={} \
++             released_readback_matches={} released_only_bit1_changed={})",
++            pulse.assert_output_step.readback_matches, pulse.assert_output_step.only_bit1_changed,
++            pulse.config_step.inner.readback_matches, pulse.config_step.inner.only_bit1_changed,
 +            pulse.release_step.readback_matches, pulse.release_step.only_bit1_changed
 +        );
 +        return (finish_release_only(args, results, StopReason::PreflightRefused, 20, dry_run), 20);
 +    }
 +    log::info!(
-+        "Frozen reset bit pulsed: asserted 0x{:02X} -> released 0x{:02X} in {:?}, every other bit unchanged",
-+        pulse.assert_step.target, pulse.release_step.target, pulse.pulse_duration
++        "Frozen reset bit pulsed: register 0x06 bit 1 configured as output (was previously {}), \
++         asserted 0x{:02X} -> released 0x{:02X} in {:?}, every other bit unchanged",
++        if pulse.config_step.bit1_was_already_output { "output" } else { "input" },
++        pulse.assert_output_step.target, pulse.release_step.target, pulse.pulse_duration
 +    );
 +    results.frozen_uart_opened = true;
 +
@@ -6024,30 +6201,37 @@ index 0000000..ac53a77
 +            assert!(!rf.prime_sent, "Prime must never be sent without the exact reservoir confirmation phrase");
 +        }
 +
-+        /// Items 1-6: the pulse must touch only bit 1 of register 0x02 (asserting then releasing),
-+        /// verify each half, and never write registers 0x06/0x07 -- checked end to end (not just
-+        /// at the `i2c` module's own unit-test level) across a full successful run.
++        /// The pulse must touch only bit 1 of registers 0x02 (twice: output-latch prep, then
++        /// release) and 0x06 (once: direction/config), and must never write register 0x07 --
++        /// checked end to end (not just at the `i2c` module's own unit-test level) across a full
++        /// successful run.
 +        #[tokio::test]
-+        async fn full_run_never_writes_registers_0x06_or_0x07_and_pulses_only_bit_1() {
++        async fn full_run_never_writes_register_0x07_and_pulses_only_bit_1() {
 +            let mut i2c = MockI2c::always_succeed();
 +            let (client, task) = spawn_mock_frozen_device_release_only(false, false, false);
 +            let mut link = FrozenLink::wrap(client, "test");
 +            let (report, code) = run_release_frozen_only_core(&release_only_args(), &mut i2c, &mut link, true).await;
 +            assert_eq!(code, 0, "stop reason: {}", report.stop_reason);
 +            for (_, reg, _) in &i2c.writes {
-+                assert_ne!(*reg, 0x06, "must never write register 0x06");
 +                assert_ne!(*reg, 0x07, "must never write register 0x07");
 +            }
-+            // Exactly two register-0x02 writes for the whole run -- the pulse's assert then release
-+            // -- no restore write on normal completion, and no emergency re-assert (no fault
-+            // occurred).
++            // Exactly three writes for the whole run -- output-latch prep (0x02), direction
++            // (0x06), then release (0x02) -- no restore write on normal completion, and no
++            // emergency re-assert (no fault occurred). MockI2c::always_succeed() seeds register
++            // 0x06 at 0xFF (PCAL6416A power-on-reset default: every pin an input).
 +            assert_eq!(
 +                i2c.writes,
 +                vec![
 +                    (crate::i2c::RESET_EXPANDER_ADDR, 0x02, 0xFF),
++                    (crate::i2c::RESET_EXPANDER_ADDR, 0x06, 0xFF & !crate::i2c::FROZEN_RESET_BIT),
 +                    (crate::i2c::RESET_EXPANDER_ADDR, 0x02, 0xFF & !crate::i2c::FROZEN_RESET_BIT),
 +                ]
 +            );
++            let rf = report.release_frozen_only_results.expect("release_frozen_only_results must be set");
++            assert_eq!(rf.original_register_0x06, 0xFF);
++            assert_eq!(rf.config_register_0x06, 0xFD);
++            assert!(rf.config_readback_matches);
++            assert!(!rf.bit1_was_already_configured_as_output);
 +            drop(link);
 +            task.abort();
 +        }
@@ -6123,8 +6307,10 @@ index 0000000..ac53a77
 +            assert!(!rf.prime_sent, "Prime must never be sent when Frozen never answers Ping");
 +            assert!(!rf.emergency_reset_asserted, "a non-responsive Frozen is not a pump fault/emergency");
 +            assert_eq!(rf.reservoir_status, ReservoirStatus::Unverified, "must never ask a confirmation the run never reached");
-+            // Only the pulse's two writes -- no third write asserting/restoring anything on abort.
-+            assert_eq!(i2c.writes.len(), 2);
++            // Only the pulse's three writes (output-latch prep, direction, release) -- the pulse
++            // itself always completes before Ping is ever attempted, and no extra write
++            // asserts/restores anything just because Frozen stayed silent afterward.
++            assert_eq!(i2c.writes.len(), 3);
 +        }
 +
 +        /// Item 8: if the I2C read itself fails, this mode must abort before ever touching the
@@ -7676,10 +7862,10 @@ index 0000000..99a38a0
 +}
 diff --git a/src/bin/opensleep-diagnostic/report.rs b/src/bin/opensleep-diagnostic/report.rs
 new file mode 100644
-index 0000000..8e58e8e
+index 0000000..bea209e
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/report.rs
-@@ -0,0 +1,632 @@
+@@ -0,0 +1,660 @@
 +//! Structured JSON/CSV/text reporting shared by all three subcommands. Machine evidence (audit
 +//! log, decoded telemetry) is always kept in separate fields from operator-entered observations,
 +//! per the safety model: a component may only be marked PASS from decoded evidence or an explicit
@@ -7931,23 +8117,45 @@ index 0000000..8e58e8e
 +/// `prime_opensleep_init.rs` module docs for the full narrative.
 +#[derive(Debug, Clone, Serialize, Default)]
 +pub struct ReleaseFrozenOnlyResults {
-+    /// I2C expander register 0x02 as read before this run changed anything.
++    /// I2C expander register 0x02 (output latch) as read before this run changed anything.
 +    pub original_register_0x02: u8,
-+    /// Register 0x02 as written for the pulse's assert half (`original | 0x02`).
++    /// Register 0x02 as written to prepare the output latch's asserted level, *before* bit 1 is
++    /// configured as an output (`original | 0x02`) -- see `i2c::pulse_frozen_reset_bit`'s doc
++    /// comment for why this ordering avoids a glitch.
 +    pub asserted_register_0x02: u8,
-+    /// Register 0x02 as read back immediately after the assert write.
++    /// Register 0x02 as read back immediately after that write.
 +    pub asserted_readback_register_0x02: u8,
 +    /// `true` iff `asserted_readback_register_0x02 == asserted_register_0x02`.
 +    pub asserted_readback_matches: bool,
++    /// I2C expander register 0x06 (direction/config) as read before this run changed anything.
++    /// The PCAL6416A power-on-reset default is every bit configured as an input (`0xFF`); a bit
++    /// configured as an input ignores its register-0x02 output-latch value entirely -- this is the
++    /// real-hardware evidence behind why an earlier revision's register-0x02-only pulse produced
++    /// no physical edge and no response from Frozen.
++    pub original_register_0x06: u8,
++    /// Register 0x06 as written to configure only bit 1 as an output (`original & !0x02`); every
++    /// other bit, including bit 0, is preserved exactly as read. Left in place afterward -- never
++    /// restored to its original value -- so the reset line stays actively driven.
++    pub config_register_0x06: u8,
++    /// Register 0x06 as read back immediately after that write.
++    pub config_readback_register_0x06: u8,
++    /// `true` iff `config_readback_register_0x06 == config_register_0x06`.
++    pub config_readback_matches: bool,
++    /// `true` iff bit 1 of register 0x06 already read `0` (output) before this run's write; `false`
++    /// iff it read `1` (input/high-Z, the power-on-reset default) -- i.e. whether this run's write
++    /// is what first enabled the reset line to be physically driven at all.
++    pub bit1_was_already_configured_as_output: bool,
 +    /// Register 0x02 as written for the pulse's release half (`asserted & !0x02`).
 +    pub released_register_0x02: u8,
 +    /// Register 0x02 as read back immediately after the release write.
 +    pub released_readback_register_0x02: u8,
 +    /// `true` iff `released_readback_register_0x02 == released_register_0x02`.
 +    pub released_readback_matches: bool,
-+    /// `true` iff neither the assert nor the release write ever changed any bit other than bit 1.
++    /// `true` iff none of the three writes (output-latch prep, direction/config, release) ever
++    /// changed any bit other than bit 1 of its own register.
 +    pub only_bit1_changed: bool,
-+    /// How long bit 1 was held asserted between the two writes, in milliseconds.
++    /// How long bit 1 was held asserted *while configured as an output* (i.e. while physically
++    /// driven), in milliseconds.
 +    pub pulse_duration_ms: u64,
 +    pub frozen_uart_opened: bool,
 +    pub frozen_reached_firmware: bool,
@@ -8262,15 +8470,21 @@ index 0000000..8e58e8e
 +            log::info!("-- release-frozen-only results --");
 +            log::info!("  Register 0x02 original:          0b{:08b}", rf.original_register_0x02);
 +            log::info!(
-+                "  Asserted: target=0b{:08b} readback=0b{:08b} matches={}",
++                "  Asserted (output latch, pre-direction): target=0b{:08b} readback=0b{:08b} matches={}",
 +                rf.asserted_register_0x02, rf.asserted_readback_register_0x02, rf.asserted_readback_matches
++            );
++            log::info!("  Register 0x06 original:          0b{:08b}", rf.original_register_0x06);
++            log::info!(
++                "  Register 0x06 configured-as-output: target=0b{:08b} readback=0b{:08b} matches={} (bit 1 was previously {})",
++                rf.config_register_0x06, rf.config_readback_register_0x06, rf.config_readback_matches,
++                if rf.bit1_was_already_configured_as_output { "output" } else { "input" }
 +            );
 +            log::info!(
 +                "  Released: target=0b{:08b} readback=0b{:08b} matches={}",
 +                rf.released_register_0x02, rf.released_readback_register_0x02, rf.released_readback_matches
 +            );
-+            log::info!("  Only bit 1 changed (both halves): {}", rf.only_bit1_changed);
-+            log::info!("  Pulse duration:                  {} ms", rf.pulse_duration_ms);
++            log::info!("  Only bit 1 changed (all three writes): {}", rf.only_bit1_changed);
++            log::info!("  Pulse duration (driven):         {} ms", rf.pulse_duration_ms);
 +            log::info!("  Frozen UART opened:              {}", rf.frozen_uart_opened);
 +            log::info!("  Frozen reached firmware:         {}", rf.frozen_reached_firmware);
 +            log::info!("  [capwater] unavailable observed: {}", rf.capwater_unavailable_observed);
