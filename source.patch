@@ -144,10 +144,10 @@ index 0000000..be05be7
 +}
 diff --git a/src/bin/opensleep-diagnostic/cli.rs b/src/bin/opensleep-diagnostic/cli.rs
 new file mode 100644
-index 0000000..5bcfbfd
+index 0000000..b7cae81
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/cli.rs
-@@ -0,0 +1,368 @@
+@@ -0,0 +1,389 @@
 +//! CLI surface. Every flag here maps to a fixed, validated field -- there is no flag that accepts
 +//! a raw opcode, a raw frame, or an arbitrary absolute temperature target. Side selection is a
 +//! closed `ValueEnum`; the cooling delta and duration are validated in `cool_test.rs` against
@@ -260,22 +260,32 @@ index 0000000..5bcfbfd
 +    #[arg(long, value_enum)]
 +    pub side: Side,
 +
-+    /// Cooling delta below the measured baseline water temperature, in degrees C. Clamped to a
-+    /// hard maximum of 2.0C by `safety::FrozenAction::enable_cooling`; no flag can raise that
-+    /// maximum.
-+    #[arg(long, default_value_t = 1.0)]
-+    pub delta_c: f64,
++    /// Cooling delta below the measured baseline water temperature, in degrees C. No fixed
++    /// host-side maximum: a live-hardware run conclusively demonstrated working cooling,
++    /// circulation, fan control, TEC operation, temperature reduction, and verified shutdown well
++    /// above the former 2.0C cap, and Frozen firmware -- not this host-side check -- remains
++    /// responsible for PID regulation, TEC current protection, thermal protection, and target
++    /// maintenance. Defaults to 1.0C when neither this nor `--target-c` is supplied; that default
++    /// is not a maximum. Mutually exclusive with `--target-c`. A resulting delta above 2.0C
++    /// requires `--confirm-large-temperature-delta`.
++    #[arg(long, value_name = "DELTA_C")]
++    pub delta_c: Option<f64>,
++
++    /// Absolute cooling target in degrees C, instead of a delta below the measured baseline.
++    /// Mutually exclusive with `--delta-c`. Validated against the measured baseline and the
++    /// Frozen protocol's representable range once baseline collection completes. A resulting
++    /// delta (baseline minus this target) above 2.0C requires
++    /// `--confirm-large-temperature-delta`.
++    #[arg(long, value_name = "TARGET_C")]
++    pub target_c: Option<f64>,
 +
 +    /// Active-phase duration in seconds. Defaults to 120 seconds -- long enough to establish
 +    /// meaningful water-temperature movement through the filled cover loop; hard-capped at 900
 +    /// seconds (15 minutes) regardless -- no flag can raise that cap. The test still stops early
-+    /// once the requested target temperature is reached (and stays reached for a short
-+    /// confirmation period), a safety condition triggers, communication is lost, or the operator
-+    /// interrupts, so a long duration is not a long minimum wait. Durations above 300 seconds
-+    /// require an additional interactive confirmation (see
-+    /// `--assume-extended-duration-phrase`) and print a reminder that the operator must remain
-+    /// present and monitor for leaks, burning smell, abnormal pump noise, loss of circulation, or
-+    /// unexpected heating for the whole run.
++    /// on a safety condition, communication loss, or an operator interrupt (durations above 300
++    /// seconds require `--confirm-extended-test`); in `--firmware-authoritative` mode, reaching
++    /// the requested target no longer stops the test early either -- Frozen keeps maintaining it
++    /// for the rest of the requested duration.
 +    #[arg(long, default_value_t = crate::cool_test::DEFAULT_DURATION_SECONDS)]
 +    pub duration_seconds: u64,
 +
@@ -311,8 +321,7 @@ index 0000000..5bcfbfd
 +    pub verbose: bool,
 +
 +    /// Perform no I2C or UART writes; run the full preflight/confirmation/reporting logic against
-+    /// a mocked Frozen device instead. The interactive typed-phrase confirmation is still
-+    /// required unless stdin is not a TTY.
++    /// a mocked Frozen device instead.
 +    #[arg(long, default_value_t = false)]
 +    pub dry_run: bool,
 +
@@ -332,26 +341,38 @@ index 0000000..5bcfbfd
 +    /// in this mode); only an explicit TEC safety-lock message, an explicit recognized firmware
 +    /// safety-fault message, the enabled target being explicitly lost, a fatal UART error, an
 +    /// internal error, operator abort, a signal, or the requested duration expiring can end the
-+    /// run. Does not change the default (120s) or hard-maximum (900s) duration, the 2.0C delta
-+    /// cap, or any preflight/confirmation requirement. See SAFETY.md for the full rationale.
++    /// run. Does not change the default (120s) or hard-maximum (900s) duration or any
++    /// preflight/confirmation requirement. See SAFETY.md for the full rationale.
 +    #[arg(long, default_value_t = false)]
 +    pub firmware_authoritative: bool,
 +
-+    /// Testing/CI escape hatch only: skips the interactive typed-phrase confirmations even when
-+    /// stdin is a TTY, by supplying the phrases directly. Never documented as a normal operator
-+    /// flag in RUN_ON_POD.md.
-+    #[arg(long, hide = true)]
-+    pub assume_interactive_phrase: Option<String>,
-+    #[arg(long, hide = true)]
-+    pub assume_start_phrase: Option<String>,
-+    /// Testing/CI escape hatch only: supplies the "RESERVOIR INDICATOR IS STILL WORKING"
-+    /// confirmation phrase required immediately before enabling cooling.
-+    #[arg(long, hide = true)]
-+    pub assume_reservoir_phrase: Option<String>,
-+    /// Testing/CI escape hatch only: supplies the "RUN EXTENDED COOLING TEST FOR UP TO 15
-+    /// MINUTES" confirmation phrase required when `--duration-seconds` exceeds 300.
-+    #[arg(long, hide = true)]
-+    pub assume_extended_duration_phrase: Option<String>,
++    /// Never prompt for or read interactive confirmation input: no typed confirmation phrases (this
++    /// binary no longer has any), no waiting for Enter, no post-run operator questionnaire. The
++    /// required `--confirm-*` flags above are the acknowledgement mechanism instead, checked purely
++    /// from the command line, so a fully specified command proceeds straight through command-line
++    /// validation and automated preflight with no further questions. Live typed-ABORT handling
++    /// during the active phase is still available whenever stdin is actually a TTY, and
++    /// SIGINT/SIGTERM handling is always active regardless of stdin -- neither depends on this flag.
++    #[arg(long, default_value_t = false)]
++    pub non_interactive: bool,
++
++    /// Required acknowledgement when `--duration-seconds` exceeds 300. Replaces the former typed
++    /// "RUN EXTENDED COOLING TEST FOR UP TO 15 MINUTES" confirmation phrase with a plain,
++    /// scriptable command-line flag; checked before any I2C/UART access.
++    #[arg(long, default_value_t = false)]
++    pub confirm_extended_test: bool,
++
++    /// Required acknowledgement when the requested (or, via `--target-c`, computed) cooling delta
++    /// exceeds 2.0C. This is an auditable acknowledgement only -- it does not itself impose any
++    /// maximum, and no flag can raise a limit that no longer exists (see `--delta-c`).
++    #[arg(long, default_value_t = false)]
++    pub confirm_large_temperature_delta: bool,
++
++    /// Optional free-text note attached to the report (`operator_note`). Never required and never
++    /// prompted for.
++    #[arg(long, value_name = "TEXT")]
++    pub operator_note: Option<String>,
++
 +    /// Testing/CI escape hatch only: skips spawning the real independent shutdown guard
 +    /// subprocess (which would try to open real hardware) even for a non-`--dry-run` invocation.
 +    /// Never set by RUN_ON_POD.md's documented usage.
@@ -703,10 +724,10 @@ index 0000000..9c6296b
 +}
 diff --git a/src/bin/opensleep-diagnostic/cool_test.rs b/src/bin/opensleep-diagnostic/cool_test.rs
 new file mode 100644
-index 0000000..cfe2839
+index 0000000..1874002
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/cool_test.rs
-@@ -0,0 +1,4641 @@
+@@ -0,0 +1,4897 @@
 +//! `frozen-cool-test`: the one subcommand that intentionally activates a cooling channel. Every
 +//! hard limit here (max delta, max duration, baseline range, heatsink ceiling) is a compile-time
 +//! constant; no CLI flag can raise any of them. See SAFETY.md for the operator-facing version of
@@ -769,7 +790,6 @@ index 0000000..cfe2839
 +
 +use crate::buildinfo::{DIAGNOSTIC_VERSION, kernel_release, source_commit};
 +use crate::cli::CoolTestArgs;
-+use crate::confirm::confirm_phrase;
 +use crate::frozen_compat::CompatFrameScanner;
 +use crate::i2c::{I2cPort, MockI2c, RealI2c, probe_address};
 +use crate::io_logging::RawIoCapture;
@@ -777,8 +797,8 @@ index 0000000..cfe2839
 +use crate::mock::mock_frozen_link_pair;
 +use crate::ownership;
 +use crate::report::{
-+    AuditEntryJson, ComponentResults, Confirmations, CoolTestResults, OperatorObservations, Report, ReservoirStatus,
-+    TemperatureSampleJson, Verdict,
++    AuditEntryJson, ComponentResults, Confirmations, CoolTestResults, OperatorObservations, Report, TemperatureSampleJson,
++    Verdict,
 +};
 +use crate::safety::{AuditedTransport, FrozenAction, Mode};
 +use crate::signals::{StopReason, wait_for_termination_signal};
@@ -795,7 +815,7 @@ index 0000000..cfe2839
 +pub const DEFAULT_DURATION_SECONDS: u64 = 120;
 +/// Hard, non-overridable maximum active duration: 15 minutes. No flag can raise this.
 +pub const HARD_MAX_DURATION_SECONDS: u64 = 900;
-+/// Durations above this require the additional [`EXTENDED_DURATION_PHRASE`] confirmation.
++/// Durations above this require the additional `--confirm-extended-test` acknowledgement.
 +pub const EXTENDED_DURATION_THRESHOLD_SECONDS: u64 = 300;
 +/// How long the selected side's live temperature must remain at or below the computed target
 +/// before the active phase stops for [`crate::signals::StopReason::TargetTemperatureReached`] --
@@ -882,16 +902,13 @@ index 0000000..cfe2839
 +/// actually reports `enabled=false`, rather than merely that the disable command was accepted.
 +const SHUTDOWN_VERIFY_WINDOW: Duration = Duration::from_secs(2);
 +
-+const INTERACTIVE_PHRASE: &str = "I CONFIRM THE WATER LOOP IS CONNECTED AND FILLED";
-+/// Required immediately before enabling cooling -- after Frozen has reached application firmware
-+/// and the baseline has validated -- distinct from `INTERACTIVE_PHRASE`. Same text and placement
-+/// convention as `frozen-prime-opensleep-init --release-frozen-only`'s own reservoir confirmation.
-+const RESERVOIR_PHRASE: &str = "RESERVOIR INDICATOR IS STILL WORKING";
-+/// Required in addition to every other confirmation when `--duration-seconds` exceeds
-+/// [`EXTENDED_DURATION_THRESHOLD_SECONDS`]. Checked early, before any I2C/UART access, alongside
-+/// [`INTERACTIVE_PHRASE`] -- the requested duration is known from the CLI args alone, so there is
-+/// no reason to touch hardware first only to refuse later.
-+const EXTENDED_DURATION_PHRASE: &str = "RUN EXTENDED COOLING TEST FOR UP TO 15 MINUTES";
++/// Default cooling delta when neither `--delta-c` nor `--target-c` is supplied. Not a maximum --
++/// see `safety::FrozenAction::enable_cooling`'s doc comment.
++const DEFAULT_DELTA_C: f64 = 1.0;
++/// Above this delta, `--confirm-large-temperature-delta` is required. An auditable
++/// acknowledgement only, not a second hidden cap -- `enable_cooling` itself no longer enforces
++/// any fixed maximum delta at all.
++const LARGE_DELTA_CONFIRMATION_THRESHOLD_CENTIDEG: i32 = 200;
 +/// Reported in `CoolTestResults::startup_mode`: the only startup implementation this file can ever
 +/// use (see module docs and `main.rs`'s guardrail tests).
 +const STARTUP_MODE_LABEL: &str = "narrow (i2c::pulse_frozen_reset_bit)";
@@ -950,16 +967,30 @@ index 0000000..cfe2839
 +        return (refused_report(args, false, "missing required confirmation flags"), 30);
 +    }
 +
-+    let interactive_ok = confirm_phrase(
-+        args.assume_interactive_phrase.clone(),
-+        INTERACTIVE_PHRASE,
-+        "Type I CONFIRM THE WATER LOOP IS CONNECTED AND FILLED to continue: ",
-+    );
-+    if !interactive_ok {
-+        log::error!("refusing to run: interactive confirmation phrase was not matched exactly");
-+        return (refused_report(args, false, "interactive confirmation phrase mismatch"), 30);
++    if args.delta_c.is_some() && args.target_c.is_some() {
++        log::error!("refusing to run: --delta-c and --target-c are mutually exclusive");
++        return (refused_report(args, false, "--delta-c and --target-c are mutually exclusive"), 30);
++    }
++    if let Some(d) = args.delta_c
++        && !(d.is_finite() && d > 0.0)
++    {
++        log::error!("refusing to run: --delta-c must be a finite value greater than zero, got {d}");
++        return (refused_report(args, false, "--delta-c must be a finite value greater than zero"), 30);
++    }
++    if let Some(t) = args.target_c
++        && !t.is_finite()
++    {
++        log::error!("refusing to run: --target-c must be a finite value, got {t}");
++        return (refused_report(args, false, "--target-c must be a finite value"), 30);
 +    }
 +
++    if args.duration_seconds > EXTENDED_DURATION_THRESHOLD_SECONDS && !args.confirm_extended_test {
++        log::error!(
++            "refusing to run: --duration-seconds {} exceeds {}s and requires --confirm-extended-test",
++            args.duration_seconds, EXTENDED_DURATION_THRESHOLD_SECONDS
++        );
++        return (refused_report(args, false, "extended-duration confirmation flag missing"), 30);
++    }
 +    if args.duration_seconds > EXTENDED_DURATION_THRESHOLD_SECONDS {
 +        eprintln!(
 +            "--frozen-cool-test: requested duration ({}) exceeds {}s. This test may run for up to \
@@ -968,15 +999,23 @@ index 0000000..cfe2839
 +             unexpected heating.",
 +            args.duration_seconds, EXTENDED_DURATION_THRESHOLD_SECONDS
 +        );
-+        let extended_confirmation_ok = confirm_phrase(
-+            args.assume_extended_duration_phrase.clone(),
-+            EXTENDED_DURATION_PHRASE,
-+            "Type RUN EXTENDED COOLING TEST FOR UP TO 15 MINUTES to continue: ",
++    }
++
++    // Only the --delta-c case can be checked this early -- the resulting delta is known from the
++    // CLI args alone. --target-c's resulting delta depends on the measured baseline and is
++    // checked again inside run_core once that's known (see the large-delta check there).
++    if let Some(d) = args.delta_c
++        && (d * 100.0).round() as i32 > LARGE_DELTA_CONFIRMATION_THRESHOLD_CENTIDEG
++        && !args.confirm_large_temperature_delta
++    {
++        log::error!(
++            "refusing to run: --delta-c {d} exceeds {:.2}C and requires --confirm-large-temperature-delta",
++            f64::from(LARGE_DELTA_CONFIRMATION_THRESHOLD_CENTIDEG) / 100.0
 +        );
-+        if !extended_confirmation_ok {
-+            log::error!("refusing to run: extended-duration confirmation phrase was not matched exactly");
-+            return (refused_report(args, false, "extended-duration confirmation phrase mismatch"), 30);
-+        }
++        return (
++            refused_report(args, false, "large temperature delta confirmation flag missing (--confirm-large-temperature-delta)"),
++            30,
++        );
 +    }
 +
 +    if args.dry_run {
@@ -1228,13 +1267,18 @@ index 0000000..cfe2839
 +/// been found of a benign word containing any of them.
 +const WORD_EXACT_FAULT_KEYWORDS: [&str; 2] = ["locked", "fault"];
 +
-+/// Generic firmware-fault keyword scan. Excludes the literal substring "flash locked": that is a
-+/// captured, evidenced, benign boot-time firmware message (`frozen/command.rs` source comment,
-+/// paired with "cal_info valid"), not an actuator/safety fault, and would otherwise false-trigger
-+/// on the word "locked" alone.
++/// Generic firmware-fault keyword scan -- **legacy (non-`--firmware-authoritative`) active loop
++/// only**; `--firmware-authoritative` mode never calls this at all (see item 1 of the fix that
++/// removed it there: a live-hardware run reported `"FW: [temps] 0 reads failed out of 1200"` --
++/// healthy status telemetry, zero failures -- and this scan's `contains("failed")` misclassified
++/// it as an explicit firmware safety fault; automatic fault shutdown in that mode now requires a
++/// specifically parsed, recognized negative state, like `TecSafetyState`, not a keyword match).
++/// Excludes the literal substring "flash locked" (a captured, evidenced, benign boot-time firmware
++/// message, `frozen/command.rs` source comment, paired with "cal_info valid") and any `"[temps]"`
++/// health-report message (see `parse_temps_health_report`) for the same reason.
 +fn is_generic_fault_message(msg: &str) -> bool {
 +    let lower = msg.to_lowercase();
-+    if lower.contains("flash locked") {
++    if lower.contains("flash locked") || lower.contains("[temps]") {
 +        return false;
 +    }
 +    let words: Vec<&str> = lower.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
@@ -1245,6 +1289,43 @@ index 0000000..cfe2839
 +            lower.contains(kw)
 +        }
 +    })
++}
++
++/// Parses `"FW: [temps] <failed> reads failed out of <total>"` -- firmware's own temperature-read
++/// health counter (e.g. `"FW: [temps] 0 reads failed out of 1200"`). Purely descriptive telemetry,
++/// never itself a fault by any count -- a live-hardware run's own zero-failure report was the
++/// evidence behind excluding `"[temps]"` messages from `is_generic_fault_message` above and from
++/// `--firmware-authoritative` mode's fault detection entirely. Returns `(failed, total)`.
++fn parse_temps_health_report(msg: &str) -> Option<(u64, u64)> {
++    let lower = msg.to_lowercase();
++    let marker_idx = lower.find("[temps]")?;
++    let rest = &lower[marker_idx + "[temps]".len()..];
++    let failed_end = rest.find("reads failed")?;
++    let failed: u64 = rest[..failed_end].trim().parse().ok()?;
++    let after = &rest[failed_end + "reads failed".len()..];
++    let out_of_pos = after.find("out of")?;
++    let total_str = after[out_of_pos + "out of".len()..].trim();
++    let total_digits: String = total_str.chars().take_while(|c| c.is_ascii_digit()).collect();
++    let total: u64 = total_digits.parse().ok()?;
++    Some((failed, total))
++}
++
++/// Parses `"FW: [top-fan] <duty> @ <rpm> rpm"` / `"FW: [bottom-fan] <duty> @ <rpm> rpm"` -- global
++/// Hub thermal-management telemetry. Unlike pump/TEC messages, real captured fan telemetry has no
++/// left/right identifier at all: both fans serve the whole Hub, not either individual cooling
++/// side, so this is never scoped to (or expected to name) the selected side. `which` must be
++/// `"top-fan"` or `"bottom-fan"`. Returns `(duty, rpm)`.
++fn parse_fan_report(msg: &str, which: &str) -> Option<(f64, f64)> {
++    let lower = msg.to_lowercase();
++    let marker = format!("[{which}]");
++    let idx = lower.find(&marker)?;
++    let rest = &lower[idx + marker.len()..];
++    let at = rest.find('@')?;
++    let duty: f64 = rest[..at].trim().parse().ok()?;
++    let after_at = &rest[at + 1..];
++    let rpm_pos = after_at.find("rpm")?;
++    let rpm: f64 = after_at[..rpm_pos].trim().parse().ok()?;
++    Some((duty, rpm))
 +}
 +
 +/// True if a firmware `Message` about the selected water/heatsink sensor is a known, non-fatal
@@ -1533,15 +1614,18 @@ index 0000000..cfe2839
 +    let mut cr = ComponentResults::default();
 +    let mut ct = CoolTestResults {
 +        selected_side: side_tag.to_string(),
-+        requested_delta_c: args.delta_c,
++        // Placeholder until baseline collection completes and the real delta (from --delta-c,
++        // --target-c, or the default) is known and reassigned below -- see the large-delta
++        // confirmation check.
++        requested_delta_c: args.delta_c.unwrap_or(DEFAULT_DELTA_C),
 +        requested_duration_seconds: args.duration_seconds,
 +        startup_mode: STARTUP_MODE_LABEL.to_string(),
 +        // `run_core` is only ever reached (via `run()`) after any *required* confirmation has
 +        // already succeeded -- `run()` returns early otherwise, before opening any hardware --
-+        // so reaching this line already proves the extended-duration phrase was received whenever
-+        // it was required. Tests that call `run_core` directly (bypassing `run()`'s prompt
-+        // entirely) get the same, correct answer: no prompt was needed unless the duration itself
-+        // exceeds the threshold.
++        // so reaching this line already proves --confirm-extended-test was set whenever it was
++        // required. Tests that call `run_core` directly (bypassing `run()`'s own checks entirely)
++        // get the same, correct answer: it wasn't needed unless the duration itself exceeds the
++        // threshold.
 +        extended_test_confirmation_received: args.duration_seconds > EXTENDED_DURATION_THRESHOLD_SECONDS,
 +        control_authority: if args.firmware_authoritative { "firmware" } else { "diagnostic" }.to_string(),
 +        ..Default::default()
@@ -1795,7 +1879,40 @@ index 0000000..cfe2839
 +    ct.baseline_right_range_c = baseline_range_c(&baseline_samples, |s| s.raw_right);
 +    ct.baseline_heatsink_range_c = baseline_range_c(&baseline_samples, |s| s.raw_heatsink);
 +
-+    let delta_centideg = (args.delta_c * 100.0).round() as i32;
++    // Item 2/3: --target-c is validated against the just-measured baseline here (it cannot be
++    // validated any earlier, since the baseline isn't known until now); --delta-c's own
++    // finiteness/positivity was already checked in run() before any hardware access. Neither path
++    // enforces a fixed maximum delta any more -- see safety::FrozenAction::enable_cooling's doc
++    // comment for why -- only the auditable --confirm-large-temperature-delta acknowledgement
++    // above LARGE_DELTA_CONFIRMATION_THRESHOLD_CENTIDEG.
++    let delta_centideg = match args.target_c {
++        Some(target_c) => {
++            let target_centideg = (target_c * 100.0).round() as i32;
++            i32::from(baseline as u16) - target_centideg
++        }
++        None => (args.delta_c.unwrap_or(DEFAULT_DELTA_C) * 100.0).round() as i32,
++    };
++    ct.requested_delta_c = f64::from(delta_centideg) / 100.0;
++
++    if delta_centideg > LARGE_DELTA_CONFIRMATION_THRESHOLD_CENTIDEG && !args.confirm_large_temperature_delta {
++        log::error!(
++            "refusing to run active test: requested delta {:.2}C exceeds {:.2}C and requires \
++             --confirm-large-temperature-delta",
++            ct.requested_delta_c,
++            f64::from(LARGE_DELTA_CONFIRMATION_THRESHOLD_CENTIDEG) / 100.0
++        );
++        let shutdown = run_cool_test_shutdown(Some(link), &mut audit, i2c, StopReason::PreflightRefused, side).await;
++        cr.emergency_shutdown = if shutdown.verified() { Verdict::Pass } else { Verdict::Fail };
++        ct.shutdown_verified = shutdown.verified();
++        ct.emergency_reset_asserted = shutdown.emergency_reset_asserted;
++        ct.stop_reason = StopReason::PreflightRefused.to_string();
++        ct.stop_reason_code = stop_reason_code(StopReason::PreflightRefused).to_string();
++        return finish(
++            args, dry_run, &audit, &stats, samples, cr, ct, StopReason::PreflightRefused, false, 30,
++            expander_value, &led, true, true,
++        );
++    }
++
 +    let action = match FrozenAction::enable_cooling(side, baseline as u16, delta_centideg) {
 +        Ok(a) => a,
 +        Err(e) => {
@@ -1815,55 +1932,13 @@ index 0000000..cfe2839
 +    let target_centideg = action.target_centideg().unwrap_or(0);
 +
 +    print_proposed_target(side, baseline, delta_centideg, target_centideg, args.duration_seconds);
-+    let final_phrase = format!("START {} COOLING TEST", side_word(side).to_uppercase());
-+    let start_ok = confirm_phrase(
-+        args.assume_start_phrase.clone(),
-+        &final_phrase,
-+        &format!("Type {final_phrase} to continue: "),
-+    );
-+    if !start_ok {
-+        log::error!("refusing to run active test: final start phrase was not matched exactly");
-+        let shutdown = run_cool_test_shutdown(Some(link), &mut audit, i2c, StopReason::PreflightRefused, side).await;
-+        cr.emergency_shutdown = if shutdown.verified() { Verdict::Pass } else { Verdict::Fail };
-+        ct.shutdown_verified = shutdown.verified();
-+        ct.emergency_reset_asserted = shutdown.emergency_reset_asserted;
-+        ct.stop_reason = StopReason::PreflightRefused.to_string();
-+        ct.stop_reason_code = stop_reason_code(StopReason::PreflightRefused).to_string();
-+        return finish(
-+            args, dry_run, &audit, &stats, samples, cr, ct, StopReason::PreflightRefused, false, 30,
-+            expander_value, &led, true, true,
-+        );
-+    }
++    // No more typed confirmation phrases -- see cli.rs's --non-interactive doc comment. The four
++    // required --confirm-* flags plus (when applicable) --confirm-extended-test and
++    // --confirm-large-temperature-delta are the sole acknowledgement mechanism now; a fully
++    // specified command proceeds straight through to enabling cooling with no further prompts.
++    // reservoir_status is left at its Unverified default (see ReservoirStatus's own doc comment):
++    // there is no longer an interactive reservoir-indicator confirmation to have asked.
 +
-+    // Immediately before enabling cooling: a third confirmation, distinct from the two above,
-+    // matching --release-frozen-only's own placement and semantics.
-+    let reservoir_ok = confirm_phrase(
-+        args.assume_reservoir_phrase.clone(),
-+        RESERVOIR_PHRASE,
-+        &format!("Type {RESERVOIR_PHRASE} to continue: "),
-+    );
-+    ct.reservoir_status = if reservoir_ok {
-+        ReservoirStatus::Confirmed
-+    } else {
-+        ReservoirStatus::FailedByOperatorObservation
-+    };
-+    if !reservoir_ok {
-+        log::error!("refusing to run active test: reservoir confirmation phrase was not matched exactly");
-+        let shutdown = run_cool_test_shutdown(Some(link), &mut audit, i2c, StopReason::PreflightRefused, side).await;
-+        cr.emergency_shutdown = if shutdown.verified() { Verdict::Pass } else { Verdict::Fail };
-+        ct.shutdown_verified = shutdown.verified();
-+        ct.emergency_reset_asserted = shutdown.emergency_reset_asserted;
-+        ct.stop_reason = StopReason::PreflightRefused.to_string();
-+        ct.stop_reason_code = stop_reason_code(StopReason::PreflightRefused).to_string();
-+        return finish(
-+            args, dry_run, &audit, &stats, samples, cr, ct, StopReason::PreflightRefused, false, 30,
-+            expander_value, &led, true, true,
-+        );
-+    }
-+
-+    // All blocking stdin reads for confirmation phrases are complete by this point, so it is now
-+    // safe to start reading stdin in the background for operator-reported abort conditions
-+    // without racing the reads above.
 +    let mut operator_abort_rx = match operator_abort_rx_override {
 +        Some(rx) => Some(rx),
 +        None => spawn_operator_abort_watcher(),
@@ -2240,7 +2315,10 @@ index 0000000..cfe2839
 +    let side_bracket_tag = format!("[{side_tag}]");
 +    tec_activity_seen = tec_activity_seen
 +        || stats.messages.iter().any(|m| m.to_lowercase().contains("tec") && m.contains(&side_bracket_tag));
-+    let fan_seen = stats.messages.iter().any(|m| m.to_lowercase().contains("fan") && m.contains(&side_bracket_tag));
++    // Fan telemetry is global Hub thermal management, never side-scoped -- see parse_fan_report's
++    // doc comment. "seen" here means either fan produced any telemetry at all, not the selected
++    // side specifically (there is no such thing for a fan).
++    let fan_seen = stats.messages.iter().any(|m| parse_fan_report(m, "top-fan").is_some() || parse_fan_report(m, "bottom-fan").is_some());
 +
 +    let shutdown = run_cool_test_shutdown(Some(link), &mut audit, i2c, stop_reason, side).await;
 +    cr.emergency_shutdown = if shutdown.verified() { Verdict::Pass } else { Verdict::Fail };
@@ -2476,7 +2554,21 @@ index 0000000..cfe2839
 +    let mut tec_activity_seen = false;
 +    let mut explicit_firmware_safety_passed = false;
 +    let mut selected_tec_unlocking_observed = false;
-+    let mut explicit_firmware_fault_observed = false;
++    // Never currently set `true`: item 1 removed the only trigger (the generic fault-keyword
++    // scan) from this mode entirely. Kept as a named, reported field -- not `mut` right now -- so
++    // a future specifically-parsed, evidenced negative firmware state has somewhere to report
++    // itself without inventing a new field at that point.
++    let explicit_firmware_fault_observed = false;
++    let mut temperature_reads_failed: Option<u64> = None;
++    let mut temperature_reads_total: Option<u64> = None;
++    let mut top_fan_activity_observed = false;
++    let mut top_fan_latest_duty: Option<f64> = None;
++    let mut top_fan_latest_rpm: Option<f64> = None;
++    let mut top_fan_max_rpm: Option<f64> = None;
++    let mut bottom_fan_activity_observed = false;
++    let mut bottom_fan_latest_duty: Option<f64> = None;
++    let mut bottom_fan_latest_rpm: Option<f64> = None;
++    let mut bottom_fan_max_rpm: Option<f64> = None;
 +    let mut tec_current_first_a: Option<f64> = None;
 +    let mut tec_current_min_a: Option<f64> = None;
 +    let mut tec_current_max_a: Option<f64> = None;
@@ -2645,15 +2737,34 @@ index 0000000..cfe2839
 +                                                }
 +                                            }
 +                                        }
++                                        if let Some((failed, total)) = parse_temps_health_report(&m) {
++                                            temperature_reads_failed = Some(failed);
++                                            temperature_reads_total = Some(total);
++                                        }
++                                        if let Some((duty, rpm)) = parse_fan_report(&m, "top-fan") {
++                                            top_fan_activity_observed = true;
++                                            top_fan_latest_duty = Some(duty);
++                                            top_fan_latest_rpm = Some(rpm);
++                                            top_fan_max_rpm = Some(top_fan_max_rpm.map_or(rpm, |v: f64| v.max(rpm)));
++                                        }
++                                        if let Some((duty, rpm)) = parse_fan_report(&m, "bottom-fan") {
++                                            bottom_fan_activity_observed = true;
++                                            bottom_fan_latest_duty = Some(duty);
++                                            bottom_fan_latest_rpm = Some(rpm);
++                                            bottom_fan_max_rpm = Some(bottom_fan_max_rpm.map_or(rpm, |v: f64| v.max(rpm)));
++                                        }
++                                        // Item 1: no generic fault-keyword scan in this mode at all --
++                                        // an automatic firmware-fault shutdown requires a specifically
++                                        // parsed, recognized negative state (TEC lock states above are
++                                        // the only ones currently evidenced). Every other firmware
++                                        // Message, however it's worded, is observational and
++                                        // nonterminal here -- see is_generic_fault_message's own doc
++                                        // comment for the live-hardware incident this fixed
++                                        // ("[temps] 0 reads failed out of 1200" misclassified as a
++                                        // fault by a plain contains("failed") check).
 +                                        if is_known_nonfatal_sensor_message(&m) {
 +                                            log::warn!("firmware-authoritative: firmware sensor-unavailable message (non-fatal): {m:?}");
 +                                            telemetry_warning_count += 1;
-+                                        } else if active_start.elapsed() > FAULT_KEYWORD_GRACE && is_generic_fault_message(&m) {
-+                                            log::error!("firmware-authoritative: explicit firmware safety fault message: {m:?}");
-+                                            explicit_firmware_fault_observed = true;
-+                                            stop_reason = StopReason::FirmwareSafetyFault;
-+                                            telemetry_ok = false;
-+                                            break 'fa_active;
 +                                        }
 +                                    }
 +                                    FrozenPacket::TargetUpdate((s, target)) => {
@@ -2742,7 +2853,9 @@ index 0000000..cfe2839
 +        }
 +
 +        let side_bracket_tag = format!("[{side_tag}]");
-+        fan_seen = stats.messages.iter().any(|m| m.to_lowercase().contains("fan") && m.contains(&side_bracket_tag));
++        // Fan telemetry is global Hub thermal management, never side-scoped -- see
++        // parse_fan_report's doc comment. "seen" means either fan produced any telemetry at all.
++        fan_seen = top_fan_activity_observed || bottom_fan_activity_observed;
 +        tec_activity_seen = tec_activity_seen
 +            || stats.messages.iter().any(|m| m.to_lowercase().contains("tec") && m.contains(&side_bracket_tag));
 +        if !tec_current_observed {
@@ -2750,7 +2863,7 @@ index 0000000..cfe2839
 +            telemetry_warning_count += 1;
 +        }
 +        if !fan_seen {
-+            log::warn!("firmware-authoritative: no fan telemetry observed for the selected side (not treated as a fault)");
++            log::warn!("firmware-authoritative: no global fan telemetry observed (not treated as a fault)");
 +            telemetry_warning_count += 1;
 +        }
 +        if !pump_command_observed {
@@ -2842,6 +2955,20 @@ index 0000000..cfe2839
 +    ct.selected_tec_current_last_a = tec_current_last_a;
 +    ct.selected_tec_current_samples = tec_current_samples;
 +    ct.explicit_firmware_fault_observed = explicit_firmware_fault_observed;
++    ct.temperature_reads_failed = temperature_reads_failed;
++    ct.temperature_reads_total = temperature_reads_total;
++    ct.temperature_read_failure_ratio = match (temperature_reads_failed, temperature_reads_total) {
++        (Some(failed), Some(total)) if total > 0 => Some(failed as f64 / total as f64),
++        _ => None,
++    };
++    ct.top_fan_activity_observed = top_fan_activity_observed;
++    ct.top_fan_latest_duty = top_fan_latest_duty;
++    ct.top_fan_latest_rpm = top_fan_latest_rpm;
++    ct.top_fan_max_rpm = top_fan_max_rpm;
++    ct.bottom_fan_activity_observed = bottom_fan_activity_observed;
++    ct.bottom_fan_latest_duty = bottom_fan_latest_duty;
++    ct.bottom_fan_latest_rpm = bottom_fan_latest_rpm;
++    ct.bottom_fan_max_rpm = bottom_fan_max_rpm;
 +    ct.telemetry_warning_count = telemetry_warning_count;
 +    // This mode has no watchdog-style stop condition at all -- see FA_COMMUNICATION_SILENCE_LIMIT.
 +    ct.telemetry_watchdog_triggered = false;
@@ -3198,8 +3325,10 @@ index 0000000..cfe2839
 +            water_loop_filled_declared: Some(args.confirm_water_loop_filled),
 +            no_visible_leaks_declared: Some(args.confirm_no_visible_leaks),
 +            active_test_confirmed_flag: Some(args.confirm_active_test),
-+            interactive_phrase_confirmed: Some(true),
-+            final_start_phrase_confirmed: Some(cr.frozen_command_accepted != Verdict::Unknown),
++            // No longer applicable: this binary has no typed confirmation phrases at all --
++            // `None` here means "not asked", not "asked and failed".
++            interactive_phrase_confirmed: None,
++            final_start_phrase_confirmed: None,
 +        },
 +        i2c_device: args.i2c_device.clone(),
 +        i2c_bus_open: true,
@@ -3238,7 +3367,7 @@ index 0000000..cfe2839
 +        priming_start_observed: false,
 +        priming_done_observed: false,
 +        priming_done_because_empty: false,
-+        operator_observations: prompt_observations(),
++        operator_observations: build_operator_observations(args),
 +        prime_operator_observations: None,
 +        stop_reason: stop_reason.to_string(),
 +        safe_stop: None,
@@ -3267,23 +3396,20 @@ index 0000000..cfe2839
 +    (report, code)
 +}
 +
-+fn prompt_observations() -> Option<OperatorObservations> {
-+    if !std::io::stdin().is_terminal() {
-+        return None;
-+    }
-+    let ask = |prompt: &str| -> String {
-+        eprint!("{prompt}");
-+        let mut line = String::new();
-+        let _ = std::io::stdin().read_line(&mut line);
-+        line.trim().to_string()
-+    };
++/// No longer an interactive post-run questionnaire (removed entirely -- a physical condition
++/// this binary cannot verify electronically is reported as "not collected", never left to block
++/// on operator input or to make the run look like it failed merely because nobody answered).
++/// `--operator-note` is the one optional, never-prompted-for way to attach free text.
++const OPERATOR_OBSERVATION_NOT_COLLECTED: &str = "not collected";
++
++fn build_operator_observations(args: &CoolTestArgs) -> Option<OperatorObservations> {
 +    Some(OperatorObservations {
-+        pump_heard_or_felt: Some(ask("Pump heard/felt? (yes/no/unsure): ")),
-+        fan_seen_or_heard: Some(ask("Fan seen/heard? (yes/no/unsure): ")),
-+        airflow_felt: Some(ask("Airflow felt? (yes/no/unsure): ")),
-+        leak_observed: Some(ask("Leak observed? (yes/no): ").eq_ignore_ascii_case("yes")),
-+        unusual_smell_or_noise: Some(ask("Unusual smell/noise? (yes/no): ").eq_ignore_ascii_case("yes")),
-+        notes: Some(ask("Notes (optional): ")),
++        pump_heard_or_felt: Some(OPERATOR_OBSERVATION_NOT_COLLECTED.to_string()),
++        fan_seen_or_heard: Some(OPERATOR_OBSERVATION_NOT_COLLECTED.to_string()),
++        airflow_felt: Some(OPERATOR_OBSERVATION_NOT_COLLECTED.to_string()),
++        leak_observed: None,
++        unusual_smell_or_noise: None,
++        notes: args.operator_note.clone(),
 +    })
 +}
 +
@@ -3301,8 +3427,8 @@ index 0000000..cfe2839
 +            water_loop_filled_declared: Some(args.confirm_water_loop_filled),
 +            no_visible_leaks_declared: Some(args.confirm_no_visible_leaks),
 +            active_test_confirmed_flag: Some(args.confirm_active_test),
-+            interactive_phrase_confirmed: Some(false),
-+            final_start_phrase_confirmed: Some(false),
++            interactive_phrase_confirmed: None,
++            final_start_phrase_confirmed: None,
 +        },
 +        i2c_device: args.i2c_device.clone(),
 +        i2c_bus_open: false,
@@ -3364,7 +3490,8 @@ index 0000000..cfe2839
 +    fn args(side: Side, dry_run: bool) -> CoolTestArgs {
 +        CoolTestArgs {
 +            side,
-+            delta_c: 1.0,
++            delta_c: Some(1.0),
++            target_c: None,
 +            duration_seconds: 2,
 +            confirm_cover_hydraulics_connected: true,
 +            confirm_water_loop_filled: true,
@@ -3378,10 +3505,10 @@ index 0000000..cfe2839
 +            dry_run,
 +            raw_serial_log: false,
 +            firmware_authoritative: false,
-+            assume_interactive_phrase: Some(INTERACTIVE_PHRASE.to_string()),
-+            assume_start_phrase: Some("START LEFT COOLING TEST".to_string()),
-+            assume_reservoir_phrase: Some(RESERVOIR_PHRASE.to_string()),
-+            assume_extended_duration_phrase: Some(EXTENDED_DURATION_PHRASE.to_string()),
++            non_interactive: true,
++            confirm_extended_test: false,
++            confirm_large_temperature_delta: false,
++            operator_note: None,
 +            skip_independent_guard: true,
 +        }
 +    }
@@ -3408,12 +3535,14 @@ index 0000000..cfe2839
 +    }
 +
 +    #[tokio::test]
-+    async fn refuses_when_interactive_phrase_is_wrong() {
-+        let mut a = args(Side::Left, true);
-+        a.assume_interactive_phrase = Some("nope".to_string());
-+        let (report, code) = run(&a).await;
-+        assert_eq!(code, 30);
-+        assert!(!report.overall_pass);
++    async fn non_interactive_run_never_blocks_on_a_confirmation_phrase() {
++        // There is no more typed confirmation phrase to get wrong -- a fully specified,
++        // --non-interactive command must proceed straight through to completion.
++        let a = args(Side::Left, true);
++        let start = std::time::Instant::now();
++        let (report, _code) = run(&a).await;
++        assert!(start.elapsed() < Duration::from_secs(30));
++        assert!(report.cool_test_results.is_some());
 +    }
 +
 +    #[tokio::test]
@@ -3425,13 +3554,26 @@ index 0000000..cfe2839
 +    }
 +
 +    #[tokio::test]
-+    async fn refuses_when_delta_exceeds_maximum() {
++    async fn large_delta_without_confirmation_flag_is_refused() {
 +        let mut a = args(Side::Left, true);
-+        a.delta_c = 5.0;
-+        let (report, _) = run(&a).await;
-+        // The construction failure happens inside run_core after confirmations pass; the enabled
-+        // count must still be zero.
++        a.delta_c = Some(5.0);
++        let (report, code) = run(&a).await;
++        assert_eq!(code, 30);
 +        assert_eq!(report.enabled_target_command_count, 0);
++        assert!(report.stop_reason.contains("confirm-large-temperature-delta"), "got: {}", report.stop_reason);
++    }
++
++    #[tokio::test]
++    async fn large_delta_is_accepted_with_the_confirmation_flag() {
++        // No arbitrary replacement cap: a delta well above the former 2.0C limit is accepted
++        // outright once acknowledged.
++        let mut a = args(Side::Left, true);
++        a.delta_c = Some(5.0);
++        a.confirm_large_temperature_delta = true;
++        let (report, _code) = run(&a).await;
++        assert_eq!(report.enabled_target_command_count, 1);
++        let ct = report.cool_test_results.expect("cool_test_results must be set");
++        assert_eq!(ct.requested_delta_c, 5.0);
 +    }
 +
 +    #[tokio::test]
@@ -3498,45 +3640,44 @@ index 0000000..cfe2839
 +    }
 +
 +    #[tokio::test]
-+    async fn durations_above_three_hundred_seconds_require_the_extended_confirmation_phrase() {
++    async fn durations_above_three_hundred_seconds_require_the_extended_confirmation_flag() {
 +        let mut a = args(Side::Left, true);
 +        a.duration_seconds = EXTENDED_DURATION_THRESHOLD_SECONDS + 1;
-+        a.assume_extended_duration_phrase = Some("wrong".to_string());
++        a.confirm_extended_test = false;
 +        let (report, code) = run(&a).await;
 +        assert_eq!(code, 30);
 +        assert!(report.stop_reason.contains("extended-duration"), "got: {}", report.stop_reason);
 +    }
 +
 +    #[tokio::test]
-+    async fn duration_at_or_below_three_hundred_seconds_never_needs_the_extended_confirmation_phrase() {
++    async fn duration_at_or_below_three_hundred_seconds_never_needs_the_extended_confirmation_flag() {
 +        // Forces a fast, early refusal for an unrelated reason so this never has to run the full
 +        // active phase (300s, with the constant-temperature dry-run mock never reaching target)
 +        // just to prove the extended-duration gate was skipped entirely for a non-extended duration.
 +        let mut a = args(Side::Left, true);
 +        a.duration_seconds = EXTENDED_DURATION_THRESHOLD_SECONDS;
-+        a.assume_extended_duration_phrase = Some("wrong".to_string()); // must never even be checked
++        a.confirm_extended_test = false; // must never even be checked at this duration
 +        a.confirm_active_test = false;
 +        let (report, code) = run(&a).await;
 +        assert_eq!(code, 30);
-+        assert_ne!(report.stop_reason, "extended-duration confirmation phrase mismatch");
++        assert_ne!(report.stop_reason, "extended-duration confirmation flag missing");
 +    }
 +
 +    #[tokio::test]
-+    async fn correct_extended_duration_phrase_lets_the_run_proceed_past_that_gate() {
-+        // Forces a refusal further along (wrong reservoir phrase, reached only after baseline
-+        // validates) to prove the extended-duration gate itself was satisfied and passed, without
-+        // waiting out a full 300+s active phase just to observe a normal completion.
++    async fn correct_extended_duration_flag_lets_the_run_proceed_past_that_gate() {
++        // Forces a refusal further along (a large delta without its own confirmation flag, the
++        // very next early check after the extended-duration gate) to prove the extended-duration
++        // gate itself was satisfied and passed, without waiting out a full 300+s active phase
++        // just to observe a normal completion.
 +        let mut a = args(Side::Left, true);
 +        a.duration_seconds = EXTENDED_DURATION_THRESHOLD_SECONDS + 1;
-+        a.assume_reservoir_phrase = Some("wrong".to_string());
++        a.confirm_extended_test = true;
++        a.delta_c = Some(5.0);
++        a.confirm_large_temperature_delta = false;
 +        let (report, code) = run(&a).await;
 +        assert_eq!(code, 30);
-+        assert_ne!(report.stop_reason, "extended-duration confirmation phrase mismatch");
-+    }
-+
-+    #[test]
-+    fn max_delta_constant_matches_spec() {
-+        assert_eq!(crate::safety::MAX_COOL_DELTA_CENTIDEG, 200);
++        assert_ne!(report.stop_reason, "extended-duration confirmation flag missing");
++        assert!(report.stop_reason.contains("confirm-large-temperature-delta") || report.overall_pass);
 +    }
 +
 +    #[test]
@@ -3803,6 +3944,38 @@ index 0000000..cfe2839
 +    }
 +
 +    #[test]
++    fn temps_zero_reads_failed_is_healthy_not_a_fault() {
++        // The exact live-hardware message that motivated this fix: healthy status telemetry (zero
++        // failures out of 1200 reads) was previously misclassified as an explicit firmware safety
++        // fault because it contains the word "failed".
++        assert!(!is_generic_fault_message("FW: [temps] 0 reads failed out of 1200"));
++        assert_eq!(parse_temps_health_report("FW: [temps] 0 reads failed out of 1200"), Some((0, 1200)));
++    }
++
++    #[test]
++    fn temps_nonzero_reads_failed_is_parsed_but_still_not_a_fault() {
++        assert!(!is_generic_fault_message("FW: [temps] 3 reads failed out of 1200"));
++        assert_eq!(parse_temps_health_report("FW: [temps] 3 reads failed out of 1200"), Some((3, 1200)));
++    }
++
++    #[test]
++    fn temps_health_report_ignores_unrelated_messages() {
++        assert_eq!(parse_temps_health_report("FW: pump[left] slow @ 6.03V 0.17A"), None);
++    }
++
++    #[test]
++    fn fan_report_parses_duty_and_rpm_with_no_side_identifier() {
++        assert_eq!(parse_fan_report("FW: [top-fan] 45 @ 1800 rpm", "top-fan"), Some((45.0, 1800.0)));
++        assert_eq!(parse_fan_report("FW: [bottom-fan] 30 @ 1200 rpm", "bottom-fan"), Some((30.0, 1200.0)));
++    }
++
++    #[test]
++    fn fan_report_never_matches_the_other_fan_or_unrelated_messages() {
++        assert_eq!(parse_fan_report("FW: [top-fan] 45 @ 1800 rpm", "bottom-fan"), None);
++        assert_eq!(parse_fan_report("FW: pump[left] slow @ 6.03V 0.17A", "top-fan"), None);
++    }
++
++    #[test]
 +    fn generic_fault_keywords_are_detected() {
 +        assert!(is_generic_fault_message("FW: overtemperature shutdown"));
 +        assert!(is_generic_fault_message("FW: pump[left] fault"));
@@ -4010,7 +4183,7 @@ index 0000000..cfe2839
 +        let mut i2c = MockI2c::always_succeed();
 +
 +        let mut a = args(Side::Left, false);
-+        a.delta_c = 1.0; // baseline ~24.50C -> target ~23.50C (2350 centideg), well above the mock's post-enable 2200
++        a.delta_c = Some(1.0); // baseline ~24.50C -> target ~23.50C (2350 centideg), well above the mock's post-enable 2200
 +        a.duration_seconds = 60; // long enough that DurationExpired is never what stops it
 +        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None, false).await;
 +
@@ -4814,6 +4987,105 @@ index 0000000..cfe2839
 +        })
 +    }
 +
++    /// Same shape as [`spawn_device_with_a_message`], but pushes every message in `messages` on
++    /// each qualifying tick instead of just one -- used to exercise multiple message types (e.g.
++    /// `[temps]` health telemetry and both fans' telemetry) arriving together.
++    fn spawn_device_with_messages(
++        mut device_side: tokio::io::DuplexStream,
++        messages: &'static [&'static str],
++        messages_after: usize,
++    ) -> tokio::task::JoinHandle<()> {
++        use bytes::{Buf, BytesMut};
++        use tokio::io::{AsyncReadExt, AsyncWriteExt};
++        tokio::spawn(async move {
++            let mut acc = BytesMut::new();
++            let mut read_buf = [0u8; 256];
++            let mut temp_requests: usize = 0;
++            let mut count: u8 = 0;
++            loop {
++                if acc.len() >= 2 {
++                    let len = acc[1] as usize;
++                    let total = 1 + 1 + len + 2;
++                    if acc.len() >= total {
++                        let opcode = acc[2];
++                        let payload = acc[2..2 + len].to_vec();
++                        acc.advance(total);
++                        let mut frames: Vec<Vec<u8>> = Vec::new();
++                        match opcode {
++                            0x01 => frames.push(opensleep::common::codec::command(vec![0x81, 0x00, 0b0100_0110])),
++                            0x41 => {
++                                temp_requests += 1;
++                                count = count.wrapping_add(1);
++                                frames.push(opensleep::common::codec::command(vec![
++                                    0x41, 0x09, 0x9A, 0x09, 0xA4, 0x0A, 0x28, 9, count,
++                                ]));
++                                if temp_requests >= messages_after {
++                                    for message in messages {
++                                        let mut p = vec![0x07u8, 0x00];
++                                        p.extend_from_slice(message.as_bytes());
++                                        frames.push(opensleep::common::codec::command(p));
++                                    }
++                                }
++                            }
++                            0x40 if payload.len() == 5 => frames.push(opensleep::common::codec::command(vec![
++                                0xC0, 0x00, payload[1], payload[2], payload[3], payload[4],
++                            ])),
++                            _ => {}
++                        }
++                        for f in frames {
++                            if device_side.write_all(&f).await.is_err() {
++                                return;
++                            }
++                        }
++                        continue;
++                    }
++                }
++                match device_side.read(&mut read_buf).await {
++                    Ok(0) | Err(_) => break,
++                    Ok(n) => acc.extend_from_slice(&read_buf[..n]),
++                }
++            }
++        })
++    }
++
++    #[tokio::test]
++    async fn temps_and_fan_telemetry_do_not_stop_firmware_authoritative_cooling_and_are_reported() {
++        const MESSAGES: &[&str] = &[
++            "FW: [temps] 0 reads failed out of 1200",
++            "FW: [top-fan] 45 @ 1800 rpm",
++            "FW: [bottom-fan] 30 @ 1200 rpm",
++        ];
++        let (client, device) = tokio::io::duplex(8192);
++        let device_task = spawn_device_with_messages(device, MESSAGES, 3);
++        let mut link = FrozenLink::wrap(client, "test");
++        let mut i2c = MockI2c::always_succeed();
++
++        let mut a = args(Side::Left, false);
++        a.firmware_authoritative = true;
++        a.duration_seconds = 15;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None, false).await;
++
++        assert_eq!(
++            report.stop_reason,
++            StopReason::DurationExpired.to_string(),
++            "broad words like \"failed\" in [temps] telemetry must never stop a firmware-authoritative run"
++        );
++        let ct = report.cool_test_results.expect("cool_test_results must be set");
++        assert_eq!(ct.temperature_reads_failed, Some(0));
++        assert_eq!(ct.temperature_reads_total, Some(1200));
++        assert_eq!(ct.temperature_read_failure_ratio, Some(0.0));
++        assert!(ct.top_fan_activity_observed);
++        assert_eq!(ct.top_fan_latest_duty, Some(45.0));
++        assert_eq!(ct.top_fan_latest_rpm, Some(1800.0));
++        assert!(ct.bottom_fan_activity_observed);
++        assert_eq!(ct.bottom_fan_latest_duty, Some(30.0));
++        assert_eq!(ct.bottom_fan_latest_rpm, Some(1200.0));
++        assert!(!ct.explicit_firmware_fault_observed);
++
++        drop(link);
++        device_task.abort();
++    }
++
 +    #[tokio::test]
 +    async fn tec_locked_message_triggers_shutdown() {
 +        let (client, device) = tokio::io::duplex(8192);
@@ -5014,15 +5286,20 @@ index 0000000..cfe2839
 +    }
 +
 +    #[tokio::test]
-+    async fn cool_test_does_not_start_without_the_reservoir_confirmation() {
++    async fn target_c_resulting_in_a_large_delta_is_refused_post_baseline_without_the_confirmation_flag() {
++        // --target-c's resulting delta can only be checked once the real baseline is known -- this
++        // proves that post-baseline check in run_core (distinct from --delta-c's early check in
++        // run()) actually runs and refuses correctly, never enabling cooling.
 +        let mut i2c = MockI2c::always_succeed();
 +        let (client, task) = mock_frozen_link_pair();
 +        let mut link = FrozenLink::wrap(client, "test");
 +        let mut a = args(Side::Left, false);
-+        a.assume_reservoir_phrase = Some("wrong".to_string());
++        a.delta_c = None;
++        a.target_c = Some(10.0); // baseline ~24.5C -> delta ~14.5C, well above the confirmation threshold
++        a.confirm_large_temperature_delta = false;
 +        let (report, code) = run_core(&a, &mut i2c, &mut link, false, None, None, false).await;
 +        assert_eq!(code, 30);
-+        assert_eq!(report.enabled_target_command_count, 0, "cooling must never be enabled without the reservoir confirmation");
++        assert_eq!(report.enabled_target_command_count, 0, "cooling must never be enabled without the large-delta confirmation flag");
 +        drop(link);
 +        task.abort();
 +    }
@@ -12218,10 +12495,10 @@ index 0000000..e668cde
 +}
 diff --git a/src/bin/opensleep-diagnostic/report.rs b/src/bin/opensleep-diagnostic/report.rs
 new file mode 100644
-index 0000000..b58394c
+index 0000000..1031acf
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/report.rs
-@@ -0,0 +1,1029 @@
+@@ -0,0 +1,1079 @@
 +//! Structured JSON/CSV/text reporting shared by all three subcommands. Machine evidence (audit
 +//! log, decoded telemetry) is always kept in separate fields from operator-entered observations,
 +//! per the safety model: a component may only be marked PASS from decoded evidence or an explicit
@@ -12773,6 +13050,29 @@ index 0000000..b58394c
 +    /// (nothing to disarm), or if shutdown could not be verified (the guard is deliberately left
 +    /// armed in that case -- see `cool_test.rs`) or the disarm write itself failed.
 +    pub independent_guard_disarmed: bool,
++
++    // ---- `[temps]` firmware health telemetry (see cool_test::parse_temps_health_report) ----
++    /// The most recently reported failed-read count from `"FW: [temps] <failed> reads failed out
++    /// of <total>"`. Purely descriptive -- a nonzero count is never itself a reason to stop; a
++    /// live-hardware run's own zero-failure report was misclassified as a firmware safety fault
++    /// by an earlier revision's generic keyword scan before this parser was added.
++    pub temperature_reads_failed: Option<u64>,
++    /// The most recently reported total-read count from the same message.
++    pub temperature_reads_total: Option<u64>,
++    /// `temperature_reads_failed / temperature_reads_total` from the same message, `None` if
++    /// neither has been observed yet or the reported total was zero.
++    pub temperature_read_failure_ratio: Option<f64>,
++
++    // ---- Fan telemetry (see cool_test::parse_fan_report) -- global Hub thermal management,
++    // never scoped to either cooling side; there is no left/right fan. ----
++    pub top_fan_activity_observed: bool,
++    pub top_fan_latest_duty: Option<f64>,
++    pub top_fan_latest_rpm: Option<f64>,
++    pub top_fan_max_rpm: Option<f64>,
++    pub bottom_fan_activity_observed: bool,
++    pub bottom_fan_latest_duty: Option<f64>,
++    pub bottom_fan_latest_rpm: Option<f64>,
++    pub bottom_fan_max_rpm: Option<f64>,
 +}
 +
 +/// One decoded firmware pump message (`FW: pump[<side>] ... @ <V>V <A>A`), kept separate from
@@ -13040,6 +13340,20 @@ index 0000000..b58394c
 +            csv_field!("telemetry_warning_count", ct.telemetry_warning_count);
 +            csv_field!("independent_guard_armed", ct.independent_guard_armed);
 +            csv_field!("independent_guard_disarmed", ct.independent_guard_disarmed);
++            csv_field!("temperature_reads_failed", ct.temperature_reads_failed.map(|v| v.to_string()).unwrap_or_default());
++            csv_field!("temperature_reads_total", ct.temperature_reads_total.map(|v| v.to_string()).unwrap_or_default());
++            csv_field!(
++                "temperature_read_failure_ratio",
++                ct.temperature_read_failure_ratio.map(|v| v.to_string()).unwrap_or_default()
++            );
++            csv_field!("top_fan_activity_observed", ct.top_fan_activity_observed);
++            csv_field!("top_fan_latest_duty", ct.top_fan_latest_duty.map(|v| v.to_string()).unwrap_or_default());
++            csv_field!("top_fan_latest_rpm", ct.top_fan_latest_rpm.map(|v| v.to_string()).unwrap_or_default());
++            csv_field!("top_fan_max_rpm", ct.top_fan_max_rpm.map(|v| v.to_string()).unwrap_or_default());
++            csv_field!("bottom_fan_activity_observed", ct.bottom_fan_activity_observed);
++            csv_field!("bottom_fan_latest_duty", ct.bottom_fan_latest_duty.map(|v| v.to_string()).unwrap_or_default());
++            csv_field!("bottom_fan_latest_rpm", ct.bottom_fan_latest_rpm.map(|v| v.to_string()).unwrap_or_default());
++            csv_field!("bottom_fan_max_rpm", ct.bottom_fan_max_rpm.map(|v| v.to_string()).unwrap_or_default());
 +        }
 +        Ok(())
 +    }
@@ -13214,6 +13528,19 @@ index 0000000..b58394c
 +                log::info!(
 +                    "  Independent shutdown guard armed/disarmed: {}/{}",
 +                    ct.independent_guard_armed, ct.independent_guard_disarmed
++                );
++                log::info!(
++                    "  [temps] reads failed/total/ratio: {:?}/{:?}/{:?}",
++                    ct.temperature_reads_failed, ct.temperature_reads_total, ct.temperature_read_failure_ratio
++                );
++                log::info!(
++                    "  Top fan observed/duty/rpm/max rpm: {}/{:?}/{:?}/{:?}",
++                    ct.top_fan_activity_observed, ct.top_fan_latest_duty, ct.top_fan_latest_rpm, ct.top_fan_max_rpm
++                );
++                log::info!(
++                    "  Bottom fan observed/duty/rpm/max rpm: {}/{:?}/{:?}/{:?}",
++                    ct.bottom_fan_activity_observed, ct.bottom_fan_latest_duty, ct.bottom_fan_latest_rpm,
++                    ct.bottom_fan_max_rpm
 +                );
 +            }
 +        }
@@ -13464,10 +13791,10 @@ index 0000000..ee0673a
 +}
 diff --git a/src/bin/opensleep-diagnostic/safety.rs b/src/bin/opensleep-diagnostic/safety.rs
 new file mode 100644
-index 0000000..a2a5a23
+index 0000000..4eafa23
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/safety.rs
-@@ -0,0 +1,648 @@
+@@ -0,0 +1,660 @@
 +//! Structural enforcement of the per-mode Frozen command whitelist.
 +//!
 +//! Three independent layers keep everything except the documented command set unreachable:
@@ -13503,8 +13830,6 @@ index 0000000..a2a5a23
 +use opensleep::frozen::FrozenCommand;
 +use opensleep::frozen::packet::FrozenTarget;
 +
-+/// Maximum permitted cooling delta below the validated baseline: 2.0 degrees C.
-+pub const MAX_COOL_DELTA_CENTIDEG: i32 = 200;
 +/// Default cooling delta below the validated baseline: 1.0 degrees C. `cli.rs`'s
 +/// `--delta-c` default (`1.0`) is the degrees-C form of this same value; see
 +/// `tests::default_delta_flag_matches_default_delta_constant` for the cross-check.
@@ -13617,25 +13942,23 @@ index 0000000..a2a5a23
 +    }
 +
 +    /// Validates and builds the single enabled `SetTargetTemperature` this binary can ever send.
-+    /// `delta_centideg` must be within `[0, MAX_COOL_DELTA_CENTIDEG]` and `baseline_centideg` must
-+    /// already have passed the caller's baseline sanity range check; this function additionally
-+    /// refuses a target that would fall outside a conservative absolute range as a last-resort
-+    /// backstop.
++    /// `delta_centideg` must be non-negative and `baseline_centideg` must already have passed the
++    /// caller's baseline sanity range check; this function additionally refuses a target that
++    /// would fall outside a conservative absolute range as a last-resort backstop. Deliberately no
++    /// longer enforces any fixed maximum delta here: a live-hardware run conclusively demonstrated
++    /// working cooling, circulation, fan control, TEC operation, temperature reduction, and
++    /// verified shutdown, and Frozen firmware -- not this host-side check -- is what actually owns
++    /// PID regulation, TEC current protection, thermal protection, and target maintenance. `cli.rs`
++    /// requires an explicit `--confirm-large-temperature-delta` acknowledgement above a threshold
++    /// as an audit trail, not a second hidden cap enforced here.
 +    pub fn enable_cooling(
 +        side: BedSide,
 +        baseline_centideg: u16,
 +        delta_centideg: i32,
 +    ) -> Result<Self, CoolingLimitError> {
-+        if delta_centideg < 0 {
++        if delta_centideg <= 0 {
 +            return Err(CoolingLimitError(format!(
-+                "cooling delta must not be negative (heating is not implemented by this tool), got {delta_centideg}"
-+            )));
-+        }
-+        if delta_centideg > MAX_COOL_DELTA_CENTIDEG {
-+            return Err(CoolingLimitError(format!(
-+                "requested delta {}.{:02}C exceeds the maximum permitted {}.{:02}C; refusing (no option may override this limit)",
-+                delta_centideg / 100, delta_centideg % 100,
-+                MAX_COOL_DELTA_CENTIDEG / 100, MAX_COOL_DELTA_CENTIDEG % 100,
++                "cooling delta must be positive (heating is not implemented by this tool), got {delta_centideg}"
 +            )));
 +        }
 +        let target = i32::from(baseline_centideg) - delta_centideg;
@@ -13946,15 +14269,31 @@ index 0000000..a2a5a23
 +    }
 +
 +    #[test]
-+    fn cooling_delta_above_max_is_rejected_at_construction() {
++    fn cooling_delta_has_no_fixed_maximum_at_construction() {
++        // A live-hardware run conclusively demonstrated working cooling, circulation, fan
++        // control, TEC operation, temperature reduction, and verified shutdown at a delta well
++        // above the former 2.0C cap -- there is no longer any fixed host-side maximum here.
 +        assert!(FrozenAction::enable_cooling(BedSide::Left, 2400, 200).is_ok());
-+        assert!(FrozenAction::enable_cooling(BedSide::Left, 2400, 201).is_err());
-+        assert!(FrozenAction::enable_cooling(BedSide::Left, 2400, 1000).is_err());
++        assert!(FrozenAction::enable_cooling(BedSide::Left, 2400, 201).is_ok());
++        assert!(FrozenAction::enable_cooling(BedSide::Left, 2400, 1000).is_ok());
++    }
++
++    #[test]
++    fn cooling_delta_still_respects_the_conservative_absolute_backstop() {
++        // Not a reintroduced delta cap: this is the same, unchanged 0-45C absolute-target
++        // backstop enable_cooling has always enforced, independent of delta size.
++        assert!(FrozenAction::enable_cooling(BedSide::Left, 2400, 2400).is_ok()); // target = 0C, in range
++        assert!(FrozenAction::enable_cooling(BedSide::Left, 2400, 2401).is_err()); // target < 0C
 +    }
 +
 +    #[test]
 +    fn cooling_delta_cannot_be_negative_ie_no_heating() {
 +        assert!(FrozenAction::enable_cooling(BedSide::Left, 2400, -1).is_err());
++    }
++
++    #[test]
++    fn cooling_delta_cannot_be_zero() {
++        assert!(FrozenAction::enable_cooling(BedSide::Left, 2400, 0).is_err());
 +    }
 +
 +    #[test]

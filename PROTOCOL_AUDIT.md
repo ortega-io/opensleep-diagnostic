@@ -384,6 +384,24 @@ bracket-format parser. As with the bracket format, the dash format's default val
 literally contains "fault" as a substring) was the second real trigger for this codebase's
 word-exact fault-keyword matching (see `cool_test::WORD_EXACT_FAULT_KEYWORDS`).
 
+**Fan telemetry** was captured from the same class of live run: `"FW: [top-fan] <duty> @ <rpm>
+rpm"` / `"FW: [bottom-fan] <duty> @ <rpm> rpm"`. Neither message names a cooling side -- both fans
+are Hub-wide thermal management, not per-side actuators, unlike the pump/TEC messages above.
+`cool_test::parse_fan_report` is deliberately never scoped to (or expected to find) a left/right
+identifier for this reason; an earlier revision's "was fan telemetry observed" check incorrectly
+required the selected side's own bracket tag to appear in a fan message, which it structurally
+never could, in both the legacy and `--firmware-authoritative` active loops.
+
+**`[temps]` health telemetry**: `"FW: [temps] <failed> reads failed out of <total>"`, e.g. `"FW:
+[temps] 0 reads failed out of 1200"` -- Frozen's own temperature-read health counter, observed
+during a live `--firmware-authoritative` run with `failed=0`. This is the message that prompted
+removing generic keyword-based fault detection from `--firmware-authoritative` mode entirely (see
+SAFETY.md): a plain `contains("failed")` check misclassified this healthy zero-failure report as
+an explicit firmware safety fault. `cool_test::parse_temps_health_report` recognizes the format and
+reports it purely descriptively (`temperature_reads_failed`/`_total`/`_ratio`); no count, including
+a nonzero one, is treated as fatal by itself -- no such threshold has ever been documented for this
+firmware.
+
 ### No solenoid/valve message exists in the reused source
 
 Despite the physical Pod 3 hydraulic loop plausibly containing a solenoid or float valve, **no

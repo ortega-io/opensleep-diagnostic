@@ -1,8 +1,10 @@
 opensleep-diagnostic — build report
 ====================================
 
-Patch revision: 16 (adds --firmware-authoritative, an optional narrower active-phase mode)
-Supersedes revision 15 (fixes a watchdog-clock mismatch and a caller-side TEC control-flow bug),
+Patch revision: 17 (full firmware-authoritative cooling tests: no delta cap, no interactive
+confirmations, fixes a second false firmware-fault positive)
+Supersedes revision 16 (adds --firmware-authoritative, an optional narrower active-phase mode),
+revision 15 (fixes a watchdog-clock mismatch and a caller-side TEC control-flow bug),
 revision 14 (fixed a false TEC-lock abort; extended the active phase to 15 minutes),
 revision 13 (decoded the 14-byte GetTemperature reply; fixed a premature 40s baseline cutoff),
 revision 12 (reworked frozen-cool-test onto the narrow startup model; fixed an unbounded-write
@@ -15,6 +17,43 @@ frozen-prime-test, now removed), revision 5 (added frozen-prime-test), revision 
 active-test preflight/monitoring), revision 3 (staged, Frozen-only diagnostic redesign), revision 2
 (sensor-first post-reset bootloader retry-probe), and revision 1 (initial diagnostic-only fork).
 Same upstream base commit; only source.patch changed.
+
+What changed in revision 17
+----------------------------
+A later live left-side run in --firmware-authoritative mode conclusively demonstrated working
+cooling, circulation, fan control, TEC operation, temperature reduction, and verified shutdown --
+confirming revision 16's pre-enable telemetry race fix held. Four remaining gaps addressed here:
+
+  - Second false firmware-fault positive, fixed structurally: "FW: [temps] 0 reads failed out of
+    1200" (Frozen's own healthy status counter) was classified as explicit_firmware_safety_fault by
+    --firmware-authoritative mode's still-present generic fault-keyword scan (matched the bare word
+    "failed"). Fixed by removing generic keyword-based fault detection from that mode entirely --
+    not by excluding one more word from a growing list -- so an automatic fault shutdown there now
+    requires a specifically parsed, recognized negative state, same discipline as TecSafetyState.
+    New parse_temps_health_report reports read-failure counts purely descriptively; no count is
+    ever itself a reason to stop. The legacy loop keeps its keyword scan, now also excluding
+    "[temps]" messages as a narrower, defensive fix for the same evidence.
+  - Fan telemetry corrected from side-scoped to global: "[top-fan]"/"[bottom-fan]" messages name no
+    cooling side (Hub-wide thermal management), but both active loops' "fan telemetry observed"
+    check required the selected side's own tag, which a fan message could never contain. New
+    parse_fan_report is never side-scoped; --firmware-authoritative reports top/bottom fan
+    activity, latest duty/RPM, and max RPM.
+  - The fixed 2.0C host-side cooling-delta maximum was removed entirely, not replaced with another
+    guessed cap -- enable_cooling now only requires a positive, finite delta and a target within
+    the unchanged 0-45C absolute backstop; Frozen remains responsible for thermal/current safety.
+    A resulting delta above 2.0C requires the auditable --confirm-large-temperature-delta flag
+    (never a new maximum). New --target-c sets an absolute target directly, mutually exclusive with
+    --delta-c, validated against the measured baseline once known. 1.0C default unchanged, never a
+    maximum.
+  - Every interactive typed confirmation phrase was removed (the water-loop phrase, the per-side
+    start phrase, the reservoir phrase, the extended-duration phrase). The four required
+    --confirm-* flags remain; --confirm-extended-test and --confirm-large-temperature-delta replace
+    the phrases that gated those two situations. New --non-interactive documents the (now sole)
+    non-interactive behavior explicitly. The post-run operator questionnaire was deleted outright;
+    the report now always includes "operator observation: not collected" for anything this tool
+    cannot verify electronically. New --operator-note attaches optional free text, never required.
+
+8 net new tests (259 total, up from 251). See TEST_RESULTS.md for the full writeup.
 
 What changed in revision 16
 ----------------------------

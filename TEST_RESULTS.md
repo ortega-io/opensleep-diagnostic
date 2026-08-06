@@ -1,11 +1,84 @@
 # TEST_RESULTS.md — opensleep-diagnostic
 
-All 251 unit/integration tests in `src/bin/opensleep-diagnostic/` pass (up from 244; see the
+All 259 unit/integration tests in `src/bin/opensleep-diagnostic/` pass (up from 251; see the
 revision note directly below), plus the 51 pre-existing `opensleep` library tests (unmodified,
-reused as-is) and 0 doc-tests — 302 total, 0 failed. Verified inside the
+reused as-is) and 0 doc-tests — 310 total, 0 failed. Verified inside the
 `messense/rust-musl-cross:aarch64-musl` builder image via `cargo test --locked` under its built-in
 QEMU aarch64 runner (the same environment the release binary is built in) as part of the
-diagnostic-v16 release build -- see `build-report.txt`.
+diagnostic-v17 release build -- see `build-report.txt`.
+
+## Revision note: full firmware-authoritative cooling tests -- remove the 2.0C delta cap, all
+## typed confirmations, the operator questionnaire, and fix a second false firmware-fault positive
+
+A later live left-side run in `--firmware-authoritative` mode *conclusively demonstrated working
+cooling, circulation, fan control, TEC operation, temperature reduction, and verified shutdown* --
+confirming the pre-enable telemetry race from the previous revision was genuinely fixed. Four
+remaining gaps were addressed in this revision, all scoped to `frozen-cool-test`:
+
+* **A second false firmware-fault positive, fixed structurally this time.** Frozen sent `FW:
+  [temps] 0 reads failed out of 1200` -- its own healthy status counter -- and
+  `--firmware-authoritative` mode's still-present generic fault-keyword scan classified it as
+  `explicit_firmware_safety_fault` because the scan matched the bare word `"failed"` anywhere in
+  the message. Fixed by removing generic keyword-based fault detection from
+  `--firmware-authoritative` mode entirely, rather than adding yet another excluded word to a list
+  that keeps growing: an automatic firmware-fault shutdown in that mode now requires a specifically
+  parsed, recognized negative state (the same discipline `TecSafetyState` already enforced) --
+  every other firmware `Message`, however worded, is observational and nonterminal. New
+  `cool_test::parse_temps_health_report` recognizes `"[temps] <failed> reads failed out of
+  <total>"` and reports it purely descriptively
+  (`temperature_reads_failed`/`_total`/`_ratio`) -- no count is ever itself a reason to stop. The
+  legacy active loop keeps its keyword scan (unchanged), with `"[temps]"` messages now also
+  excluded there as a narrower, defensive fix for the same real evidence.
+* **Fan telemetry corrected from side-scoped to global.** `"FW: [top-fan] <duty> @ <rpm> rpm"` /
+  `"FW: [bottom-fan] <duty> @ <rpm> rpm"` name no cooling side at all -- both fans are Hub-wide
+  thermal management. Both active loops' "was fan telemetry observed" check previously required the
+  selected side's own bracket tag to appear in a fan message, which it structurally never could.
+  New `cool_test::parse_fan_report` is never side-scoped; `--firmware-authoritative` now reports
+  `top_fan_activity_observed`/`latest_duty`/`latest_rpm`/`max_rpm` and the `bottom_fan_*`
+  equivalents, and its "no fan telemetry" warning fires only when *neither* fan produced any.
+* **The fixed 2.0C host-side cooling-delta maximum was removed entirely**, not replaced with
+  another guessed cap. `safety::FrozenAction::enable_cooling` now only requires a positive, finite
+  delta and a resulting target within the existing, unchanged conservative 0-45C absolute backstop
+  -- Frozen firmware remains responsible for PID regulation, TEC current protection, thermal
+  protection, and target maintenance, exactly as `--firmware-authoritative` mode already assumed.
+  A resulting delta above 2.0C now requires the auditable `--confirm-large-temperature-delta`
+  acknowledgement (never itself a new maximum). New `--target-c` sets an absolute target directly,
+  mutually exclusive with `--delta-c`, validated against the measured baseline once known --
+  checked in `run_core` after baseline collection, distinct from `--delta-c`'s own early check in
+  `run()` (which can run before any hardware access, since that delta is known from the CLI args
+  alone). The 1.0C default is unchanged and was never the maximum.
+* **Every interactive typed confirmation phrase was removed**: `I CONFIRM THE WATER LOOP IS
+  CONNECTED AND FILLED`, the second phrase naming the selected side, `RESERVOIR INDICATOR IS STILL
+  WORKING`, and `RUN EXTENDED COOLING TEST FOR UP TO 15 MINUTES`. The four required `--confirm-*`
+  flags remain; `--confirm-extended-test` (duration above 300s) and
+  `--confirm-large-temperature-delta` (delta above 2.0C) replace the phrases that used to gate
+  those two specific situations, checked purely from the command line. New `--non-interactive` is
+  the explicit, documented flag for this behavior (in effect the only behavior now, since there is
+  no more interactive alternative to fall back to). The post-run operator questionnaire
+  (`prompt_observations`, `"Pump heard/felt?"` etc.) was deleted outright -- `frozen-cool-test`'s
+  report now always includes `"operator observation: not collected"` for anything this tool cannot
+  verify electronically, rather than pausing for input or letting a missing answer make the run
+  look like it failed. New `--operator-note` attaches optional free text; it is never required and
+  never prompted for.
+
+8 net new tests (259 total, up from 251): the exact live-hardware `[temps]` false positive
+(`temps_zero_reads_failed_is_healthy_not_a_fault` and an end-to-end
+`temps_and_fan_telemetry_do_not_stop_firmware_authoritative_cooling_and_are_reported` test that
+also proves fan telemetry is recorded correctly), fan-format parsing
+(`fan_report_parses_duty_and_rpm_with_no_side_identifier`,
+`fan_report_never_matches_the_other_fan_or_unrelated_messages`), no fixed delta maximum
+(`large_delta_without_confirmation_flag_is_refused`, `large_delta_is_accepted_with_the_confirmation_flag`,
+`target_c_resulting_in_a_large_delta_is_refused_post_baseline_without_the_confirmation_flag` in
+`cool_test.rs`, plus `cooling_delta_has_no_fixed_maximum_at_construction`,
+`cooling_delta_still_respects_the_conservative_absolute_backstop`,
+`cooling_delta_cannot_be_zero` in `safety.rs`), and a non-interactive completion proof
+(`non_interactive_run_never_blocks_on_a_confirmation_phrase`). Every duration/confirmation test that
+referenced a removed phrase constant was updated to check the corresponding flag instead
+(`durations_above_three_hundred_seconds_require_the_extended_confirmation_flag`,
+`duration_at_or_below_three_hundred_seconds_never_needs_the_extended_confirmation_flag`,
+`correct_extended_duration_flag_lets_the_run_proceed_past_that_gate`); the obsolete reservoir-phrase
+test was replaced with `target_c_resulting_in_a_large_delta_is_refused_post_baseline_without_the_confirmation_flag`,
+exercising the one remaining post-baseline confirmation gate directly.
 
 ## Revision note: add `--firmware-authoritative`, an optional narrower active-phase mode
 

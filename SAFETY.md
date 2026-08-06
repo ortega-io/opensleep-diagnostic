@@ -29,8 +29,12 @@ conditions and refuses to start unless it receives explicit confirmation, every 
 * The hydraulic loop must be connected and filled before this mode is started.
 * Visually check for leaks before starting.
 * This binary structurally cannot verify "is the cover physically connected" — it can only trust
-  the four `--confirm-*` flags and the typed confirmation phrases described below. **You, the
-  operator, are the safety interlock for this precondition.**
+  the four required `--confirm-*` flags described below. **You, the operator, are the safety
+  interlock for this precondition.** There are no interactive typed confirmation phrases: a
+  live-hardware run conclusively demonstrated working cooling, circulation, fan control, TEC
+  operation, temperature reduction, and verified shutdown, and every phrase this mode previously
+  asked for has been replaced by an explicit, auditable command-line flag instead — see "Required
+  confirmations" below and `cli.rs`'s `--non-interactive` doc comment.
 
 **Startup and shutdown now use the same narrow model as `--release-frozen-only`.** This mode no
 longer runs this binary's own reimplemented four-register I2C reset sequence at startup, and no
@@ -43,9 +47,10 @@ write) at shutdown. Instead:
   `opensleep::reset::ResetController`, never the four-register full reset sequence, never register
   `0x07`. See that mode's own section above for the full pulse mechanics and the real-hardware
   evidence behind them.
-* A **third** confirmation phrase, `RESERVOIR INDICATOR IS STILL WORKING`, is required — after
-  Frozen has reached application firmware and the baseline has validated, immediately before the
-  cooling target is enabled. See "Required confirmations" below.
+* There is no longer a typed reservoir confirmation immediately before enabling cooling. Watch the
+  reservoir yourself if you have any doubt about it; `--confirm-water-loop-filled` remains
+  required, and Frozen firmware's own telemetry (`[capwater]`/`[flowrate]` sensor-unavailable
+  messages, when present) is recorded either way.
 * On normal completion, `DurationExpired`, reaching the requested target temperature, or a clean
   Ctrl+C/SIGTERM/SIGHUP, shutdown disables both sides over UART (three repeated attempts) and
   performs **no I2C write at all** — Frozen is left released and running, exactly as
@@ -287,20 +292,31 @@ PROTOCOL_AUDIT.md.
 
 * Exactly one side per invocation; cooling only (no heating) in this first build. The other side is
   explicitly disabled before the test starts and stays that way for the whole run.
-* Default cooling delta: 1.0C below the measured baseline. **Maximum permitted delta: 2.0C** —
-  `safety::FrozenAction::enable_cooling` refuses to construct a command for a larger delta. This
-  cap is unchanged by the duration/startup changes below.
+* Default cooling delta: 1.0C below the measured baseline, used only when neither `--delta-c` nor
+  `--target-c` is supplied — this default is not a maximum. **There is no fixed host-side maximum
+  delta any more**: a live-hardware run conclusively demonstrated working cooling, circulation, fan
+  control, TEC operation, temperature reduction, and verified shutdown well above the former 2.0C
+  cap, and `safety::FrozenAction::enable_cooling` no longer refuses to construct a command purely
+  for exceeding it — Frozen firmware itself remains responsible for PID regulation, TEC current
+  protection, thermal protection, and target maintenance. A resulting delta above 2.0C requires the
+  explicit `--confirm-large-temperature-delta` acknowledgement (an audit trail, not a second hidden
+  cap). `enable_cooling` still refuses a non-positive delta and a resulting target outside a
+  conservative 0–45C absolute backstop, independent of delta size. `--target-c` sets an absolute
+  target directly instead of a delta below baseline; it is mutually exclusive with `--delta-c` and
+  validated against the measured baseline once that's known.
 * Default active duration: **120 seconds** — long enough to establish meaningful water-temperature
   movement through the filled cover loop. **Absolute maximum: 900 seconds (15 minutes)** —
   `cool_test::run` refuses to start at all if `--duration-seconds` exceeds this. Requesting more
-  than 300 seconds requires an additional, exact typed confirmation (`RUN EXTENDED COOLING TEST
-  FOR UP TO 15 MINUTES`) and prints a reminder that the operator must remain present for the whole
-  run and continuously monitor for leaks, a burning smell, abnormal pump noise, loss of
-  circulation, or unexpected heating. A long duration is not a long minimum wait: the test always
-  stops early once the requested target temperature is reached *and stays reached* for a short
-  confirmation window (never on a single noisy sample, and the TEC is never kept enabled merely to
-  consume the rest of the requested duration once that's confirmed), a safety condition triggers,
-  communication with Frozen is lost, or the operator interrupts (see below).
+  than 300 seconds requires the explicit `--confirm-extended-test` acknowledgement and prints a
+  reminder that the operator must remain present for the whole run and continuously monitor for
+  leaks, a burning smell, abnormal pump noise, loss of circulation, or unexpected heating. A long
+  duration is not a long minimum wait: in the legacy active loop, the test always stops early once
+  the requested target temperature is reached *and stays reached* for a short confirmation window
+  (never on a single noisy sample, and the TEC is never kept enabled merely to consume the rest of
+  the requested duration once that's confirmed); in `--firmware-authoritative` mode, target
+  attainment is logged but no longer stops the test early at all (Frozen keeps maintaining it for
+  the rest of the requested duration). Either mode still stops early if a safety condition
+  triggers, communication with Frozen is lost, or the operator interrupts (see below).
 * The selected TEC's safety-interlock state is parsed into explicit states
   (`cool_test::TecSafetyState`), not matched by raw substring: `"safe, unlocking"` and `"unlocked"`
   are positive, non-fault transitions; only `"unsafe, locking"` and the exact word `"locked"` are
@@ -373,8 +389,13 @@ into shutdown that skips this.
 * Frozen reports the selected side disabled on its own, after this tool enabled it.
 * A firmware message contains a fault keyword (overtemperature, overcurrent, shutdown, fault,
   failed, locked) more than 2 seconds into the active phase — giving a brief startup grace period
-  so ordinary boot-time chatter isn't mistaken for a fault. As with the TEC check, "locked" here is
-  matched by exact word, not substring — it does not match `"unlocked"`.
+  so ordinary boot-time chatter isn't mistaken for a fault. As with the TEC check, "locked"/"fault"
+  here are matched by exact word, not substring — "locked" does not match `"unlocked"`, "fault"
+  does not match `"default"`. `"flash locked"` and any `"[temps]"` health-report message (e.g.
+  `"[temps] 0 reads failed out of 1200"`, real firmware's own zero-failure status counter) are
+  excluded outright, regardless of which words they contain — legacy-mode-only: see
+  `--firmware-authoritative` below for why that mode removed keyword-based fault detection
+  entirely instead of adding more excluded cases.
 * **You type `ABORT` and press Enter** (or a report of a leak, smell, or noise — see below).
 
 ### TEC safety-interlock false positive (fixed)
@@ -422,10 +443,7 @@ TEC false positive above, but this time in the pump-confirmation logic instead o
 parser.
 
 `--firmware-authoritative` is an opt-in flag for `frozen-cool-test` that removes this entire class
-of host-side inference. Every requirement above this section — the four required `--confirm-*`
-flags, both typed confirmation phrases, the baseline collection and validation, the 2.0C delta cap,
-the 120s default / 900s hard-maximum duration, the extended-duration confirmation above 300s — is
-completely unchanged. What changes is what happens *after* the target is confirmed enabled:
+of host-side inference. What changes is what happens *after* the target is confirmed enabled:
 
 * Frozen firmware becomes the sole authority on pump sequencing, TEC ramping, PID control, solenoid
   control, fan control, current safety, thermal regulation, and target maintenance. This tool
@@ -451,14 +469,45 @@ completely unchanged. What changes is what happens *after* the target is confirm
 * Positive evidence is still tracked and reported even though its *absence* is never a fault: pump
   command/status messages (both the `"pump[<side>] ... @ <V>V <A>A"` format and the
   `"[pump-<side>] <command>=><value>"` format — both captured from the same incident), TEC current
-  and safety-interlock messages, and observed target attainment. Missing TEC-current, fan, or pump
-  telemetry produces a logged warning, never a stop.
+  and safety-interlock messages, `[temps]` read-health telemetry, both fans' telemetry, and observed
+  target attainment. Missing TEC-current, fan, or pump telemetry produces a logged warning, never a
+  stop.
 * An independent shutdown guard, armed only once the target is confirmed enabled (never for
   `--dry-run`), runs as a genuinely separate OS process — not a thread — so it survives the main
   process crashing, hanging, or being killed outright, which an in-process construct cannot. It
   uses the same disable-first, narrow-emergency-reset-only-as-last-resort sequence as every other
   shutdown path in this tool, and only fires if the main process's own verified shutdown never
   disarms it before its own timer (the requested duration plus a 30-second grace period) elapses.
+
+### The next false positive: `"0 reads failed out of 1200"` (fixed)
+
+A later left-side run *conclusively demonstrated working cooling, circulation, fan control, TEC
+operation, temperature reduction, and verified shutdown* in `--firmware-authoritative` mode — the
+pre-enable race above was confirmed fixed. But the same class of bug resurfaced once more: Frozen
+sent `FW: [temps] 0 reads failed out of 1200` — its own healthy status counter, zero failures — and
+the generic firmware-fault keyword scan this mode still ran classified it as
+`explicit_firmware_safety_fault`, because the scan matched the word `"failed"` anywhere in the
+message, regardless of context.
+
+Fixed by removing generic keyword-based fault detection from `--firmware-authoritative` mode
+**entirely** — not by adding another excluded word to the list (the same trap that keeps
+recurring), but structurally: an automatic firmware-fault shutdown in this mode now requires a
+specifically parsed, recognized negative state, exactly like `TecSafetyState` already was. A
+firmware `Message` this tool cannot specifically parse and recognize as negative is always
+observational and nonterminal, no matter what words it contains. `"[temps] <N> reads failed out of
+<M>"` is now its own parser (`cool_test::parse_temps_health_report`), reported as
+`temperature_reads_failed`/`temperature_reads_total`/`temperature_read_failure_ratio` — purely
+descriptive, never itself a reason to stop at any count. The legacy (non-`--firmware-authoritative`)
+active loop keeps its keyword scan (unchanged, still evidence-gated and word-exact where a prior
+incident required it — see above), with `"[temps]"` messages now also excluded there as a direct,
+narrower fix for the same evidence.
+
+Also fixed in the same pass: fan telemetry (`"FW: [top-fan] <duty> @ <rpm> rpm"` /
+`"FW: [bottom-fan] <duty> @ <rpm> rpm"`) is Hub-wide thermal management, not scoped to either
+cooling side — real captured messages have no left/right identifier at all. Both loops' "was fan
+telemetry observed" check no longer looks for the selected side's own tag (which a fan message
+could never contain), and `--firmware-authoritative` reports `top_fan_*`/`bottom_fan_*` activity,
+latest duty/RPM, and max RPM directly.
 
 `--firmware-authoritative` does not change the required confirmations, the hard limits, or the
 guaranteed shutdown sequence below — it changes what the active phase watches for and what it does
@@ -503,28 +552,22 @@ All of the following are required; missing any one refuses the run before any I2
 --confirm-active-test
 ```
 
-Additionally, unless standard input is not a TTY, you must type the exact phrase:
+There are no interactive typed confirmation phrases: a live-hardware run conclusively demonstrated
+working cooling, circulation, fan control, TEC operation, temperature reduction, and verified
+shutdown, and every phrase this mode previously asked for (`I CONFIRM THE WATER LOOP IS CONNECTED
+AND FILLED`, a second phrase naming the selected side, and a third reservoir-indicator phrase) has
+been removed. The command never pauses to wait for typed input; `--non-interactive` documents this
+explicitly and additionally guarantees no post-run questionnaire either (see below). Two more
+command-line flags are required only in the specific situations they apply to:
 
-```
-I CONFIRM THE WATER LOOP IS CONNECTED AND FILLED
-```
+* `--confirm-extended-test` — required when `--duration-seconds` exceeds 300. Replaces the former
+  `RUN EXTENDED COOLING TEST FOR UP TO 15 MINUTES` phrase.
+* `--confirm-large-temperature-delta` — required when the requested (or, via `--target-c`,
+  computed) cooling delta exceeds 2.0C. An auditable acknowledgement only, not a second maximum —
+  see "Active-test limits" above.
 
-...and, after preflight validates the baseline and prints the proposed target, a second exact
-phrase naming the selected side, e.g.:
-
-```
-START LEFT COOLING TEST
-```
-
-...and, immediately before the cooling target is actually enabled (after Frozen has reached
-application firmware), a **third** exact phrase:
-
-```
-RESERVOIR INDICATOR IS STILL WORKING
-```
-
-Only type this if the reservoir-fill indicator is genuinely still responding. None of the three
-confirmations accepts `yes`/`no`/a shortened form.
+A fully specified command with every flag it needs proceeds straight through to enabling cooling
+with no further prompts.
 
 ## Required confirmations before `frozen-prime-test` can run
 
