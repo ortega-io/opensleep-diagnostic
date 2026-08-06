@@ -17,8 +17,9 @@ Five subcommands:
   that releases Frozen from reset with a single-bit I2C pulse instead of the full upstream reset
   sequence — see that flag's own section below and in SAFETY.md.
 * `opensleep-diagnostic frozen-cool-test` — intentionally activates one cooling channel; requires
-  a connected, *already-filled* hydraulic loop and multiple explicit confirmations. **Read
-  SAFETY.md before running this.**
+  a connected, *already-filled* hydraulic loop and multiple explicit confirmations. Starts Frozen
+  the same narrow way `--release-frozen-only` does, and performs no I2C write at all on a normal
+  stop. **Read SAFETY.md before running this.**
 * `opensleep-diagnostic emergency-stop` — independent fast-path disable + reset-assert.
 
 ## 1. Copy the binary to the Pod
@@ -385,20 +386,28 @@ negative just because the confirmation was never reached).
   Emergency reset asserted:        true/false
   ```
 
-## 7. Once the loop is confirmed filled: run a 10-second cooling test on one side
+## 7. Once the loop is confirmed filled: run a cooling test on one side
 
 Only proceed here once you've confirmed water movement and a stable reservoir level from step 6
 (or already knew the loop was filled and skipped step 6).
 
-`--delta-c 1.0` and `--duration-seconds 10` are both already the defaults for a first test; they're
-spelled out below for clarity. Only the selected side is ever enabled -- the other side is
-explicitly disabled before the test starts and stays that way for the whole run.
+`--delta-c 1.0` and `--duration-seconds 120` are both already the defaults; they're spelled out
+below for clarity. Only the selected side is ever enabled -- the other side is explicitly disabled
+before the test starts and stays that way for the whole run. A 120-second default is not a long
+minimum wait: the test always stops early once the requested target temperature is reached, a
+safety condition triggers, communication with Frozen is lost, or you interrupt it.
+
+**This mode now starts Frozen the same way `--release-frozen-only` does** (see that flag's own
+section above and SAFETY.md) -- a narrow, single-bit I2C pulse, never the full upstream reset --
+and, on a normal stop, its own shutdown performs **no I2C write at all**, leaving Frozen released
+and running (never the old always-assert-0x20-reset behavior). Read SAFETY.md's `frozen-cool-test`
+section before running this if you haven't already.
 
 ```sh
 /persistent/tools/opensleep-diagnostic frozen-cool-test \
     --side left \
     --delta-c 1.0 \
-    --duration-seconds 10 \
+    --duration-seconds 120 \
     --confirm-cover-hydraulics-connected \
     --confirm-water-loop-filled \
     --confirm-no-visible-leaks \
@@ -414,13 +423,21 @@ You will be asked to type, exactly:
 I CONFIRM THE WATER LOOP IS CONNECTED AND FILLED
 ```
 
-The tool will then run preflight (reset, enter firmware, collect >= 5 baseline samples over >= 5
-seconds, validate the baseline is within 15–35C and internally consistent), print the proposed
-target, and ask for a second exact phrase:
+The tool will then run preflight (release Frozen from reset, enter firmware, collect >= 5 baseline
+samples over >= 10 seconds, validate the baseline is within 15–35C and internally consistent),
+print the proposed target, and ask for a second exact phrase:
 
 ```
 START LEFT COOLING TEST
 ```
+
+...and, immediately before the cooling target is actually enabled, a **third** exact phrase:
+
+```
+Type RESERVOIR INDICATOR IS STILL WORKING to continue:
+```
+
+Only type this if the reservoir-fill indicator is genuinely still responding.
 
 During the active phase, watch/listen (without touching or metering the open board) for:
 
@@ -432,13 +449,21 @@ During the active phase, watch/listen (without touching or metering the open boa
 
 If you observe any of the last three, **type `ABORT` (or a word like `LEAK`) and press Enter**, or
 press **Ctrl+C** immediately, or run `emergency-stop` from your second session -- all three stop
-the test the same way. The tool itself also aborts automatically on: lost/stale telemetry (> 2s), a
-UART read/write failure, an implausible temperature jump, the heatsink or water-temperature limits
-being exceeded, the selected pump still reporting off/0V more than 3 seconds after being enabled,
-a firmware message reporting the selected TEC locked, Frozen disabling the selected side on its
-own, a firmware fault-keyword message after a brief startup grace period, or the (non-overridable,
-30-second-max) duration expiring -- see SAFETY.md for the full list. It always runs the same
-safe-stop sequence regardless of why it stopped.
+the test. Pressing Ctrl+C does **not** exit immediately: the process disables both sides over UART
+(three repeated attempts) before it exits, exactly like every other stop reason, and (unlike
+before) performs no I2C write at all for a clean interrupt. The tool itself also stops
+automatically on: reaching the requested target temperature (not a fault -- reported as
+`target_reached`), lost/stale telemetry (> 2s), a UART read/write failure, an implausible
+temperature jump, the heatsink or water-temperature limits being exceeded, the selected pump still
+reporting off/0V more than 3 seconds after being enabled, a firmware message reporting the selected
+TEC locked, Frozen disabling the selected side on its own, a firmware fault-keyword message after a
+brief startup grace period, or the (non-overridable, 300-second-max) duration expiring -- see
+SAFETY.md for the full list. Only a genuine fault among these, combined with UART-based shutdown
+confirmation failing, triggers the narrow emergency I2C reset; every other stop reason performs no
+I2C write.
+
+By default, raw hexadecimal RX/TX byte dumps are never printed (even with `--verbose`) -- add
+`--raw-serial-log` if you specifically need them; it works independently of `--verbose`.
 
 At the end, you'll be prompted for operator observations (pump heard/felt, fan seen/heard, airflow
 felt, leak observed, unusual smell/noise, free-text notes). These are stored in the JSON report as

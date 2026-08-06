@@ -32,6 +32,31 @@ conditions and refuses to start unless it receives explicit confirmation, every 
   the four `--confirm-*` flags and the typed confirmation phrases described below. **You, the
   operator, are the safety interlock for this precondition.**
 
+**Startup and shutdown now use the same narrow model as `--release-frozen-only`.** This mode no
+longer runs this binary's own reimplemented four-register I2C reset sequence at startup, and no
+longer runs the shared `safe_stop::run_safe_stop` (with its unconditional, hardcoded-0xFF I2C
+write) at shutdown. Instead:
+
+* Startup releases Frozen from reset via the exact same shared implementation
+  (`frozen_startup::start_frozen_narrow`, built on `i2c::pulse_frozen_reset_bit`) that
+  `frozen-prime-opensleep-init --release-frozen-only` uses — never
+  `opensleep::reset::ResetController`, never the four-register full reset sequence, never register
+  `0x07`. See that mode's own section above for the full pulse mechanics and the real-hardware
+  evidence behind them.
+* A **third** confirmation phrase, `RESERVOIR INDICATOR IS STILL WORKING`, is required — after
+  Frozen has reached application firmware and the baseline has validated, immediately before the
+  cooling target is enabled. See "Required confirmations" below.
+* On normal completion, `DurationExpired`, reaching the requested target temperature, or a clean
+  Ctrl+C/SIGTERM/SIGHUP, shutdown disables both sides over UART (three repeated attempts) and
+  performs **no I2C write at all** — Frozen is left released and running, exactly as
+  `--release-frozen-only` leaves it. Only if that UART-based confirmation fails *and* the stop
+  reason is a genuine fault (TEC locked, a firmware fault message, temperature/heatsink out of
+  range, an implausible jump, the pump not confirmed running, Frozen disabling the target on its
+  own, telemetry lost/stale, a UART read/write failure, an internal panic, or an operator-reported
+  leak/smell/noise) does it fall back to the narrow, bit-1-only `i2c::assert_frozen_reset_bit_only`
+  — never the full reset, never registers `0x06`/`0x07`. See "Safe-stop" below for how this differs
+  from every other active mode.
+
 ### `frozen-prime-test` — an active test; **fills an empty or partially-filled loop**
 
 `frozen-prime-test` intentionally sends `Prime` (opcode `0x52`) exactly once, to run the hydraulic
@@ -263,10 +288,16 @@ PROTOCOL_AUDIT.md.
 * Exactly one side per invocation; cooling only (no heating) in this first build. The other side is
   explicitly disabled before the test starts and stays that way for the whole run.
 * Default cooling delta: 1.0C below the measured baseline. **Maximum permitted delta: 2.0C** —
-  `safety::FrozenAction::enable_cooling` refuses to construct a command for a larger delta.
-* Default active duration: **10 seconds**, chosen conservatively for a first test. **Absolute
-  maximum: 30 seconds** — `cool_test::run` refuses to start at all if `--duration-seconds` exceeds
-  this.
+  `safety::FrozenAction::enable_cooling` refuses to construct a command for a larger delta. This
+  cap is unchanged by the duration/startup changes below.
+* Default active duration: **120 seconds** — long enough to establish meaningful water-temperature
+  movement through the filled cover loop. **Absolute maximum: 300 seconds** — `cool_test::run`
+  refuses to start at all if `--duration-seconds` exceeds this. A long duration is not a long
+  minimum wait: the test always stops early once the requested target temperature is reached, a
+  safety condition triggers, communication with Frozen is lost, or the operator interrupts (see
+  below).
+* The baseline is now collected over **at least 10 seconds** of stable samples (up from 5), from
+  multiple unsolicited `TemperatureUpdate` pushes — never a single reading.
 * The baseline water temperature must fall within **15.00C–35.00C**
   (`cool_test::MIN_WATER_CENTIDEG`/`MAX_WATER_CENTIDEG`) before the test proceeds. This range is a
   conservative, compile-time choice (not derived from a documented firmware spec — see
@@ -312,6 +343,11 @@ Firmware messages reporting `[capwater]` or `[flowrate]` sensor unavailable are 
 warnings, not treated as an automatic abort condition on their own — they have been observed with
 the cover connected and the reservoir filled, and flow itself is not exercised until a pump
 actually runs during an active test.
+
+**Not a fault, but also ends the active phase early:** once the selected side's live temperature
+reaches the computed target (baseline minus the requested delta), the test stops on its own rather
+than continuing to cool for the rest of the configured duration — reported as `target_reached` in
+the JSON output, distinct from every fault condition above.
 
 ### Typing ABORT during `frozen-cool-test`'s active phase
 
@@ -374,7 +410,15 @@ phrase naming the selected side, e.g.:
 START LEFT COOLING TEST
 ```
 
-Neither confirmation accepts `yes`/`no`/a shortened form.
+...and, immediately before the cooling target is actually enabled (after Frozen has reached
+application firmware), a **third** exact phrase:
+
+```
+RESERVOIR INDICATOR IS STILL WORKING
+```
+
+Only type this if the reservoir-fill indicator is genuinely still responding. None of the three
+confirmations accepts `yes`/`no`/a shortened form.
 
 ## Required confirmations before `frozen-prime-test` can run
 
@@ -417,10 +461,10 @@ Neither confirmation accepts `yes`/`no`/a shortened form.
 One shared-pattern routine (`safe_stop::run_safe_stop`) runs before every active test, on normal
 completion, on Ctrl+C/SIGTERM/SIGHUP, on timeout, on any communication or telemetry error, and
 (via a `catch_unwind` boundary around the per-tick evaluation logic) after an internal panic in
-that logic — in `frozen-cool-test`, `frozen-prime-test`, and `emergency-stop` alike. It always:
-sends `SetTargetTemperature(enabled=false)` for LEFT and RIGHT three times with short delays,
-flushes the UART, and asserts `0x20` subsystem reset (`reg 0x02 <- 0xFF`), leaving the subsystem in
-that asserted-reset state. A run is only reported PASS if this completes successfully. If the UART
+that logic — in `frozen-prime-test` and `emergency-stop` alike. It always: sends
+`SetTargetTemperature(enabled=false)` for LEFT and RIGHT three times with short delays, flushes the
+UART, and asserts `0x20` subsystem reset (`reg 0x02 <- 0xFF`), leaving the subsystem in that
+asserted-reset state. A run is only reported PASS if this completes successfully. If the UART
 disable fails but the I2C reset succeeds, the run is reported **degraded**, not PASS. If the I2C
 reset *also* fails, the program prints an explicit instruction to disconnect Hub power immediately.
 
@@ -429,6 +473,18 @@ every invocation — even when `"priming done"` was observed.** No Prime-cancell
 in the reused protocol (see PROTOCOL_AUDIT.md), so subsystem reset is the only forced-stop
 mechanism available; it is not a substitute for a graceful "stop priming" command, because none
 exists to substitute for.
+
+**`frozen-cool-test` is the one exception: it never calls `safe_stop::run_safe_stop`.** Its own
+shutdown (`cool_test::run_cool_test_shutdown`) sends the same three repeated
+`SetTargetTemperature(enabled=false)` attempts and flushes the UART, but asserts **no** I2C reset
+at all on a normal stop — only the narrow, bit-1-only `i2c::assert_frozen_reset_bit_only` (never
+the shared routine's hardcoded-0xFF `i2c::assert_reset`), and only when UART-based confirmation
+failed for a genuine fault (see "Startup and shutdown" in this mode's own section above). A run is
+reported PASS only if either UART confirmation or the emergency reset succeeded; if UART
+confirmation failed and no fault warranted the emergency reset (a duration/target-reached/Ctrl+C
+stop with a non-responsive link), shutdown is reported unverified and the program prints an
+explicit warning to reboot the Hub or disconnect power if cooling does not visibly stop —
+`frozen-cool-test` never overwrites bits it doesn't need to touch just to force a PASS.
 
 ## Keep a second session open
 

@@ -1,11 +1,80 @@
 # TEST_RESULTS.md — opensleep-diagnostic
 
-All 166 unit/integration tests in `src/bin/opensleep-diagnostic/` pass (up from 162; see the
+All 186 unit/integration tests in `src/bin/opensleep-diagnostic/` pass (up from 166; see the
 revision note directly below), plus the 51 pre-existing `opensleep` library tests (unmodified,
-reused as-is) and 0 doc-tests — 217 total, 0 failed. Verified inside the
+reused as-is) and 0 doc-tests — 237 total, 0 failed. Verified inside the
 `messense/rust-musl-cross:aarch64-musl` builder image via `cargo test --locked` under its built-in
 QEMU aarch64 runner (the same environment the release binary is built in) as part of the
-diagnostic-v11 release build -- see `build-report.txt`.
+diagnostic-v12 release build -- see `build-report.txt`.
+
+## Revision note: rework `frozen-cool-test` onto the narrow startup model; fix an unbounded-write hang
+
+`frozen-cool-test` previously ran this binary's own reimplemented four-register I2C reset sequence
+at startup and the shared, always-assert-0x20-reset `safe_stop::run_safe_stop` at shutdown. Both
+are replaced:
+
+* **Shared narrow startup.** The pulse-based startup logic (I2C release, boot-message drain,
+  Ping/JumpToFirmware retry) was extracted out of `prime_opensleep_init.rs` into a new module,
+  `frozen_startup.rs` (`start_frozen_narrow`), and both `--release-frozen-only` and
+  `frozen-cool-test` now call the same implementation -- proven directly (not just by source
+  scanning) in `cool_test::tests::cool_test_and_release_frozen_only_use_the_same_shared_narrow_startup`.
+  `cool_test.rs` never references `ResetController::`/`run_reset_sequence(` -- enforced by a local
+  guardrail test (needles require actual call syntax, not a bare mention, since this file's own
+  module docs legitimately discuss both names in prose).
+* **Cool-test's own narrow shutdown.** `run_cool_test_shutdown` disables both sides over UART
+  (three repeated attempts, matching `safe_stop`'s cadence) and performs **no I2C write at all** on
+  a normal stop (`DurationExpired`, the new `TargetTemperatureReached`, or a clean
+  Ctrl+C/SIGTERM/SIGHUP) -- only falling back to the narrow, bit-1-only
+  `i2c::assert_frozen_reset_bit_only` if UART-based confirmation failed *and* the stop reason is a
+  genuine fault. Confirmation is read directly from each disable command's own `TargetUpdate`
+  reply (the real protocol's actual ack mechanism), not a separate passive listen -- an earlier
+  version of this routine waited a flat, wasted window every time because it only listened for an
+  *unsolicited* push that the protocol never sends for this case; fixed before release.
+* **A third confirmation phrase**, `RESERVOIR INDICATOR IS STILL WORKING`, is now required
+  immediately before the cooling target is enabled, matching `--release-frozen-only`'s own
+  placement.
+* **Duration bounds changed**: default 120s (was 10s), hard maximum 300s (was 30s); baseline
+  collection window extended to >=10s (was >=5s). The delta cap (2.0C) is unchanged. The test now
+  also stops early once the selected side's live temperature reaches the computed target
+  (`TargetTemperatureReached`), reported as `target_reached` in the JSON output.
+* **Raw RX/TX debug log lines are now off by default everywhere** (previously any subcommand
+  running with `--verbose` printed them, which was extremely noisy) and independent of
+  `--verbose` -- `io_logging::LoggingIo` gained an explicit `raw_log_enabled` boolean, defaulted
+  `false` on every constructor and checked directly before each `log::debug!` call, never inferred
+  from the log crate's own level filtering. `frozen-cool-test` gained the opt-in
+  `--raw-serial-log` flag to turn it back on (the only subcommand with this flag in this revision).
+* **`CoolTestResults`** (new `Report` field) reports: selected side, requested delta, requested and
+  actual duration, baseline/minimum/final left-right-heatsink temperatures, selected/opposite-side
+  and heatsink temperature changes, `target_reached`, selected-TEC/left-pump/right-pump activity
+  observed, `shutdown_verified`, `emergency_reset_asserted`, reservoir status, stop reason, and the
+  startup mode used.
+
+**A genuine, previously-latent hang was found and fixed while testing this revision.**
+`FrozenLink::send()`/`send_only()`/`flush()` transmitted with no timeout at all -- only the *read*
+side of every exchange had ever had a caller-supplied bound. A real-hardware failure mode (a stuck
+or disconnected UART, or -- as reproduced directly in a new test against a non-responsive mock
+device during a long retry loop -- a transport whose write buffer fills and is never drained) could
+hang this diagnostic forever with no way to recover except killing the process. `link.rs` gained a
+`WRITE_TIMEOUT` (3s) applied to every write; this is a safety fix that benefits every subcommand
+using `FrozenLink`, not only `frozen-cool-test`.
+
+**A related exit-code bug was found and fixed in the same pass.** `cool_test.rs`'s internal
+preflight refusals (an enabled target survived safety-off, baseline validation failed, the computed
+cooling target was refused, a confirmation phrase mismatched) never explicitly returned this
+binary's usual 30 -- they fell through to the same 0/21/1 computation an active-test outcome uses.
+Device/communication-level preflight failures (the I2C pulse didn't verify, Frozen never reached
+firmware) correctly remain 20, matching `--release-frozen-only`'s established convention that the
+same `StopReason::PreflightRefused` value can map to different exit codes depending on *why* the
+run was refused. `finish()` now takes an explicit `exit_code` parameter per call site (matching
+`prime_opensleep_init.rs`'s own `finish_release_only` convention) instead of inferring one
+internally.
+
+**20 net new tests (186 total, up from 166):** 13 net new in `cool_test.rs` (the suite grew from
+43 to 56, including tests proving the shared startup, the register-0x06/0x02-only shutdown
+guarantees, the `--raw-serial-log` default and opt-in, `TargetTemperatureReached`, and that
+Ctrl+C specifically triggers both-side disable with no I2C write), 4 new in `frozen_startup.rs`
+(a wholly new module), and 3 new in `io_logging.rs`; `link.rs`'s existing 6 tests are unchanged in
+count but now also exercise the new bounded-write path.
 
 ## Revision note: fix `--release-frozen-only` to configure the reset pin as an output before pulsing it
 

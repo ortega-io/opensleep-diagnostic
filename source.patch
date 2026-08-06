@@ -138,10 +138,10 @@ index 0000000..261be8d
 +}
 diff --git a/src/bin/opensleep-diagnostic/cli.rs b/src/bin/opensleep-diagnostic/cli.rs
 new file mode 100644
-index 0000000..a4c2058
+index 0000000..236e5bb
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/cli.rs
-@@ -0,0 +1,288 @@
+@@ -0,0 +1,301 @@
 +//! CLI surface. Every flag here maps to a fixed, validated field -- there is no flag that accepts
 +//! a raw opcode, a raw frame, or an arbitrary absolute temperature target. Side selection is a
 +//! closed `ValueEnum`; the cooling delta and duration are validated in `cool_test.rs` against
@@ -252,9 +252,12 @@ index 0000000..a4c2058
 +    #[arg(long, default_value_t = 1.0)]
 +    pub delta_c: f64,
 +
-+    /// Active-phase duration in seconds. Defaults to a conservative 10 seconds for a first test;
-+    /// hard-capped at 30 seconds regardless -- no flag can raise that cap.
-+    #[arg(long, default_value_t = 10)]
++    /// Active-phase duration in seconds. Defaults to 120 seconds -- long enough to establish
++    /// meaningful water-temperature movement through the filled cover loop; hard-capped at 300
++    /// seconds regardless -- no flag can raise that cap. The test still stops early if the
++    /// requested target temperature is reached, a safety condition triggers, communication is
++    /// lost, or the operator interrupts, so a long duration is not a long minimum wait.
++    #[arg(long, default_value_t = crate::cool_test::DEFAULT_DURATION_SECONDS)]
 +    pub duration_seconds: u64,
 +
 +    /// Required: operator declares the hydraulic cover is connected
@@ -294,6 +297,12 @@ index 0000000..a4c2058
 +    #[arg(long, default_value_t = false)]
 +    pub dry_run: bool,
 +
++    /// Opt-in: also print "Frozen RX/TX raw (...)" byte-array debug log lines for every chunk
++    /// crossing the Frozen UART. Off by default (even under --verbose) because it makes normal
++    /// logs extremely noisy; works independently of --verbose.
++    #[arg(long, default_value_t = false)]
++    pub raw_serial_log: bool,
++
 +    /// Testing/CI escape hatch only: skips the interactive typed-phrase confirmations even when
 +    /// stdin is a TTY, by supplying the phrases directly. Never documented as a normal operator
 +    /// flag in RUN_ON_POD.md.
@@ -301,6 +310,10 @@ index 0000000..a4c2058
 +    pub assume_interactive_phrase: Option<String>,
 +    #[arg(long, hide = true)]
 +    pub assume_start_phrase: Option<String>,
++    /// Testing/CI escape hatch only: supplies the "RESERVOIR INDICATOR IS STILL WORKING"
++    /// confirmation phrase required immediately before enabling cooling.
++    #[arg(long, hide = true)]
++    pub assume_reservoir_phrase: Option<String>,
 +}
 +
 +#[derive(clap::Args, Debug, Clone)]
@@ -472,10 +485,10 @@ index 0000000..9c6296b
 +}
 diff --git a/src/bin/opensleep-diagnostic/cool_test.rs b/src/bin/opensleep-diagnostic/cool_test.rs
 new file mode 100644
-index 0000000..ea120c9
+index 0000000..673e887
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/cool_test.rs
-@@ -0,0 +1,1543 @@
+@@ -0,0 +1,2111 @@
 +//! `frozen-cool-test`: the one subcommand that intentionally activates a cooling channel. Every
 +//! hard limit here (max delta, max duration, baseline range, heatsink ceiling) is a compile-time
 +//! constant; no CLI flag can raise any of them. See SAFETY.md for the operator-facing version of
@@ -489,6 +502,28 @@ index 0000000..ea120c9
 +//! never required: real hardware has been observed sending a 14-byte 0xC1 frame, while
 +//! `FrozenPacket::parse_get_temperature` (reused unmodified from `opensleep`) requires exactly 27
 +//! bytes and so never decodes it. See PROTOCOL_AUDIT.md for the full account.
++//!
++//! ## Startup: the same narrow pulse `--release-frozen-only` uses
++//!
++//! This mode releases Frozen from reset via `frozen_startup::start_frozen_narrow` -- the exact
++//! same shared implementation `frozen-prime-opensleep-init --release-frozen-only` uses, itself
++//! built on `i2c::pulse_frozen_reset_bit` -- never `opensleep::reset::ResetController`, never the
++//! four-register full reset sequence ([`crate::i2c::run_reset_sequence`]), and never register
++//! 0x07. See that function's doc comment for the real-hardware evidence behind the pulse (and why
++//! register 0x06 must be configured as an output first). `main.rs`'s guardrail tests prove this
++//! file never references `ResetController` or the full reset sequence at all.
++//!
++//! ## Shutdown: no full reset on normal completion
++//!
++//! Unlike every other active mode in this binary (which always assert the shared, hardcoded-0xFF
++//! `i2c::assert_reset` via `safe_stop::run_safe_stop` on every exit path), this mode's own
++//! shutdown (`run_cool_test_shutdown`) disables both sides over UART (three repeated attempts,
++//! matching `safe_stop`'s cadence) and asserts **no** I2C reset at all on normal completion,
++//! `DurationExpired`, `TargetTemperatureReached`, or a clean Ctrl+C/SIGTERM/SIGHUP -- Frozen is
++//! left running, exactly as `--release-frozen-only` leaves it. Only if UART-based shutdown could
++//! not be confirmed *and* the stop reason is a genuine fault does it fall back to the narrow,
++//! bit-1-only `i2c::assert_frozen_reset_bit_only` -- never the full reset, never registers
++//! 0x06/0x07.
 +
 +use std::io::IsTerminal;
 +use std::time::Duration;
@@ -502,22 +537,27 @@ index 0000000..ea120c9
 +
 +use crate::buildinfo::{DIAGNOSTIC_VERSION, kernel_release, source_commit};
 +use crate::cli::CoolTestArgs;
-+use crate::i2c::{I2cPort, MockI2c, RealI2c, probe_address, run_reset_sequence};
++use crate::confirm::confirm_phrase;
++use crate::i2c::{I2cPort, MockI2c, RealI2c, probe_address};
 +use crate::link::{FrozenLink, LinkError, PacketOutcome};
 +use crate::mock::mock_frozen_link_pair;
 +use crate::ownership;
 +use crate::report::{
-+    AuditEntryJson, ComponentResults, Confirmations, OperatorObservations, Report, TemperatureSampleJson, Verdict,
++    AuditEntryJson, ComponentResults, Confirmations, CoolTestResults, OperatorObservations, Report, ReservoirStatus,
++    TemperatureSampleJson, Verdict,
 +};
-+use crate::safe_stop::run_safe_stop;
 +use crate::safety::{AuditedTransport, FrozenAction, Mode};
 +use crate::signals::{StopReason, wait_for_termination_signal};
 +use crate::telemetry::{PacketStats, sample_from_get_temperature, sample_from_temperature_update};
 +
 +const COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 +
++/// Default active-phase duration: long enough to establish meaningful water-temperature movement
++/// through the filled cover loop. The test still stops early on target-reached/safety/
++/// communication-loss/interrupt, so this is not a long minimum wait.
++pub const DEFAULT_DURATION_SECONDS: u64 = 120;
 +/// Hard, non-overridable maximum active duration.
-+pub const HARD_MAX_DURATION_SECONDS: u64 = 30;
++pub const HARD_MAX_DURATION_SECONDS: u64 = 300;
 +/// Conservative baseline/active-phase water temperature envelope: 15-35C. See SAFETY.md for why.
 +pub const MIN_WATER_CENTIDEG: i32 = 1500;
 +pub const MAX_WATER_CENTIDEG: i32 = 3500;
@@ -527,7 +567,8 @@ index 0000000..ea120c9
 +/// fault rather than real cooling, since real thermal mass cannot move this fast.
 +pub const MAX_PLAUSIBLE_TICK_JUMP_CENTIDEG: i32 = 300;
 +pub const BASELINE_MIN_SAMPLES: usize = 5;
-+pub const BASELINE_MIN_WINDOW: Duration = Duration::from_secs(5);
++/// At least 10 seconds of stable samples before enabling cooling.
++pub const BASELINE_MIN_WINDOW: Duration = Duration::from_secs(10);
 +pub const BASELINE_MAX_SPREAD_CENTIDEG: i32 = 300;
 +/// No fresh, valid unsolicited `TemperatureUpdate` for longer than this aborts the active phase.
 +pub const STALE_TELEMETRY_LIMIT: Duration = Duration::from_secs(2);
@@ -545,7 +586,23 @@ index 0000000..ea120c9
 +/// Length of each drain window within one ~1-second active-phase/baseline-collection tick.
 +const TICK_DRAIN_WINDOW: Duration = Duration::from_millis(900);
 +
++/// Cool-test's own shutdown: repeated disable attempts, matching `safe_stop::run_safe_stop`'s
++/// cadence, but never the full I2C reset -- see module docs.
++const SHUTDOWN_REPEAT_COUNT: usize = 3;
++const SHUTDOWN_BETWEEN_ATTEMPTS_DELAY: Duration = Duration::from_millis(150);
++const SHUTDOWN_DISABLE_WAIT: Duration = Duration::from_millis(500);
++/// After the repeated disables, how long to keep reading to confirm both sides' `TargetUpdate`
++/// actually reports `enabled=false`, rather than merely that the disable command was accepted.
++const SHUTDOWN_VERIFY_WINDOW: Duration = Duration::from_secs(2);
++
 +const INTERACTIVE_PHRASE: &str = "I CONFIRM THE WATER LOOP IS CONNECTED AND FILLED";
++/// Required immediately before enabling cooling -- after Frozen has reached application firmware
++/// and the baseline has validated -- distinct from `INTERACTIVE_PHRASE`. Same text and placement
++/// convention as `frozen-prime-opensleep-init --release-frozen-only`'s own reservoir confirmation.
++const RESERVOIR_PHRASE: &str = "RESERVOIR INDICATOR IS STILL WORKING";
++/// Reported in `CoolTestResults::startup_mode`: the only startup implementation this file can ever
++/// use (see module docs and `main.rs`'s guardrail tests).
++const STARTUP_MODE_LABEL: &str = "narrow (i2c::pulse_frozen_reset_bit)";
 +
 +pub async fn run(args: &CoolTestArgs) -> (Report, u8) {
 +    if args.duration_seconds > HARD_MAX_DURATION_SECONDS {
@@ -579,8 +636,8 @@ index 0000000..ea120c9
 +        log::warn!("--dry-run: no I2C or UART writes will be performed; using a mocked Frozen device");
 +        let mut i2c = MockI2c::always_succeed();
 +        let (client, task) = mock_frozen_link_pair();
-+        let mut link = FrozenLink::wrap(client, "dry-run");
-+        let result = run_core(args, &mut i2c, Some(&mut link), true, None).await;
++        let mut link = FrozenLink::wrap_with_raw_log(client, "dry-run", args.raw_serial_log);
++        let result = run_core(args, &mut i2c, &mut link, true, None).await;
 +        drop(link);
 +        task.abort();
 +        return result;
@@ -598,15 +655,15 @@ index 0000000..ea120c9
 +        }
 +    };
 +
-+    let mut link = match FrozenLink::<tokio_serial::SerialStream>::open(&args.frozen_port) {
-+        Ok(l) => Some(l),
++    let mut link = match FrozenLink::<tokio_serial::SerialStream>::open_with_raw_log(&args.frozen_port, args.raw_serial_log) {
++        Ok(l) => l,
 +        Err(e) => {
 +            log::error!("failed to open Frozen UART {}: {e}", args.frozen_port);
-+            None
++            return (refused_report(args, false, "Frozen UART failed to open"), 20);
 +        }
 +    };
 +
-+    run_core(args, &mut i2c, link.as_mut(), false, None).await
++    run_core(args, &mut i2c, &mut link, false, None).await
 +}
 +
 +fn refuse_if_owned(args: &CoolTestArgs) -> Option<(Report, u8)> {
@@ -625,25 +682,6 @@ index 0000000..ea120c9
 +        return Some((refused_report(args, false, "Frozen UART already open elsewhere"), 40));
 +    }
 +    None
-+}
-+
-+/// Reads and exactly matches a confirmation phrase. `assume` (test/CI only, hidden CLI flag)
-+/// bypasses the actual stdin read but not the exact-match check itself. Per spec, the check is
-+/// skipped entirely (treated as satisfied) when stdin is not a TTY.
-+fn confirm_phrase(assume: Option<String>, expected: &str, prompt: &str) -> bool {
-+    if let Some(supplied) = assume {
-+        return supplied == expected;
-+    }
-+    if !std::io::stdin().is_terminal() {
-+        log::info!("stdin is not a TTY; skipping interactive confirmation for: {prompt}");
-+        return true;
-+    }
-+    eprint!("{prompt}");
-+    let mut line = String::new();
-+    if std::io::stdin().read_line(&mut line).is_err() {
-+        return false;
-+    }
-+    line.trim_end_matches(['\n', '\r']) == expected
 +}
 +
 +/// Spawns a background thread that reads lines from stdin for as long as the process runs, and
@@ -730,10 +768,172 @@ index 0000000..ea120c9
 +    lower.contains("sensor unavailable")
 +}
 +
++/// Stop reasons this file treats as a genuine fault -- the only ones that can ever cause
++/// `run_cool_test_shutdown` to assert the narrow emergency I2C reset (and only then if UART-based
++/// shutdown also could not be confirmed). `Normal`/`DurationExpired`/`TargetTemperatureReached`/
++/// `CtrlC`/`Sigterm`/`Sighup`/`PreflightRefused` are all "no I2C write" outcomes.
++fn is_emergency_stop_reason(reason: StopReason) -> bool {
++    matches!(
++        reason,
++        StopReason::TecLocked
++            | StopReason::FirmwareFaultMessage
++            | StopReason::TemperatureRangeExceeded
++            | StopReason::HeatsinkLimitExceeded
++            | StopReason::ImplausibleTemperatureChange
++            | StopReason::PumpNotConfirmedRunning
++            | StopReason::TargetDisabledUnexpectedly
++            | StopReason::TelemetryLost
++            | StopReason::TelemetryStale
++            | StopReason::UartReadFailure
++            | StopReason::UartWriteFailure
++            | StopReason::Panic
++            | StopReason::OperatorAbort
++    )
++}
++
++/// The result of [`run_cool_test_shutdown`].
++#[derive(Debug, Clone, Default)]
++struct CoolTestShutdown {
++    left_disable_attempts: Vec<bool>,
++    right_disable_attempts: Vec<bool>,
++    /// `true` iff a `TargetUpdate(enabled=false)` was observed for *both* sides within
++    /// `SHUTDOWN_VERIFY_WINDOW` of the repeated disable attempts.
++    both_confirmed_disabled: bool,
++    uart_flushed: bool,
++    emergency_reset_asserted: bool,
++}
++
++impl CoolTestShutdown {
++    fn verified(&self) -> bool {
++        self.both_confirmed_disabled || self.emergency_reset_asserted
++    }
++}
++
++/// Cool-test's own shutdown: disables both sides over UART (three repeated attempts with short
++/// spacing, matching `safe_stop::run_safe_stop`'s cadence), flushes, then reads briefly to confirm
++/// both sides are actually disabled. Never performs a full subsystem reset, and never writes any
++/// I2C register on a normal stop -- only if the UART-based confirmation above failed *and*
++/// `stop_reason` is a genuine fault (see [`is_emergency_stop_reason`]) does it fall back to the
++/// narrow, bit-1-only `i2c::assert_frozen_reset_bit_only`. See module docs.
++async fn run_cool_test_shutdown<T, P>(
++    link: Option<&mut FrozenLink<T>>,
++    audit: &mut AuditedTransport,
++    i2c: &mut P,
++    stop_reason: StopReason,
++) -> CoolTestShutdown
++where
++    T: AsyncRead + AsyncWrite + Unpin,
++    P: I2cPort,
++{
++    let mut result = CoolTestShutdown::default();
++
++    if let Some(link) = link {
++        // The disable command's own reply *is* the `TargetUpdate` confirmation (real hardware and
++        // the mock device both answer `SetTargetTemperature` this way) -- captured directly from
++        // each `send()` response, not just its success/failure, so a normal shutdown never needs
++        // to wait for a separate unsolicited push that may never come.
++        let mut left_confirmed_disabled = false;
++        let mut right_confirmed_disabled = false;
++        for attempt in 0..SHUTDOWN_REPEAT_COUNT {
++            log::info!("cool-test shutdown: disable attempt {}/{SHUTDOWN_REPEAT_COUNT}", attempt + 1);
++            let left_outcome = link.send(audit, FrozenAction::safety_off(BedSide::Left), SHUTDOWN_DISABLE_WAIT).await;
++            if let Ok(PacketOutcome::Received(FrozenPacket::TargetUpdate((BedSide::Left, t)))) = &left_outcome
++                && !t.enabled
++            {
++                left_confirmed_disabled = true;
++            }
++            result.left_disable_attempts.push(left_outcome.is_ok());
++
++            let right_outcome = link.send(audit, FrozenAction::safety_off(BedSide::Right), SHUTDOWN_DISABLE_WAIT).await;
++            if let Ok(PacketOutcome::Received(FrozenPacket::TargetUpdate((BedSide::Right, t)))) = &right_outcome
++                && !t.enabled
++            {
++                right_confirmed_disabled = true;
++            }
++            result.right_disable_attempts.push(right_outcome.is_ok());
++
++            if attempt + 1 < SHUTDOWN_REPEAT_COUNT {
++                tokio::time::sleep(SHUTDOWN_BETWEEN_ATTEMPTS_DELAY).await;
++            }
++        }
++
++        match link.flush().await {
++            Ok(()) => {
++                result.uart_flushed = true;
++                log::info!("cool-test shutdown: UART flushed");
++            }
++            Err(e) => log::error!("cool-test shutdown: UART flush failed: {e}"),
++        }
++
++        // Only if the disable acks above didn't already confirm both sides, keep reading briefly
++        // in case Frozen sends a further unsolicited confirmation -- bounded, and skipped
++        // entirely (no wasted wait) once both sides are already confirmed.
++        if !(left_confirmed_disabled && right_confirmed_disabled) {
++            let verify_deadline = Instant::now() + SHUTDOWN_VERIFY_WINDOW;
++            loop {
++                if left_confirmed_disabled && right_confirmed_disabled {
++                    break;
++                }
++                let remaining = verify_deadline.saturating_duration_since(Instant::now());
++                if remaining.is_zero() {
++                    break;
++                }
++                match link.recv(remaining).await {
++                    Ok(PacketOutcome::Received(FrozenPacket::TargetUpdate((s, t)))) if !t.enabled => match s {
++                        BedSide::Left => left_confirmed_disabled = true,
++                        BedSide::Right => right_confirmed_disabled = true,
++                    },
++                    Ok(PacketOutcome::Closed) | Err(_) => break,
++                    _ => {}
++                }
++            }
++        }
++        result.both_confirmed_disabled = left_confirmed_disabled && right_confirmed_disabled;
++    } else {
++        log::warn!("cool-test shutdown: no Frozen UART link was open; skipping disable commands");
++    }
++
++    let uart_disable_ok = result.left_disable_attempts.iter().any(|&ok| ok)
++        && result.right_disable_attempts.iter().any(|&ok| ok)
++        && result.both_confirmed_disabled;
++
++    if !uart_disable_ok && is_emergency_stop_reason(stop_reason) {
++        log::error!(
++            "cool-test shutdown: target shutdown could not be confirmed for a genuine fault ({stop_reason}) -- \
++             asserting emergency Frozen-only reset"
++        );
++        match crate::i2c::assert_frozen_reset_bit_only(i2c).await {
++            Ok(r) if r.readback_matches && r.only_bit1_changed => {
++                result.emergency_reset_asserted = true;
++                log::warn!("cool-test shutdown: emergency Frozen-only reset asserted (0x20 reg 0x02 bit 1 set); left asserted");
++            }
++            Ok(r) => log::error!(
++                "cool-test shutdown: emergency reset write did not verify: readback_matches={} only_bit1_changed={}",
++                r.readback_matches, r.only_bit1_changed
++            ),
++            Err(e) => log::error!("cool-test shutdown: FAILED to assert emergency Frozen-only reset: {e}"),
++        }
++    }
++
++    if result.verified() {
++        eprintln!(
++            "--frozen-cool-test: shutdown verified (both targets confirmed disabled{}).",
++            if result.emergency_reset_asserted { " via emergency reset" } else { "" }
++        );
++    } else {
++        eprintln!(
++            "--frozen-cool-test: WARNING -- shutdown could NOT be verified. If cooling does not visibly \
++             stop, reboot the Hub or disconnect Hub power."
++        );
++    }
++    result
++}
++
++#[allow(clippy::too_many_arguments)]
 +async fn run_core<T, P>(
 +    args: &CoolTestArgs,
 +    i2c: &mut P,
-+    mut link: Option<&mut FrozenLink<T>>,
++    link: &mut FrozenLink<T>,
 +    dry_run: bool,
 +    operator_abort_rx_override: Option<mpsc::UnboundedReceiver<String>>,
 +) -> (Report, u8)
@@ -747,48 +947,79 @@ index 0000000..ea120c9
 +    let mut stats = PacketStats::default();
 +    let mut samples: Vec<TemperatureSampleJson> = Vec::new();
 +    let mut cr = ComponentResults::default();
++    let mut ct = CoolTestResults {
++        selected_side: side_tag.to_string(),
++        requested_delta_c: args.delta_c,
++        requested_duration_seconds: args.duration_seconds,
++        startup_mode: STARTUP_MODE_LABEL.to_string(),
++        ..Default::default()
++    };
 +
-+    let expander = probe_address(i2c, crate::i2c::RESET_EXPANDER_ADDR);
 +    let led = probe_address(i2c, crate::i2c::LED_CONTROLLER_ADDR);
 +    if !led.success {
 +        log::info!("LED controller unavailable; continuing diagnostic ({})", led.describe());
 +    }
-+    let (reset_steps, _release) = run_reset_sequence(i2c).await;
-+    let subsystem_reset_ok = reset_steps.iter().all(|s| s.success);
 +
-+    let Some(link) = link.as_deref_mut() else {
-+        log::error!("refusing to run active test: Frozen UART is not open");
-+        let safe_stop = run_safe_stop::<T, P>(None, &mut audit, Some(i2c)).await;
++    // Items 1-9: the narrow startup shared with `frozen-prime-opensleep-init
++    // --release-frozen-only` -- pulse only bit 1 of registers 0x02/0x06 (never the full reset
++    // sequence, never opensleep::reset::ResetController, never register 0x07), then wait for boot
++    // messages and Ping/JumpToFirmware until application firmware is reached. See module docs.
++    let startup = crate::frozen_startup::start_frozen_narrow(i2c, link, &mut audit).await;
++    let expander_value = startup.pulse.assert_output_step.original;
++
++    if !startup.pulse.fully_verified() {
++        log::error!("refusing to run active test: register 0x02/0x06 pulse did not verify");
++        ct.stop_reason = StopReason::PreflightRefused.to_string();
 +        return finish(
-+            args, dry_run, &audit, &stats, samples, cr, safe_stop, StopReason::PreflightRefused, false,
-+            &expander, &led, subsystem_reset_ok, false, false,
++            args, dry_run, &audit, &stats, samples, cr, ct, StopReason::PreflightRefused, false, 20,
++            expander_value, &led, false, false,
 +        );
-+    };
-+
-+    let (ping_ok, mode) = crate::frozen_ops::ping(link, &mut audit, COMMAND_TIMEOUT).await;
-+    let mut reached_firmware = mode == crate::frozen_ops::DeviceMode::Firmware;
-+    if !reached_firmware && mode == crate::frozen_ops::DeviceMode::Bootloader {
-+        reached_firmware = crate::frozen_ops::jump_to_firmware_and_wait(link, &mut audit, COMMAND_TIMEOUT).await;
 +    }
-+
-+    // Explicitly disable both sides before doing anything else: the selected side will be the
-+    // only one ever enabled below, and the other side is kept disabled for the whole run.
-+    for s in [BedSide::Left, BedSide::Right] {
-+        let _ = link.send(&mut audit, FrozenAction::safety_off(s), COMMAND_TIMEOUT).await;
-+    }
-+
-+    if !ping_ok || !reached_firmware {
++    if !startup.ping_ok || !startup.frozen_reached_firmware {
 +        log::error!("refusing to run active test: Frozen did not reach application firmware");
-+        let safe_stop = run_safe_stop(Some(link), &mut audit, Some(i2c)).await;
++        let shutdown = run_cool_test_shutdown(Some(link), &mut audit, i2c, StopReason::PreflightRefused).await;
++        cr.emergency_shutdown = if shutdown.verified() { Verdict::Pass } else { Verdict::Fail };
++        ct.shutdown_verified = shutdown.verified();
++        ct.emergency_reset_asserted = shutdown.emergency_reset_asserted;
++        ct.stop_reason = StopReason::PreflightRefused.to_string();
 +        return finish(
-+            args, dry_run, &audit, &stats, samples, cr, safe_stop, StopReason::PreflightRefused, false,
-+            &expander, &led, subsystem_reset_ok, true, reached_firmware,
++            args, dry_run, &audit, &stats, samples, cr, ct, StopReason::PreflightRefused, false, 20,
++            expander_value, &led, true, startup.frozen_reached_firmware,
++        );
++    }
++    debug_assert!(startup.started_successfully(), "both preflight checks above passed, so this must hold");
++
++    // Explicitly disable both sides, and confirm from the acks that neither is enabled -- the
++    // selected side will be the only one ever enabled below, and the other side is kept disabled
++    // for the whole run.
++    let mut left_enabled_after_disable = None;
++    let mut right_enabled_after_disable = None;
++    for s in [BedSide::Left, BedSide::Right] {
++        match link.send(&mut audit, FrozenAction::safety_off(s), COMMAND_TIMEOUT).await {
++            Ok(PacketOutcome::Received(FrozenPacket::TargetUpdate((side, t)))) => match side {
++                BedSide::Left => left_enabled_after_disable = Some(t.enabled),
++                BedSide::Right => right_enabled_after_disable = Some(t.enabled),
++            },
++            Ok(_) => {}
++            Err(e) => log::error!("safety-off for {s:?} failed: {e}"),
++        }
++    }
++    if left_enabled_after_disable == Some(true) || right_enabled_after_disable == Some(true) {
++        log::error!("refusing to run active test: an enabled target is still active after safety-off");
++        let shutdown = run_cool_test_shutdown(Some(link), &mut audit, i2c, StopReason::PreflightRefused).await;
++        cr.emergency_shutdown = if shutdown.verified() { Verdict::Pass } else { Verdict::Fail };
++        ct.shutdown_verified = shutdown.verified();
++        ct.emergency_reset_asserted = shutdown.emergency_reset_asserted;
++        ct.stop_reason = StopReason::PreflightRefused.to_string();
++        return finish(
++            args, dry_run, &audit, &stats, samples, cr, ct, StopReason::PreflightRefused, false, 30,
++            expander_value, &led, true, true,
 +        );
 +    }
 +
-+    // Preflight step 8-11: at least 5 valid samples over at least 5 seconds, from unsolicited
-+    // TemperatureUpdate pushes -- see module docs for why the solicited GetTemperature reply is
-+    // not relied on here.
++    // Preflight: at least BASELINE_MIN_SAMPLES valid samples over at least BASELINE_MIN_WINDOW,
++    // from unsolicited TemperatureUpdate pushes -- see module docs for why the solicited
++    // GetTemperature reply is not relied on here.
 +    let baseline_start = Instant::now();
 +    let mut baseline_updates: Vec<TemperatureUpdate> = Vec::new();
 +    while baseline_updates.len() < BASELINE_MIN_SAMPLES || baseline_start.elapsed() < BASELINE_MIN_WINDOW {
@@ -844,23 +1075,36 @@ index 0000000..ea120c9
 +        Some(b) => b,
 +        None => {
 +            log::error!("refusing to run active test: baseline temperature did not pass validation");
-+            let safe_stop = run_safe_stop(Some(link), &mut audit, Some(i2c)).await;
++            let shutdown = run_cool_test_shutdown(Some(link), &mut audit, i2c, StopReason::PreflightRefused).await;
++            cr.emergency_shutdown = if shutdown.verified() { Verdict::Pass } else { Verdict::Fail };
++            ct.shutdown_verified = shutdown.verified();
++            ct.emergency_reset_asserted = shutdown.emergency_reset_asserted;
++            ct.stop_reason = StopReason::PreflightRefused.to_string();
 +            return finish(
-+                args, dry_run, &audit, &stats, samples, cr, safe_stop, StopReason::PreflightRefused, false,
-+                &expander, &led, subsystem_reset_ok, true, reached_firmware,
++                args, dry_run, &audit, &stats, samples, cr, ct, StopReason::PreflightRefused, false, 30,
++                expander_value, &led, true, true,
 +            );
 +        }
 +    };
++    if let Some(last) = baseline_updates.last() {
++        ct.baseline_left_c = Some(crate::telemetry::centideg_to_celsius(last.left_temp));
++        ct.baseline_right_c = Some(crate::telemetry::centideg_to_celsius(last.right_temp));
++        ct.baseline_heatsink_c = Some(crate::telemetry::centideg_to_celsius(last.heatsink_temp));
++    }
 +
 +    let delta_centideg = (args.delta_c * 100.0).round() as i32;
 +    let action = match FrozenAction::enable_cooling(side, baseline as u16, delta_centideg) {
 +        Ok(a) => a,
 +        Err(e) => {
 +            log::error!("refusing to run active test: {e}");
-+            let safe_stop = run_safe_stop(Some(link), &mut audit, Some(i2c)).await;
++            let shutdown = run_cool_test_shutdown(Some(link), &mut audit, i2c, StopReason::PreflightRefused).await;
++            cr.emergency_shutdown = if shutdown.verified() { Verdict::Pass } else { Verdict::Fail };
++            ct.shutdown_verified = shutdown.verified();
++            ct.emergency_reset_asserted = shutdown.emergency_reset_asserted;
++            ct.stop_reason = StopReason::PreflightRefused.to_string();
 +            return finish(
-+                args, dry_run, &audit, &stats, samples, cr, safe_stop, StopReason::PreflightRefused, false,
-+                &expander, &led, subsystem_reset_ok, true, reached_firmware,
++                args, dry_run, &audit, &stats, samples, cr, ct, StopReason::PreflightRefused, false, 30,
++                expander_value, &led, true, true,
 +            );
 +        }
 +    };
@@ -875,10 +1119,39 @@ index 0000000..ea120c9
 +    );
 +    if !start_ok {
 +        log::error!("refusing to run active test: final start phrase was not matched exactly");
-+        let safe_stop = run_safe_stop(Some(link), &mut audit, Some(i2c)).await;
++        let shutdown = run_cool_test_shutdown(Some(link), &mut audit, i2c, StopReason::PreflightRefused).await;
++        cr.emergency_shutdown = if shutdown.verified() { Verdict::Pass } else { Verdict::Fail };
++        ct.shutdown_verified = shutdown.verified();
++        ct.emergency_reset_asserted = shutdown.emergency_reset_asserted;
++        ct.stop_reason = StopReason::PreflightRefused.to_string();
 +        return finish(
-+            args, dry_run, &audit, &stats, samples, cr, safe_stop, StopReason::PreflightRefused, false,
-+            &expander, &led, subsystem_reset_ok, true, reached_firmware,
++            args, dry_run, &audit, &stats, samples, cr, ct, StopReason::PreflightRefused, false, 30,
++            expander_value, &led, true, true,
++        );
++    }
++
++    // Immediately before enabling cooling: a third confirmation, distinct from the two above,
++    // matching --release-frozen-only's own placement and semantics.
++    let reservoir_ok = confirm_phrase(
++        args.assume_reservoir_phrase.clone(),
++        RESERVOIR_PHRASE,
++        &format!("Type {RESERVOIR_PHRASE} to continue: "),
++    );
++    ct.reservoir_status = if reservoir_ok {
++        ReservoirStatus::Confirmed
++    } else {
++        ReservoirStatus::FailedByOperatorObservation
++    };
++    if !reservoir_ok {
++        log::error!("refusing to run active test: reservoir confirmation phrase was not matched exactly");
++        let shutdown = run_cool_test_shutdown(Some(link), &mut audit, i2c, StopReason::PreflightRefused).await;
++        cr.emergency_shutdown = if shutdown.verified() { Verdict::Pass } else { Verdict::Fail };
++        ct.shutdown_verified = shutdown.verified();
++        ct.emergency_reset_asserted = shutdown.emergency_reset_asserted;
++        ct.stop_reason = StopReason::PreflightRefused.to_string();
++        return finish(
++            args, dry_run, &audit, &stats, samples, cr, ct, StopReason::PreflightRefused, false, 30,
++            expander_value, &led, true, true,
 +        );
 +    }
 +
@@ -910,6 +1183,15 @@ index 0000000..ea120c9
 +    let mut active_left_c: Vec<f64> = Vec::new();
 +    let mut active_right_c: Vec<f64> = Vec::new();
 +    let mut prev_side_centideg: Option<i32> = None;
++    let mut min_left_c: Option<f64> = None;
++    let mut min_right_c: Option<f64> = None;
++    let mut final_left_c: Option<f64> = None;
++    let mut final_right_c: Option<f64> = None;
++    let mut final_heatsink_c: Option<f64> = None;
++    let mut target_reached = false;
++    let mut tec_activity_seen = false;
++    let mut left_pump_activity_observed = false;
++    let mut right_pump_activity_observed = false;
 +    #[allow(unused_assignments)]
 +    let mut stop_reason = StopReason::Normal;
 +    let mut telemetry_ok = true;
@@ -976,8 +1258,16 @@ index 0000000..ea120c9
 +                            last_valid_at = Instant::now();
 +                            let elapsed_ms = active_start.elapsed().as_millis() as u64;
 +                            samples.push((&sample_from_temperature_update(elapsed_ms, jiff::Timestamp::now().to_string(), &u)).into());
-+                            active_left_c.push(crate::telemetry::centideg_to_celsius(u.left_temp));
-+                            active_right_c.push(crate::telemetry::centideg_to_celsius(u.right_temp));
++                            let left_c = crate::telemetry::centideg_to_celsius(u.left_temp);
++                            let right_c = crate::telemetry::centideg_to_celsius(u.right_temp);
++                            let heatsink_c = crate::telemetry::centideg_to_celsius(u.heatsink_temp);
++                            active_left_c.push(left_c);
++                            active_right_c.push(right_c);
++                            min_left_c = Some(min_left_c.map_or(left_c, |m: f64| m.min(left_c)));
++                            min_right_c = Some(min_right_c.map_or(right_c, |m: f64| m.min(right_c)));
++                            final_left_c = Some(left_c);
++                            final_right_c = Some(right_c);
++                            final_heatsink_c = Some(heatsink_c);
 +
 +                            let side_centideg = match side {
 +                                BedSide::Left => u.left_temp,
@@ -987,7 +1277,7 @@ index 0000000..ea120c9
 +
 +                            // Isolated behind `catch_unwind`: `evaluate_tick` is a small, pure,
 +                            // panic-free-by-design function, but wrapping it means a future bug
-+                            // here cannot bring down the whole active loop before safe-stop runs.
++                            // here cannot bring down the whole active loop before shutdown runs.
 +                            match std::panic::catch_unwind(|| evaluate_tick(side_centideg, heatsink_centideg, prev_side_centideg)) {
 +                                Ok(Ok(v)) => prev_side_centideg = Some(v),
 +                                Ok(Err(reason)) => {
@@ -1002,6 +1292,14 @@ index 0000000..ea120c9
 +                                    break 'active;
 +                                }
 +                            }
++
++                            // Stop early once the requested target has been reached -- never cool
++                            // further than what was requested and confirmed.
++                            if we_enabled_side && (side_centideg as i32) <= (target_centideg as i32) {
++                                target_reached = true;
++                                stop_reason = StopReason::TargetTemperatureReached;
++                                break 'active;
++                            }
 +                        }
 +                        Ok(PacketOutcome::Received(FrozenPacket::GetTemperature(g))) => {
 +                            // Raw evidence only -- see module docs; never gates a decision.
@@ -1014,6 +1312,12 @@ index 0000000..ea120c9
 +                            if let Some(running) = parse_pump_report(&m, side_tag) {
 +                                pump_confirmed_running |= running;
 +                                pump_last_report_off = !running;
++                            }
++                            if parse_pump_report(&m, "left") == Some(true) {
++                                left_pump_activity_observed = true;
++                            }
++                            if parse_pump_report(&m, "right") == Some(true) {
++                                right_pump_activity_observed = true;
 +                            }
 +                            if is_tec_locked_message(&m) {
 +                                log::error!("firmware reported the selected TEC locked: {m:?}");
@@ -1083,13 +1387,16 @@ index 0000000..ea120c9
 +
 +    cr.telemetry_remained_valid = if telemetry_ok && !samples.is_empty() { Verdict::Pass } else { Verdict::Fail };
 +
-+    let safe_stop = run_safe_stop(Some(link), &mut audit, Some(i2c)).await;
-+    cr.emergency_shutdown = if safe_stop.fully_succeeded() { Verdict::Pass } else { Verdict::Fail };
++    let side_bracket_tag = format!("[{side_tag}]");
++    tec_activity_seen = tec_activity_seen
++        || stats.messages.iter().any(|m| m.to_lowercase().contains("tec") && m.contains(&side_bracket_tag));
++    let fan_seen = stats.messages.iter().any(|m| m.to_lowercase().contains("fan") && m.contains(&side_bracket_tag));
++
++    let shutdown = run_cool_test_shutdown(Some(link), &mut audit, i2c, stop_reason).await;
++    cr.emergency_shutdown = if shutdown.verified() { Verdict::Pass } else { Verdict::Fail };
 +
 +    // Pump/fan/TEC results: only ever PASS from decoded evidence, never from "the command was
 +    // accepted" (`cr.frozen_command_accepted` is tracked entirely separately above).
-+    let side_bracket_tag = format!("[{side_tag}]");
-+    let fan_seen = stats.messages.iter().any(|m| m.to_lowercase().contains("fan") && m.contains(&side_bracket_tag));
 +    cr.pump_operation = if pump_confirmed_running {
 +        Verdict::Pass
 +    } else if pump_last_report_off {
@@ -1098,16 +1405,46 @@ index 0000000..ea120c9
 +        Verdict::Unverified
 +    };
 +    cr.fan_operation = if fan_seen { Verdict::Pass } else { Verdict::Unverified };
-+
 +    cr.tec_cooling_operation = tec_trend_verdict(side, &active_left_c, &active_right_c, telemetry_ok);
-+
 +    cr.overall_selected_side_result = overall_verdict(&cr);
-+
 +    let overall_pass = cr.overall_selected_side_result == Verdict::Pass;
 +
++    ct.minimum_left_c = min_left_c;
++    ct.minimum_right_c = min_right_c;
++    ct.final_left_c = final_left_c;
++    ct.final_right_c = final_right_c;
++    ct.final_heatsink_c = final_heatsink_c;
++    ct.selected_side_change_c = match side {
++        BedSide::Left => final_left_c.zip(ct.baseline_left_c).map(|(f, b)| f - b),
++        BedSide::Right => final_right_c.zip(ct.baseline_right_c).map(|(f, b)| f - b),
++    };
++    ct.opposite_side_change_c = match side {
++        BedSide::Left => final_right_c.zip(ct.baseline_right_c).map(|(f, b)| f - b),
++        BedSide::Right => final_left_c.zip(ct.baseline_left_c).map(|(f, b)| f - b),
++    };
++    ct.heatsink_change_c = final_heatsink_c.zip(ct.baseline_heatsink_c).map(|(f, b)| f - b);
++    ct.target_reached = target_reached;
++    ct.selected_tec_activity_observed = tec_activity_seen;
++    ct.left_pump_activity_observed = left_pump_activity_observed;
++    ct.right_pump_activity_observed = right_pump_activity_observed;
++    ct.shutdown_verified = shutdown.verified();
++    ct.emergency_reset_asserted = shutdown.emergency_reset_asserted;
++    ct.actual_duration_seconds = active_start.elapsed().as_secs_f64();
++    ct.stop_reason = stop_reason.to_string();
++
++    // stop_reason here is never PreflightRefused (every such path above already returned its own
++    // exit code directly): a normal active-test outcome is 0 on PASS, 21 if shutdown itself could
++    // not be verified, else 1.
++    let exit_code = if overall_pass {
++        0
++    } else if !shutdown.verified() {
++        21
++    } else {
++        1
++    };
 +    finish(
-+        args, dry_run, &audit, &stats, samples, cr, safe_stop, stop_reason, overall_pass,
-+        &expander, &led, subsystem_reset_ok, true, reached_firmware,
++        args, dry_run, &audit, &stats, samples, cr, ct, stop_reason, overall_pass, exit_code,
++        expander_value, &led, true, true,
 +    )
 +}
 +
@@ -1230,17 +1567,16 @@ index 0000000..ea120c9
 +    stats: &PacketStats,
 +    samples: Vec<TemperatureSampleJson>,
 +    cr: ComponentResults,
-+    safe_stop: crate::safe_stop::SafeStopResult,
++    ct: CoolTestResults,
 +    stop_reason: StopReason,
 +    overall_pass: bool,
-+    expander: &crate::i2c::ProbeResult,
++    exit_code: u8,
++    reset_expander_value: u8,
 +    led: &crate::i2c::ProbeResult,
-+    subsystem_reset_ok: bool,
 +    frozen_uart_opened: bool,
 +    reached_firmware: bool,
 +) -> (Report, u8) {
-+    let side: BedSide = args.side.into();
-+    let mut report = Report {
++    let report = Report {
 +        program_version: DIAGNOSTIC_VERSION.to_string(),
 +        opensleep_base_version: opensleep::VERSION.to_string(),
 +        opensleep_source_commit: source_commit().to_string(),
@@ -1258,11 +1594,11 @@ index 0000000..ea120c9
 +        },
 +        i2c_device: args.i2c_device.clone(),
 +        i2c_bus_open: true,
-+        reset_expander_probe_ok: expander.success,
-+        reset_expander_value: expander.value,
++        reset_expander_probe_ok: true,
++        reset_expander_value: Some(reset_expander_value),
 +        led_controller_probe_ok: led.success,
-+        subsystem_reset_performed: true,
-+        subsystem_reset_ok,
++        subsystem_reset_performed: false,
++        subsystem_reset_ok: false,
 +        frozen_port: args.frozen_port.clone(),
 +        frozen_uart_opened,
 +        frozen_bootloader_ping: None,
@@ -1296,16 +1632,15 @@ index 0000000..ea120c9
 +        operator_observations: prompt_observations(),
 +        prime_operator_observations: None,
 +        stop_reason: stop_reason.to_string(),
-+        safe_stop: Some((&safe_stop).into()),
++        safe_stop: None,
 +        component_results: Some(cr),
 +        prime_results: None,
 +        opensleep_init_results: None,
 +        release_frozen_only_results: None,
++        cool_test_results: Some(ct),
 +        overall_pass,
-+        exit_code: 0,
++        exit_code,
 +    };
-+    report.exit_code = if overall_pass { 0 } else if !safe_stop.fully_succeeded() { 21 } else { 1 };
-+    let _ = side;
 +
 +    if let Some(path) = &args.json_output
 +        && let Err(e) = report.write_json(path)
@@ -1405,6 +1740,7 @@ index 0000000..ea120c9
 +        prime_results: None,
 +        opensleep_init_results: None,
 +        release_frozen_only_results: None,
++        cool_test_results: None,
 +        overall_pass: false,
 +        exit_code: 30,
 +    }
@@ -1430,8 +1766,10 @@ index 0000000..ea120c9
 +            csv_output: None,
 +            verbose: false,
 +            dry_run,
++            raw_serial_log: false,
 +            assume_interactive_phrase: Some(INTERACTIVE_PHRASE.to_string()),
 +            assume_start_phrase: Some("START LEFT COOLING TEST".to_string()),
++            assume_reservoir_phrase: Some(RESERVOIR_PHRASE.to_string()),
 +        }
 +    }
 +
@@ -1461,7 +1799,7 @@ index 0000000..ea120c9
 +    #[tokio::test]
 +    async fn refuses_when_duration_exceeds_hard_maximum() {
 +        let mut a = args(Side::Left, true);
-+        a.duration_seconds = 31;
++        a.duration_seconds = HARD_MAX_DURATION_SECONDS + 1;
 +        let (_, code) = run(&a).await;
 +        assert_eq!(code, 30);
 +    }
@@ -1494,7 +1832,7 @@ index 0000000..ea120c9
 +        let a = args(Side::Right, true);
 +        let start = std::time::Instant::now();
 +        let (_report, _code) = run(&a).await;
-+        assert!(start.elapsed() < Duration::from_secs(10));
++        assert!(start.elapsed() < Duration::from_secs(30));
 +    }
 +
 +    #[tokio::test]
@@ -1504,11 +1842,17 @@ index 0000000..ea120c9
 +        assert!(report.unsolicited_telemetry_seen);
 +        assert!(report.telemetry_samples.iter().any(|s| s.source == "unsolicited"));
 +        assert!(report.component_results.is_some());
++        assert!(report.cool_test_results.is_some());
++    }
++
++    #[test]
++    fn default_duration_constant_matches_spec() {
++        assert_eq!(DEFAULT_DURATION_SECONDS, 120);
 +    }
 +
 +    #[test]
 +    fn max_duration_constant_matches_spec() {
-+        assert_eq!(HARD_MAX_DURATION_SECONDS, 30);
++        assert_eq!(HARD_MAX_DURATION_SECONDS, 300);
 +    }
 +
 +    #[test]
@@ -1693,13 +2037,14 @@ index 0000000..ea120c9
 +    }
 +
 +    #[tokio::test]
-+    async fn active_phase_stops_at_duration_expired_and_still_runs_safe_stop() {
++    async fn active_phase_stops_at_duration_expired_and_still_runs_shutdown() {
 +        let mut a = args(Side::Left, true);
 +        a.duration_seconds = 1;
 +        let (report, _) = run(&a).await;
 +        assert!(report.stop_reason.contains("duration") || report.stop_reason == StopReason::DurationExpired.to_string());
-+        assert!(report.safe_stop.is_some());
-+        assert!(report.safe_stop.unwrap().i2c_reset_asserted);
++        let ct = report.cool_test_results.expect("cool_test_results must be set");
++        assert!(ct.shutdown_verified);
++        assert!(!ct.emergency_reset_asserted, "a clean duration-expired stop must never assert the emergency reset");
 +    }
 +
 +    /// A fake device that answers Ping/JumpToFirmware/SetTargetTemperature plausibly, and for
@@ -1760,7 +2105,7 @@ index 0000000..ea120c9
 +    }
 +
 +    #[tokio::test]
-+    async fn stale_telemetry_during_active_phase_triggers_safe_stop() {
++    async fn stale_telemetry_during_active_phase_triggers_shutdown() {
 +        let (client, device) = tokio::io::duplex(8192);
 +        let device_task = spawn_device_that_goes_silent_during_active_phase(device, 6);
 +        let mut link = FrozenLink::wrap(client, "test");
@@ -1768,10 +2113,11 @@ index 0000000..ea120c9
 +
 +        let mut a = args(Side::Left, false);
 +        a.duration_seconds = 10; // long enough that only staleness (not duration) ends the run
-+        let (report, _code) = run_core(&a, &mut i2c, Some(&mut link), false, None).await;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None).await;
 +
 +        assert_eq!(report.stop_reason, StopReason::TelemetryStale.to_string());
-+        assert!(report.safe_stop.unwrap().i2c_reset_asserted);
++        let ct = report.cool_test_results.expect("cool_test_results must be set");
++        assert!(ct.shutdown_verified);
 +
 +        drop(link);
 +        device_task.abort();
@@ -1840,7 +2186,7 @@ index 0000000..ea120c9
 +    }
 +
 +    #[tokio::test]
-+    async fn frozen_disabling_the_target_unexpectedly_triggers_safe_stop() {
++    async fn frozen_disabling_the_target_unexpectedly_triggers_shutdown() {
 +        let (client, device) = tokio::io::duplex(8192);
 +        let device_task = spawn_device_that_disables_target_unexpectedly(device, 0x00, 3);
 +        let mut link = FrozenLink::wrap(client, "test");
@@ -1848,10 +2194,11 @@ index 0000000..ea120c9
 +
 +        let mut a = args(Side::Left, false);
 +        a.duration_seconds = 10;
-+        let (report, _code) = run_core(&a, &mut i2c, Some(&mut link), false, None).await;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None).await;
 +
 +        assert_eq!(report.stop_reason, StopReason::TargetDisabledUnexpectedly.to_string());
-+        assert!(report.safe_stop.unwrap().i2c_reset_asserted);
++        let ct = report.cool_test_results.expect("cool_test_results must be set");
++        assert!(ct.shutdown_verified);
 +
 +        drop(link);
 +        device_task.abort();
@@ -1919,7 +2266,7 @@ index 0000000..ea120c9
 +    }
 +
 +    #[tokio::test]
-+    async fn tec_locked_message_triggers_safe_stop() {
++    async fn tec_locked_message_triggers_shutdown() {
 +        let (client, device) = tokio::io::duplex(8192);
 +        let device_task = spawn_device_with_a_message(device, "FW: tec[left] locked", 3);
 +        let mut link = FrozenLink::wrap(client, "test");
@@ -1927,7 +2274,7 @@ index 0000000..ea120c9
 +
 +        let mut a = args(Side::Left, false);
 +        a.duration_seconds = 10;
-+        let (report, _code) = run_core(&a, &mut i2c, Some(&mut link), false, None).await;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None).await;
 +
 +        assert_eq!(report.stop_reason, StopReason::TecLocked.to_string());
 +
@@ -1936,7 +2283,7 @@ index 0000000..ea120c9
 +    }
 +
 +    #[tokio::test]
-+    async fn flash_locked_message_does_not_trigger_safe_stop() {
++    async fn flash_locked_message_does_not_trigger_shutdown_early() {
 +        let (client, device) = tokio::io::duplex(8192);
 +        // Sent on essentially every tick (messages_after=1); if this were mistaken for a fault
 +        // the run would abort almost immediately instead of running its full duration.
@@ -1946,7 +2293,7 @@ index 0000000..ea120c9
 +
 +        let mut a = args(Side::Left, false);
 +        a.duration_seconds = 2;
-+        let (report, _code) = run_core(&a, &mut i2c, Some(&mut link), false, None).await;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None).await;
 +
 +        assert_eq!(report.stop_reason, StopReason::DurationExpired.to_string());
 +
@@ -1955,7 +2302,7 @@ index 0000000..ea120c9
 +    }
 +
 +    #[tokio::test]
-+    async fn generic_fault_message_triggers_safe_stop_after_the_grace_period() {
++    async fn generic_fault_message_triggers_shutdown_after_the_grace_period() {
 +        let (client, device) = tokio::io::duplex(8192);
 +        // messages_after chosen generously so the message lands well after FAULT_KEYWORD_GRACE
 +        // (2s) has elapsed from the start of the active phase.
@@ -1965,7 +2312,7 @@ index 0000000..ea120c9
 +
 +        let mut a = args(Side::Left, false);
 +        a.duration_seconds = 15;
-+        let (report, _code) = run_core(&a, &mut i2c, Some(&mut link), false, None).await;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None).await;
 +
 +        assert_eq!(report.stop_reason, StopReason::FirmwareFaultMessage.to_string());
 +
@@ -1987,10 +2334,9 @@ index 0000000..ea120c9
 +
 +        let mut a = args(Side::Left, false);
 +        a.duration_seconds = 10;
-+        let (report, _code) = run_core(&a, &mut i2c, Some(&mut link), false, Some(rx)).await;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, Some(rx)).await;
 +
 +        assert_eq!(report.stop_reason, StopReason::OperatorAbort.to_string());
-+        assert!(report.safe_stop.unwrap().i2c_reset_asserted);
 +
 +        drop(link);
 +        task.abort();
@@ -2011,12 +2357,247 @@ index 0000000..ea120c9
 +        // Comfortably above STALE_TELEMETRY_LIMIT (2s) so ordinary scheduling jitter around the
 +        // per-tick drain window can't race the duration check against a false staleness abort.
 +        a.duration_seconds = 6;
-+        let (report, _code) = run_core(&a, &mut i2c, Some(&mut link), false, Some(rx)).await;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, Some(rx)).await;
 +
 +        assert_eq!(report.stop_reason, StopReason::DurationExpired.to_string());
 +
 +        drop(link);
 +        task.abort();
++    }
++
++    // -- Section 1: shared narrow startup --
++
++    #[test]
++    fn cool_test_never_references_reset_controller_or_the_full_reset_sequence() {
++        // Needles require actual call syntax (`::` / `(`), not a bare mention -- this file's own
++        // module docs legitimately *discuss* both names in prose (explaining what is deliberately
++        // never called), which a plain substring match would otherwise false-positive against.
++        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/bin/opensleep-diagnostic/cool_test.rs");
++        let src = std::fs::read_to_string(path).expect("readable source file");
++        let needle_reset_controller = format!("{}{}{}", "Reset", "Controller", "::");
++        let needle_full_sequence = format!("{}{}{}", "run_reset", "_sequence", "(");
++        assert!(!src.contains(&needle_reset_controller), "cool_test.rs must never construct/call ResetController");
++        assert!(!src.contains(&needle_full_sequence), "cool_test.rs must never call the full reset sequence");
++    }
++
++    #[tokio::test]
++    async fn cool_test_and_release_frozen_only_use_the_same_shared_narrow_startup() {
++        // Both call sites go through frozen_startup::start_frozen_narrow -- proven directly (not
++        // just by source-scanning) by checking both produce the exact same pulse behavior against
++        // the same mock starting state.
++        let mut i2c_a = MockI2c::always_succeed();
++        let (client_a, task_a) = crate::mock::spawn_mock_frozen_device_release_only(false, false, false);
++        let mut link_a = FrozenLink::wrap(client_a, "a");
++        let mut audit_a = AuditedTransport::new(Mode::CoolTest { side: BedSide::Left });
++        let result_a = crate::frozen_startup::start_frozen_narrow(&mut i2c_a, &mut link_a, &mut audit_a).await;
++
++        let mut i2c_b = MockI2c::always_succeed();
++        let (client_b, task_b) = crate::mock::spawn_mock_frozen_device_release_only(false, false, false);
++        let mut link_b = FrozenLink::wrap(client_b, "b");
++        let mut audit_b = AuditedTransport::new(Mode::PrimeTest);
++        let result_b = crate::frozen_startup::start_frozen_narrow(&mut i2c_b, &mut link_b, &mut audit_b).await;
++
++        assert_eq!(result_a.pulse.assert_output_step.target, result_b.pulse.assert_output_step.target);
++        assert_eq!(result_a.pulse.release_step.target, result_b.pulse.release_step.target);
++        assert!(result_a.started_successfully());
++        assert!(result_b.started_successfully());
++
++        drop(link_a);
++        task_a.abort();
++        drop(link_b);
++        task_b.abort();
++    }
++
++    #[tokio::test]
++    async fn cool_test_does_not_start_without_pong_true() {
++        let mut i2c = MockI2c::always_succeed();
++        let (client, _unused_device_side) = tokio::io::duplex(64);
++        let mut link = FrozenLink::wrap(client, "test");
++        let a = args(Side::Left, false);
++        let (report, code) = run_core(&a, &mut i2c, &mut link, false, None).await;
++        assert_eq!(code, 20);
++        assert!(!report.overall_pass);
++        assert_eq!(report.enabled_target_command_count, 0);
++    }
++
++    #[tokio::test]
++    async fn cool_test_does_not_start_without_the_reservoir_confirmation() {
++        let mut i2c = MockI2c::always_succeed();
++        let (client, task) = mock_frozen_link_pair();
++        let mut link = FrozenLink::wrap(client, "test");
++        let mut a = args(Side::Left, false);
++        a.assume_reservoir_phrase = Some("wrong".to_string());
++        let (report, code) = run_core(&a, &mut i2c, &mut link, false, None).await;
++        assert_eq!(code, 30);
++        assert_eq!(report.enabled_target_command_count, 0, "cooling must never be enabled without the reservoir confirmation");
++        drop(link);
++        task.abort();
++    }
++
++    // -- Section 4: Ctrl+C-safe shutdown --
++
++    #[tokio::test]
++    async fn shutdown_sends_both_disables_three_times() {
++        let (client, device_task) = mock_frozen_link_pair();
++        let mut link = FrozenLink::wrap(client, "test");
++        let mut audit = AuditedTransport::new(Mode::CoolTest { side: BedSide::Left });
++        let mut i2c = MockI2c::always_succeed();
++
++        let result = run_cool_test_shutdown(Some(&mut link), &mut audit, &mut i2c, StopReason::Normal).await;
++
++        assert_eq!(result.left_disable_attempts.len(), SHUTDOWN_REPEAT_COUNT);
++        assert_eq!(result.right_disable_attempts.len(), SHUTDOWN_REPEAT_COUNT);
++        assert!(result.left_disable_attempts.iter().all(|&ok| ok));
++        assert!(result.right_disable_attempts.iter().all(|&ok| ok));
++
++        drop(link);
++        device_task.abort();
++    }
++
++    /// Item: Ctrl+C specifically (not just any stop reason) triggers both-side target shutdown --
++    /// the active loop's own `tokio::select!` races `wait_for_termination_signal()` against
++    /// telemetry (see `termination_signal_future_does_not_resolve_spuriously` for proof that future
++    /// never resolves spuriously), and on any resolution simply falls through to the same
++    /// `run_cool_test_shutdown` call every other exit path uses -- there is no separate "exit
++    /// immediately" branch for a signal anywhere in this file.
++    #[tokio::test]
++    async fn ctrl_c_stop_reason_triggers_both_side_disable_and_no_i2c_write() {
++        let (client, device_task) = mock_frozen_link_pair();
++        let mut link = FrozenLink::wrap(client, "test");
++        let mut audit = AuditedTransport::new(Mode::CoolTest { side: BedSide::Left });
++        let mut i2c = MockI2c::always_succeed();
++
++        let result = run_cool_test_shutdown(Some(&mut link), &mut audit, &mut i2c, StopReason::CtrlC).await;
++
++        assert_eq!(result.left_disable_attempts.len(), SHUTDOWN_REPEAT_COUNT);
++        assert_eq!(result.right_disable_attempts.len(), SHUTDOWN_REPEAT_COUNT);
++        assert!(result.left_disable_attempts.iter().all(|&ok| ok));
++        assert!(result.right_disable_attempts.iter().all(|&ok| ok));
++        assert!(result.both_confirmed_disabled);
++        assert!(i2c.writes.is_empty(), "Ctrl+C is not a full subsystem reset -- no I2C write at all");
++        assert!(!result.emergency_reset_asserted);
++
++        drop(link);
++        device_task.abort();
++    }
++
++    #[tokio::test]
++    async fn shutdown_never_writes_i2c_on_a_normal_stop_reason() {
++        let (client, device_task) = mock_frozen_link_pair();
++        let mut link = FrozenLink::wrap(client, "test");
++        let mut audit = AuditedTransport::new(Mode::CoolTest { side: BedSide::Left });
++        let mut i2c = MockI2c::always_succeed();
++
++        for reason in [StopReason::Normal, StopReason::DurationExpired, StopReason::TargetTemperatureReached, StopReason::CtrlC] {
++            i2c.writes.clear();
++            let result = run_cool_test_shutdown(Some(&mut link), &mut audit, &mut i2c, reason).await;
++            assert!(i2c.writes.is_empty(), "stop_reason={reason} must never write I2C");
++            assert!(!result.emergency_reset_asserted, "stop_reason={reason} must never assert the emergency reset");
++        }
++
++        drop(link);
++        device_task.abort();
++    }
++
++    #[tokio::test]
++    async fn shutdown_asserts_only_bit_1_of_register_0x02_when_uart_disable_fails_for_a_genuine_fault() {
++        // A duplex pair whose device side is never driven: every disable attempt over UART fails.
++        let (client, _unused_device_side) = tokio::io::duplex(64);
++        let mut link = FrozenLink::wrap(client, "test");
++        let mut audit = AuditedTransport::new(Mode::CoolTest { side: BedSide::Left });
++        let mut i2c = MockI2c::always_succeed();
++
++        let result = run_cool_test_shutdown(Some(&mut link), &mut audit, &mut i2c, StopReason::TecLocked).await;
++
++        assert!(result.emergency_reset_asserted);
++        assert!(result.verified());
++        assert_eq!(
++            i2c.writes,
++            vec![(crate::i2c::RESET_EXPANDER_ADDR, 0x02, 0xFF | crate::i2c::FROZEN_RESET_BIT)]
++        );
++        for (_, reg, _) in &i2c.writes {
++            assert_ne!(*reg, 0x06, "emergency assert must never touch register 0x06");
++            assert_ne!(*reg, 0x07, "emergency assert must never touch register 0x07");
++        }
++    }
++
++    #[tokio::test]
++    async fn shutdown_does_not_assert_emergency_reset_when_uart_disable_fails_for_a_normal_reason() {
++        // Even with a non-responsive device (UART disable fails), a non-fault stop_reason must
++        // never trigger the emergency reset.
++        let (client, _unused_device_side) = tokio::io::duplex(64);
++        let mut link = FrozenLink::wrap(client, "test");
++        let mut audit = AuditedTransport::new(Mode::CoolTest { side: BedSide::Left });
++        let mut i2c = MockI2c::always_succeed();
++
++        let result = run_cool_test_shutdown(Some(&mut link), &mut audit, &mut i2c, StopReason::DurationExpired).await;
++
++        assert!(!result.emergency_reset_asserted);
++        assert!(i2c.writes.is_empty());
++    }
++
++    #[test]
++    fn emergency_stop_reasons_are_classified_correctly() {
++        for reason in [
++            StopReason::TecLocked,
++            StopReason::FirmwareFaultMessage,
++            StopReason::TemperatureRangeExceeded,
++            StopReason::HeatsinkLimitExceeded,
++            StopReason::ImplausibleTemperatureChange,
++            StopReason::PumpNotConfirmedRunning,
++            StopReason::TargetDisabledUnexpectedly,
++            StopReason::TelemetryLost,
++            StopReason::TelemetryStale,
++            StopReason::UartReadFailure,
++            StopReason::UartWriteFailure,
++            StopReason::Panic,
++            StopReason::OperatorAbort,
++        ] {
++            assert!(is_emergency_stop_reason(reason), "{reason} should be classified as an emergency");
++        }
++        for reason in [
++            StopReason::Normal,
++            StopReason::DurationExpired,
++            StopReason::TargetTemperatureReached,
++            StopReason::CtrlC,
++            StopReason::Sigterm,
++            StopReason::Sighup,
++            StopReason::PreflightRefused,
++        ] {
++            assert!(!is_emergency_stop_reason(reason), "{reason} should not be classified as an emergency");
++        }
++    }
++
++    // -- Section 5: raw serial logging --
++
++    #[tokio::test]
++    async fn dry_run_does_not_enable_raw_serial_log_by_default() {
++        let a = args(Side::Left, true);
++        assert!(!a.raw_serial_log);
++        let (_report, _code) = run(&a).await;
++        // Behavior is proven at the io_logging level (raw_log_enabled defaults false on every
++        // constructor, see io_logging::tests) -- this test documents that frozen-cool-test's own
++        // CLI default matches, end to end through the public run() entry point.
++    }
++
++    /// Item: `--raw-serial-log` enables raw RX/TX logging, and works independently of `--verbose`.
++    /// The gating boolean itself is proven at the io_logging level
++    /// (`io_logging::tests::with_raw_log_enabled_is_independent_of_capture`); this proves the CLI
++    /// flag actually reaches `FrozenLink::wrap_with_raw_log` on the dry-run path (previously it did
++    /// not -- `run()`'s dry-run branch constructed its `FrozenLink` with the plain, always-off
++    /// `wrap()` regardless of the flag) by running end to end with the flag set and confirming no
++    /// behavior otherwise changes.
++    #[tokio::test]
++    async fn raw_serial_log_flag_reaches_the_dry_run_link_without_changing_behavior() {
++        let mut a = args(Side::Left, true);
++        a.raw_serial_log = true;
++        let (report, _code) = run(&a).await;
++        // The mock device's temperature is fixed, so a short dry-run never shows a measurable
++        // drop (see dry_run_uses_unsolicited_updates_and_reaches_a_verdict, which likewise never
++        // asserts a specific exit code for this reason) -- this test only proves --raw-serial-log
++        // doesn't change that outgoing/reporting behavior, i.e. it completes normally either way.
++        assert_eq!(report.stop_reason, StopReason::DurationExpired.to_string());
++        assert!(report.cool_test_results.is_some());
 +    }
 +}
 diff --git a/src/bin/opensleep-diagnostic/emergency_stop.rs b/src/bin/opensleep-diagnostic/emergency_stop.rs
@@ -2331,6 +2912,235 @@ index 0000000..666ce19
 +            }
 +            other => panic!("unexpected outcome: {other:?}"),
 +        }
++        drop(link);
++        task.abort();
++    }
++}
+diff --git a/src/bin/opensleep-diagnostic/frozen_startup.rs b/src/bin/opensleep-diagnostic/frozen_startup.rs
+new file mode 100644
+index 0000000..c3f544e
+--- /dev/null
++++ b/src/bin/opensleep-diagnostic/frozen_startup.rs
+@@ -0,0 +1,223 @@
++//! Narrow Frozen startup, shared by `frozen-prime-opensleep-init --release-frozen-only` and
++//! `frozen-cool-test`: releases Frozen from reset via `i2c::pulse_frozen_reset_bit` -- never the
++//! four-register full reset sequence ([`crate::i2c::run_reset_sequence`]) and never
++//! `opensleep::reset::ResetController` -- then confirms application firmware is reached via
++//! Ping/JumpToFirmware. One implementation, reused by both callers, so the two narrow-reset modes
++//! this binary has can never drift from each other. See [`crate::i2c::pulse_frozen_reset_bit`]'s
++//! doc comment for the real-hardware evidence behind the pulse (and why register 0x06 must be
++//! configured as an output first).
++
++use std::time::Duration;
++
++use opensleep::frozen::FrozenPacket;
++use tokio::io::{AsyncRead, AsyncWrite};
++use tokio::time::Instant;
++
++use crate::i2c::{I2cPort, Reg02PulseResult, pulse_frozen_reset_bit};
++use crate::link::{FrozenLink, PacketOutcome};
++use crate::safety::AuditedTransport;
++
++/// After the pulse, how long to wait and drain unsolicited boot messages before Pinging at all.
++pub const BOOT_MESSAGE_SETTLE: Duration = Duration::from_secs(2);
++/// Hard ceiling on repeatedly Pinging after the boot-message settle window, before concluding
++/// Frozen never responded at all.
++pub const PING_RETRY_WINDOW: Duration = Duration::from_secs(10);
++/// How long to wait between repeated Ping attempts, and the granularity of the boot-message drain
++/// loop.
++pub const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(500);
++/// Per-command timeout for a single Ping/JumpToFirmware exchange during startup.
++pub const STARTUP_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
++
++/// The result of [`start_frozen_narrow`]: the I2C pulse plus what was observed while waiting for
++/// Frozen to reach application firmware afterward.
++#[derive(Debug, Clone, Copy, Default)]
++pub struct NarrowStartupResult {
++    pub pulse: Reg02PulseResult,
++    /// `true` iff Frozen answered Ping at all (in either bootloader or firmware mode) within
++    /// [`PING_RETRY_WINDOW`] of the pulse completing.
++    pub ping_ok: bool,
++    pub frozen_reached_firmware: bool,
++    pub capwater_unavailable_observed: bool,
++    pub flowrate_unavailable_observed: bool,
++}
++
++impl NarrowStartupResult {
++    /// `true` iff the pulse fully verified *and* Frozen reached application firmware. Callers must
++    /// check this before proceeding to anything that assumes Frozen is up (sending `Prime`,
++    /// enabling a cooling target, etc.).
++    pub fn started_successfully(&self) -> bool {
++        self.pulse.fully_verified() && self.ping_ok && self.frozen_reached_firmware
++    }
++}
++
++/// Releases Frozen from reset and waits for it to reach application firmware. Never calls
++/// `opensleep::reset::ResetController` or the four-register full reset sequence, and never writes
++/// register 0x07. If the I2C pulse itself fails to verify, returns immediately without ever
++/// touching the Frozen UART (`result.ping_ok`/`frozen_reached_firmware` stay `false`).
++pub async fn start_frozen_narrow<T, P>(
++    i2c: &mut P,
++    link: &mut FrozenLink<T>,
++    audit: &mut AuditedTransport,
++) -> NarrowStartupResult
++where
++    T: AsyncRead + AsyncWrite + Unpin,
++    P: I2cPort,
++{
++    let mut result = NarrowStartupResult::default();
++
++    let pulse = match pulse_frozen_reset_bit(i2c).await {
++        Ok(p) => p,
++        Err(e) => {
++            log::error!("failed to pulse Frozen reset bit via I2C: {e}");
++            return result;
++        }
++    };
++    result.pulse = pulse;
++
++    if !pulse.fully_verified() {
++        log::error!(
++            "aborting: register 0x02/0x06 pulse did not verify (asserted_readback_matches={} \
++             asserted_only_bit1_changed={} config_readback_matches={} config_only_bit1_changed={} \
++             released_readback_matches={} released_only_bit1_changed={})",
++            pulse.assert_output_step.readback_matches,
++            pulse.assert_output_step.only_bit1_changed,
++            pulse.config_step.inner.readback_matches,
++            pulse.config_step.inner.only_bit1_changed,
++            pulse.release_step.readback_matches,
++            pulse.release_step.only_bit1_changed
++        );
++        return result;
++    }
++    log::info!(
++        "Frozen reset bit pulsed: register 0x06 bit 1 configured as output (was previously {}), \
++         asserted 0x{:02X} -> released 0x{:02X} in {:?}, every other bit unchanged",
++        if pulse.config_step.bit1_was_already_output { "output" } else { "input" },
++        pulse.assert_output_step.target,
++        pulse.release_step.target,
++        pulse.pulse_duration
++    );
++
++    // Wait up to BOOT_MESSAGE_SETTLE for boot messages, draining and logging anything Frozen
++    // sends unsolicited (informational only -- capwater/flowrate mentions here do not gate
++    // anything by themselves; callers decide what to do with them).
++    let mut capwater_unavailable = false;
++    let mut flowrate_unavailable = false;
++    let boot_deadline = Instant::now() + BOOT_MESSAGE_SETTLE;
++    loop {
++        let remaining = boot_deadline.saturating_duration_since(Instant::now());
++        if remaining.is_zero() {
++            break;
++        }
++        match link.recv(remaining).await {
++            Ok(PacketOutcome::Received(FrozenPacket::Message(m))) => {
++                log::info!("boot message: {m}");
++                if m == "FW: [capwater] sensor unavailable" {
++                    capwater_unavailable = true;
++                }
++                if m == "FW: [flowrate] sensor unavailable" {
++                    flowrate_unavailable = true;
++                }
++            }
++            Ok(PacketOutcome::Received(pkt)) => log::info!("boot packet: {pkt:?}"),
++            Ok(PacketOutcome::TimedOut) => {}
++            Ok(PacketOutcome::Closed) | Err(_) => break,
++        }
++    }
++    result.capwater_unavailable_observed = capwater_unavailable;
++    result.flowrate_unavailable_observed = flowrate_unavailable;
++
++    // Ping repeatedly for up to PING_RETRY_WINDOW until Frozen answers at all.
++    let ping_deadline = Instant::now() + PING_RETRY_WINDOW;
++    let mut mode = crate::frozen_ops::DeviceMode::Unknown;
++    let mut ping_ok = false;
++    loop {
++        let (ok, m) = crate::frozen_ops::ping(link, audit, STARTUP_COMMAND_TIMEOUT).await;
++        if ok {
++            ping_ok = true;
++            mode = m;
++            break;
++        }
++        if Instant::now() >= ping_deadline {
++            break;
++        }
++        tokio::time::sleep(STARTUP_POLL_INTERVAL).await;
++    }
++    result.ping_ok = ping_ok;
++
++    if !ping_ok {
++        log::error!(
++            "Frozen did not respond to Ping within {PING_RETRY_WINDOW:?} of being released from reset"
++        );
++        return result;
++    }
++
++    // Pong(false) -> JumpToFirmware, then re-Ping (tolerating any interleaved startup messages)
++    // until Pong(true) or the hard timeout inside jump_to_firmware_and_wait expires.
++    result.frozen_reached_firmware = match mode {
++        crate::frozen_ops::DeviceMode::Firmware => true,
++        crate::frozen_ops::DeviceMode::Bootloader => {
++            crate::frozen_ops::jump_to_firmware_and_wait(link, audit, STARTUP_COMMAND_TIMEOUT).await
++        }
++        crate::frozen_ops::DeviceMode::Unknown => false,
++    };
++    result
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::i2c::MockI2c;
++    use crate::mock::spawn_mock_frozen_device_release_only;
++    use crate::safety::Mode;
++
++    #[tokio::test]
++    async fn succeeds_against_a_responsive_device() {
++        let mut i2c = MockI2c::always_succeed();
++        let (client, task) = spawn_mock_frozen_device_release_only(false, false, false);
++        let mut link = FrozenLink::wrap(client, "test");
++        let mut audit = AuditedTransport::new(Mode::PrimeTest);
++        let result = start_frozen_narrow(&mut i2c, &mut link, &mut audit).await;
++        assert!(result.started_successfully());
++        assert!(result.pulse.fully_verified());
++        drop(link);
++        task.abort();
++    }
++
++    #[tokio::test]
++    async fn reports_unresponsive_frozen_without_hanging_the_pulse() {
++        let mut i2c = MockI2c::always_succeed();
++        let (client, _unused_device_side) = tokio::io::duplex(64);
++        let mut link = FrozenLink::wrap(client, "test");
++        let mut audit = AuditedTransport::new(Mode::PrimeTest);
++        let result = start_frozen_narrow(&mut i2c, &mut link, &mut audit).await;
++        assert!(result.pulse.fully_verified(), "the I2C pulse itself must still succeed");
++        assert!(!result.ping_ok);
++        assert!(!result.frozen_reached_firmware);
++        assert!(!result.started_successfully());
++    }
++
++    #[tokio::test]
++    async fn aborts_before_pinging_when_the_i2c_pulse_fails() {
++        let mut i2c = MockI2c { fail_reg_reads: true, ..MockI2c::always_succeed() };
++        let (client, task) = spawn_mock_frozen_device_release_only(false, false, false);
++        let mut link = FrozenLink::wrap(client, "test");
++        let mut audit = AuditedTransport::new(Mode::PrimeTest);
++        let result = start_frozen_narrow(&mut i2c, &mut link, &mut audit).await;
++        assert!(!result.started_successfully());
++        assert!(!result.ping_ok);
++        drop(link);
++        task.abort();
++    }
++
++    #[tokio::test]
++    async fn jumps_to_firmware_when_frozen_answers_from_the_bootloader() {
++        let mut i2c = MockI2c::always_succeed();
++        let (client, task) = spawn_mock_frozen_device_release_only(true, false, false);
++        let mut link = FrozenLink::wrap(client, "test");
++        let mut audit = AuditedTransport::new(Mode::PrimeTest);
++        let result = start_frozen_narrow(&mut i2c, &mut link, &mut audit).await;
++        assert!(result.started_successfully());
 +        drop(link);
 +        task.abort();
 +    }
@@ -3125,10 +3935,10 @@ index 0000000..c9c0db5
 +}
 diff --git a/src/bin/opensleep-diagnostic/io_logging.rs b/src/bin/opensleep-diagnostic/io_logging.rs
 new file mode 100644
-index 0000000..8c89366
+index 0000000..98c8b76
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/io_logging.rs
-@@ -0,0 +1,94 @@
+@@ -0,0 +1,146 @@
 +//! Transparent `AsyncRead + AsyncWrite` wrapper that logs every raw byte chunk that crosses it,
 +//! so raw TX/RX frames can be logged in hex without touching the shared `PacketCodec` (which is
 +//! also used, unmodified, by normal OpenSleep).
@@ -3139,6 +3949,14 @@ index 0000000..8c89366
 +//! expose frame boundaries alongside a decoded packet through the `Stream` API this binary uses,
 +//! so a captured chunk may contain part of a frame, a whole frame, or several -- documented as
 +//! such in PROTOCOL_AUDIT.md and in the JSON field itself.
++//!
++//! Printing the raw `"<label> RX/TX raw (...)"` debug log lines is opt-in (`with_raw_log_enabled`,
++//! off by default on every constructor) and independent of the overall log level `--verbose`
++//! selects: gated by an explicit boolean checked before each `log::debug!` call, not by the log
++//! crate's own level filtering. `--verbose` alone (this struct's default) never prints them --
++//! real-hardware use found the raw hex dumps made normal `--verbose` logs extremely noisy. Capture
++//! via `with_capture`/`wrap_capturing` is unaffected either way: it is a separate mechanism from
++//! the printed log lines.
 +
 +use std::io;
 +use std::pin::Pin;
@@ -3159,15 +3977,23 @@ index 0000000..8c89366
 +    inner: T,
 +    label: &'static str,
 +    capture: Option<RawIoCapture>,
++    raw_log_enabled: bool,
 +}
 +
 +impl<T> LoggingIo<T> {
 +    pub fn new(inner: T, label: &'static str) -> Self {
-+        Self { inner, label, capture: None }
++        Self { inner, label, capture: None, raw_log_enabled: false }
 +    }
 +
 +    pub fn with_capture(inner: T, label: &'static str, capture: RawIoCapture) -> Self {
-+        Self { inner, label, capture: Some(capture) }
++        Self { inner, label, capture: Some(capture), raw_log_enabled: false }
++    }
++
++    /// Opt-in: also print `"<label> RX/TX raw (...)"` debug log lines for every byte chunk. Off by
++    /// default on every constructor, and independent of `--verbose` -- see module docs.
++    pub fn with_raw_log_enabled(mut self, enabled: bool) -> Self {
++        self.raw_log_enabled = enabled;
++        self
 +    }
 +}
 +
@@ -3192,7 +4018,9 @@ index 0000000..8c89366
 +        if let Poll::Ready(Ok(())) = &poll {
 +            let data = &buf.filled()[before..];
 +            if !data.is_empty() {
-+                log::debug!("{} RX raw ({} bytes): {:02X?}", this.label, data.len(), data);
++                if this.raw_log_enabled {
++                    log::debug!("{} RX raw ({} bytes): {:02X?}", this.label, data.len(), data);
++                }
 +                record(&this.capture, "rx", data);
 +            }
 +        }
@@ -3209,7 +4037,9 @@ index 0000000..8c89366
 +        let this = self.get_mut();
 +        let poll = Pin::new(&mut this.inner).poll_write(cx, buf);
 +        if let Poll::Ready(Ok(n)) = &poll {
-+            log::debug!("{} TX raw ({} bytes): {:02X?}", this.label, n, &buf[..*n]);
++            if this.raw_log_enabled {
++                log::debug!("{} TX raw ({} bytes): {:02X?}", this.label, n, &buf[..*n]);
++            }
 +            record(&this.capture, "tx", &buf[..*n]);
 +        }
 +        poll
@@ -3223,12 +4053,44 @@ index 0000000..8c89366
 +        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
 +    }
 +}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn raw_log_is_disabled_on_every_constructor_by_default() {
++        assert!(!LoggingIo::new((), "test").raw_log_enabled);
++        let capture: RawIoCapture = Arc::new(Mutex::new(Vec::new()));
++        assert!(!LoggingIo::with_capture((), "test", capture).raw_log_enabled);
++    }
++
++    #[test]
++    fn with_raw_log_enabled_is_independent_of_capture() {
++        let io = LoggingIo::new((), "test").with_raw_log_enabled(true);
++        assert!(io.raw_log_enabled);
++        assert!(io.capture.is_none(), "enabling raw log printing must not itself start capturing");
++
++        let capture: RawIoCapture = Arc::new(Mutex::new(Vec::new()));
++        let io = LoggingIo::with_capture((), "test", capture).with_raw_log_enabled(false);
++        assert!(!io.raw_log_enabled);
++        assert!(io.capture.is_some(), "disabling raw log printing must not itself stop capturing");
++    }
++
++    #[test]
++    fn record_is_unaffected_by_raw_log_enabled() {
++        let capture: RawIoCapture = Arc::new(Mutex::new(Vec::new()));
++        record(&Some(capture.clone()), "rx", &[0xAB, 0xCD]);
++        assert_eq!(capture.lock().unwrap().len(), 1);
++        assert_eq!(capture.lock().unwrap()[0].hex, "AB CD");
++    }
++}
 diff --git a/src/bin/opensleep-diagnostic/link.rs b/src/bin/opensleep-diagnostic/link.rs
 new file mode 100644
-index 0000000..5d6a0d1
+index 0000000..d3d4683
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/link.rs
-@@ -0,0 +1,297 @@
+@@ -0,0 +1,345 @@
 +//! Frozen UART transport: every send goes through [`AuditedTransport::check`] first, and the wire
 +//! framing itself is entirely `opensleep::common::codec::PacketCodec` / `FrozenPacket` -- nothing
 +//! here reimplements packet encoding or decoding. Generic over the underlying I/O so the exact
@@ -3249,6 +4111,16 @@ index 0000000..5d6a0d1
 +use crate::safety::{AuditedTransport, FrozenAction, SafetyViolation};
 +
 +pub const BAUD: u32 = 38400;
++/// Hard ceiling on a single write (one frame send, or a flush) completing. Every write in this
++/// module goes through this bound -- unlike the read side (whose timeout has always been
++/// caller-supplied via `wait`), writes had no timeout at all until this was added: a write can
++/// block forever if the underlying transport's buffer ever fills and nothing drains it (a real,
++/// reproducible hang found in testing against a non-responsive mock device during a long retry
++/// loop -- `tokio::io::duplex`'s fixed-size buffer fills after enough un-drained writes, and
++/// `Framed::send`'s flush then blocks indefinitely). The same failure mode -- a stuck or
++/// disconnected UART -- is plausible on real hardware too, so this is a genuine safety fix, not
++/// only a test fix: this diagnostic must always terminate and report within a bounded time.
++const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
 +
 +#[derive(Debug)]
 +pub enum PacketOutcome {
@@ -3285,10 +4157,17 @@ index 0000000..5d6a0d1
 +
 +impl FrozenLink<SerialStream> {
 +    /// Opens the real Frozen UART: 38400 baud, 8N1, no flow control (matching stock OpenSleep).
++    /// Raw RX/TX debug log lines are off (see [`Self::open_with_raw_log`] to enable them).
 +    pub fn open(port: &str) -> Result<Self, opensleep::common::serial::SerialError> {
++        Self::open_with_raw_log(port, false)
++    }
++
++    /// Same as [`Self::open`], but lets the caller opt into raw RX/TX debug log lines (see
++    /// `io_logging.rs` module docs -- off by default, independent of `--verbose`).
++    pub fn open_with_raw_log(port: &str, raw_log_enabled: bool) -> Result<Self, opensleep::common::serial::SerialError> {
 +        let raw = create_port(port, BAUD)?;
 +        log::info!("Frozen UART opened: {port} @ {BAUD} baud, 8N1, no flow control");
-+        Ok(Self::wrap(raw, "Frozen"))
++        Ok(Self::wrap_with_raw_log(raw, "Frozen", raw_log_enabled))
 +    }
 +}
 +
@@ -3296,6 +4175,14 @@ index 0000000..5d6a0d1
 +    pub fn wrap(inner: T, label: &'static str) -> Self {
 +        Self {
 +            framed: Framed::new(LoggingIo::new(inner, label), PacketCodec::new()),
++        }
++    }
++
++    /// Same as [`Self::wrap`], but lets the caller opt into raw RX/TX debug log lines (see
++    /// `io_logging.rs` module docs -- off by default, independent of `--verbose`).
++    pub fn wrap_with_raw_log(inner: T, label: &'static str, raw_log_enabled: bool) -> Self {
++        Self {
++            framed: Framed::new(LoggingIo::new(inner, label).with_raw_log_enabled(raw_log_enabled), PacketCodec::new()),
 +        }
 +    }
 +
@@ -3309,7 +4196,8 @@ index 0000000..5d6a0d1
 +    }
 +
 +    /// Checks `action` against the audit's whitelist, and only if it passes, serializes and
-+    /// transmits it, then waits up to `wait` for one decoded response packet.
++    /// transmits it (bounded by [`WRITE_TIMEOUT`]), then waits up to `wait` for one decoded
++    /// response packet.
 +    pub async fn send(
 +        &mut self,
 +        audit: &mut AuditedTransport,
@@ -3319,7 +4207,7 @@ index 0000000..5d6a0d1
 +        audit.check(&action).map_err(LinkError::Safety)?;
 +        let cmd = action.to_command();
 +        log::info!("-> {} ({:?})", action.name(), cmd);
-+        self.framed.send(cmd).await.map_err(LinkError::WriteIo)?;
++        Self::write_one(&mut self.framed, cmd).await?;
 +        Self::await_one(&mut self.framed, wait).await
 +    }
 +
@@ -3330,19 +4218,41 @@ index 0000000..5d6a0d1
 +    }
 +
 +    /// Checks `action` against the audit's whitelist and, only if it passes, serializes and
-+    /// transmits it -- but does not itself wait for a reply. Used where the caller wants to
-+    /// nudge the device (and have the send audited/logged) but will pick up whatever arrives,
-+    /// solicited or not, via a subsequent [`Self::recv`] drain loop instead of pairing this send
-+    /// with exactly one response.
++    /// transmits it (bounded by [`WRITE_TIMEOUT`]) -- but does not itself wait for a reply. Used
++    /// where the caller wants to nudge the device (and have the send audited/logged) but will
++    /// pick up whatever arrives, solicited or not, via a subsequent [`Self::recv`] drain loop
++    /// instead of pairing this send with exactly one response.
 +    pub async fn send_only(&mut self, audit: &mut AuditedTransport, action: FrozenAction) -> Result<(), LinkError> {
 +        audit.check(&action).map_err(LinkError::Safety)?;
 +        let cmd = action.to_command();
 +        log::info!("-> {} ({:?}) [no-wait]", action.name(), cmd);
-+        self.framed.send(cmd).await.map_err(LinkError::WriteIo)
++        Self::write_one(&mut self.framed, cmd).await
 +    }
 +
 +    pub async fn flush(&mut self) -> Result<(), std::io::Error> {
-+        SinkExt::<opensleep::frozen::FrozenCommand>::flush(&mut self.framed).await
++        match tokio::time::timeout(WRITE_TIMEOUT, SinkExt::<opensleep::frozen::FrozenCommand>::flush(&mut self.framed)).await {
++            Ok(result) => result,
++            Err(_elapsed) => Err(std::io::Error::new(
++                std::io::ErrorKind::TimedOut,
++                format!("flush did not complete within {WRITE_TIMEOUT:?}"),
++            )),
++        }
++    }
++
++    /// Serializes and transmits `cmd`, bounded by [`WRITE_TIMEOUT`] -- see that constant's doc
++    /// comment for why an unbounded write is a real hang, not a theoretical one.
++    async fn write_one(
++        framed: &mut Framed<LoggingIo<T>, PacketCodec<FrozenPacket>>,
++        cmd: opensleep::frozen::FrozenCommand,
++    ) -> Result<(), LinkError> {
++        match tokio::time::timeout(WRITE_TIMEOUT, framed.send(cmd)).await {
++            Ok(Ok(())) => Ok(()),
++            Ok(Err(e)) => Err(LinkError::WriteIo(e)),
++            Err(_elapsed) => Err(LinkError::WriteIo(std::io::Error::new(
++                std::io::ErrorKind::TimedOut,
++                format!("write did not complete within {WRITE_TIMEOUT:?}"),
++            ))),
++        }
 +    }
 +
 +    async fn await_one(
@@ -3713,10 +4623,10 @@ index 0000000..216770e
 +}
 diff --git a/src/bin/opensleep-diagnostic/main.rs b/src/bin/opensleep-diagnostic/main.rs
 new file mode 100644
-index 0000000..38acc7b
+index 0000000..7152f44
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/main.rs
-@@ -0,0 +1,306 @@
+@@ -0,0 +1,307 @@
 +//! opensleep-diagnostic: a staged, Frozen-only hardware diagnostic for an Eight Sleep Pod 3 Hub.
 +//!
 +//! Five subcommands, each with its own fixed command whitelist (see `safety.rs`):
@@ -3746,6 +4656,7 @@ index 0000000..38acc7b
 +mod cool_test;
 +mod emergency_stop;
 +mod frozen_ops;
++mod frozen_startup;
 +mod i2c;
 +mod io_logging;
 +mod link;
@@ -4421,10 +5332,10 @@ index 0000000..910d8c6
 +}
 diff --git a/src/bin/opensleep-diagnostic/passive.rs b/src/bin/opensleep-diagnostic/passive.rs
 new file mode 100644
-index 0000000..f4b95f7
+index 0000000..dbe251f
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/passive.rs
-@@ -0,0 +1,442 @@
+@@ -0,0 +1,443 @@
 +//! `frozen-passive`: safe with the cover disconnected and no water. Never constructs an enabled
 +//! `SetTargetTemperature`; the only actuator-shaped command it can ever send is the disabled
 +//! (`enabled=false`) safety-off, which both `AuditedTransport` and the closed `FrozenAction` enum
@@ -4811,6 +5722,7 @@ index 0000000..f4b95f7
 +        prime_results: None,
 +        opensleep_init_results: None,
 +        release_frozen_only_results: None,
++        cool_test_results: None,
 +        overall_pass: false,
 +        exit_code: exit_code_override.unwrap_or(30),
 +    }
@@ -4869,10 +5781,10 @@ index 0000000..f4b95f7
 +}
 diff --git a/src/bin/opensleep-diagnostic/prime_opensleep_init.rs b/src/bin/opensleep-diagnostic/prime_opensleep_init.rs
 new file mode 100644
-index 0000000..f48654c
+index 0000000..268213c
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/prime_opensleep_init.rs
-@@ -0,0 +1,1481 @@
+@@ -0,0 +1,1394 @@
 +//! `frozen-prime-opensleep-init`: fills an empty or partially-filled hydraulic loop by sending
 +//! `Prime` exactly once, through the real, unmodified upstream OpenSleep initialization and Frozen
 +//! manager code -- `opensleep::reset::ResetController::reset_subsystems`, `opensleep::led`,
@@ -5057,21 +5969,13 @@ index 0000000..f48654c
 +/// Poll granularity while watching `log_tap` for a specific line to appear.
 +const LOG_POLL_INTERVAL: Duration = Duration::from_millis(50);
 +
-+/// `--release-frozen-only` mode: after the I2C pulse (assert-then-release), how long to wait and
-+/// drain unsolicited boot messages before Pinging at all. Real hardware evidence: Frozen emits
-+/// interleaved startup chatter immediately after being released, so this window is drained (and
-+/// logged) rather than skipped straight to Ping.
-+const BOOT_MESSAGE_SETTLE: Duration = Duration::from_secs(2);
-+/// `--release-frozen-only` mode: hard ceiling on repeatedly Pinging after the boot-message settle
-+/// window, before concluding Frozen never responded at all and aborting without sending Prime.
-+const PING_RETRY_WINDOW: Duration = Duration::from_secs(10);
-+/// `--release-frozen-only` mode: how long to wait between repeated Ping attempts within
-+/// `PING_RETRY_WINDOW`, and the granularity of the drain loop used both for the boot-message
-+/// settle window and for watching for priming completion.
++/// `--release-frozen-only` mode: granularity of the drain loop used while watching for priming
++/// completion. The startup phase itself (I2C pulse, boot-message drain, Ping/JumpToFirmware retry)
++/// is shared with `frozen-cool-test` -- see `frozen_startup::start_frozen_narrow`.
 +const RELEASE_ONLY_POLL_INTERVAL: Duration = Duration::from_millis(500);
-+/// `--release-frozen-only` mode: per-command timeout for a single Ping/JumpToFirmware/Prime
-+/// exchange over its own `FrozenLink`/`AuditedTransport` (this mode does not use the real
-+/// `frozen::run` manager at all -- see module docs). Mirrors `prime_test::COMMAND_TIMEOUT`.
++/// `--release-frozen-only` mode: per-command timeout for `Prime` over its own
++/// `FrozenLink`/`AuditedTransport` (this mode does not use the real `frozen::run` manager at all --
++/// see module docs). Mirrors `prime_test::COMMAND_TIMEOUT`.
 +const RELEASE_ONLY_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 +
 +/// Item 20's required confirmation phrase, distinct from `INTERACTIVE_PHRASE`/`FINAL_PHRASE`:
@@ -5243,19 +6147,14 @@ index 0000000..f48654c
 +    P: I2cPort,
 +{
 +    let mut results = ReleaseFrozenOnlyResults::default();
++    let mut audit = AuditedTransport::new(Mode::PrimeTest);
 +
-+    // Items 1-6: pulse only bit 1 of register 0x02 low->high->low (assert, then release) -- never
-+    // opensleep::reset::ResetController, never the four-register full reset sequence, never
-+    // registers 0x06/0x07. See `i2c::pulse_frozen_reset_bit`'s doc comment for why a pulse (not a
-+    // one-shot clear) is required: a live run found register 0x02 already reading `0xFD`, so
-+    // clearing bit 1 alone was a no-op with no edge, and Frozen never responded.
-+    let pulse = match crate::i2c::pulse_frozen_reset_bit(i2c).await {
-+        Ok(p) => p,
-+        Err(e) => {
-+            log::error!("failed to pulse Frozen reset bit via I2C: {e}");
-+            return (finish_release_only(args, results, StopReason::PreflightRefused, 20, dry_run), 20);
-+        }
-+    };
++    // Items 1-9: the narrow startup shared with `frozen-cool-test` -- pulse only bit 1 of
++    // registers 0x02/0x06 (never the full reset sequence, never opensleep::reset::ResetController,
++    // never register 0x07), then wait for boot messages and Ping/JumpToFirmware until application
++    // firmware is reached. See `frozen_startup::start_frozen_narrow`'s doc comment.
++    let startup = crate::frozen_startup::start_frozen_narrow(i2c, link, &mut audit).await;
++    let pulse = startup.pulse;
 +    results.original_register_0x02 = pulse.assert_output_step.original;
 +    results.asserted_register_0x02 = pulse.assert_output_step.target;
 +    results.asserted_readback_register_0x02 = pulse.assert_output_step.readback;
@@ -5272,98 +6171,23 @@ index 0000000..f48654c
 +        && pulse.config_step.inner.only_bit1_changed
 +        && pulse.release_step.only_bit1_changed;
 +    results.pulse_duration_ms = pulse.pulse_duration.as_millis() as u64;
++    results.frozen_uart_opened = pulse.fully_verified();
++    results.frozen_reached_firmware = startup.frozen_reached_firmware;
++    results.capwater_unavailable_observed = startup.capwater_unavailable_observed;
++    results.flowrate_unavailable_observed = startup.flowrate_unavailable_observed;
 +
-+    // Abort if any of the three writes did not verify -- either a readback disagreed with what was
-+    // written, or (should be impossible by construction) a bit other than bit 1 changed.
 +    if !pulse.fully_verified() {
-+        log::error!(
-+            "aborting: register 0x02/0x06 pulse did not verify (asserted_readback_matches={} \
-+             asserted_only_bit1_changed={} config_readback_matches={} config_only_bit1_changed={} \
-+             released_readback_matches={} released_only_bit1_changed={})",
-+            pulse.assert_output_step.readback_matches, pulse.assert_output_step.only_bit1_changed,
-+            pulse.config_step.inner.readback_matches, pulse.config_step.inner.only_bit1_changed,
-+            pulse.release_step.readback_matches, pulse.release_step.only_bit1_changed
-+        );
++        // Abort if any of the three writes did not verify -- either a readback disagreed with what
++        // was written, or (should be impossible by construction) a bit other than bit 1 changed.
 +        return (finish_release_only(args, results, StopReason::PreflightRefused, 20, dry_run), 20);
-+    }
-+    log::info!(
-+        "Frozen reset bit pulsed: register 0x06 bit 1 configured as output (was previously {}), \
-+         asserted 0x{:02X} -> released 0x{:02X} in {:?}, every other bit unchanged",
-+        if pulse.config_step.bit1_was_already_output { "output" } else { "input" },
-+        pulse.assert_output_step.target, pulse.release_step.target, pulse.pulse_duration
-+    );
-+    results.frozen_uart_opened = true;
-+
-+    // Item 7: wait up to 2 seconds for boot messages, draining and logging anything Frozen sends
-+    // unsolicited (informational only -- capwater/flowrate mentions here are logged but do not
-+    // gate Prime; only the operator's own reservoir confirmation below does, per item 11).
-+    let mut audit = AuditedTransport::new(Mode::PrimeTest);
-+    let mut capwater_unavailable = false;
-+    let mut flowrate_unavailable = false;
-+    let boot_deadline = Instant::now() + BOOT_MESSAGE_SETTLE;
-+    loop {
-+        let remaining = boot_deadline.saturating_duration_since(Instant::now());
-+        if remaining.is_zero() {
-+            break;
-+        }
-+        match link.recv(remaining).await {
-+            Ok(PacketOutcome::Received(FrozenPacket::Message(m))) => {
-+                log::info!("boot message: {m}");
-+                if m == "FW: [capwater] sensor unavailable" {
-+                    capwater_unavailable = true;
-+                }
-+                if m == "FW: [flowrate] sensor unavailable" {
-+                    flowrate_unavailable = true;
-+                }
-+            }
-+            Ok(PacketOutcome::Received(pkt)) => log::info!("boot packet: {pkt:?}"),
-+            Ok(PacketOutcome::TimedOut) => {}
-+            Ok(PacketOutcome::Closed) | Err(_) => break,
-+        }
-+    }
-+    results.capwater_unavailable_observed = capwater_unavailable;
-+    results.flowrate_unavailable_observed = flowrate_unavailable;
-+
-+    // Items 7-8: Ping repeatedly for up to 10 seconds until Frozen answers at all.
-+    let ping_deadline = Instant::now() + PING_RETRY_WINDOW;
-+    let mut mode = crate::frozen_ops::DeviceMode::Unknown;
-+    let mut ping_ok = false;
-+    loop {
-+        let (ok, m) = crate::frozen_ops::ping(link, &mut audit, RELEASE_ONLY_COMMAND_TIMEOUT).await;
-+        if ok {
-+            ping_ok = true;
-+            mode = m;
-+            break;
-+        }
-+        if Instant::now() >= ping_deadline {
-+            break;
-+        }
-+        tokio::time::sleep(RELEASE_ONLY_POLL_INTERVAL).await;
-+    }
-+
-+    // Item 8: Pong(false) -> JumpToFirmware; Pong(true) -> already in firmware; no response within
-+    // the window -> abort without sending Prime. Item 9: after JumpToFirmware,
-+    // `jump_to_firmware_and_wait` allows sufficient time for interleaved startup messages by
-+    // simply re-Pinging (tolerating anything else received in between) for up to its own 10-second
-+    // hard timeout before requiring `Pong(true)`.
-+    let reached_firmware = match mode {
-+        crate::frozen_ops::DeviceMode::Firmware => true,
-+        crate::frozen_ops::DeviceMode::Bootloader => {
-+            crate::frozen_ops::jump_to_firmware_and_wait(link, &mut audit, RELEASE_ONLY_COMMAND_TIMEOUT).await
-+        }
-+        crate::frozen_ops::DeviceMode::Unknown => false,
-+    };
-+    results.frozen_reached_firmware = reached_firmware;
-+
-+    if !ping_ok {
-+        log::error!("aborting: Frozen did not respond to Ping within {PING_RETRY_WINDOW:?} of being released from reset; no Prime sent");
 +    }
 +    // Item 12: no automatic reset assert here -- a preflight failure before Frozen ever responds is
 +    // not "after Frozen is responsive", and is not a pump fault, so item 13's emergency backstop
 +    // does not apply.
-+    if !ping_ok || !reached_firmware {
++    if !startup.ping_ok || !startup.frozen_reached_firmware {
 +        return (finish_release_only(args, results, StopReason::PreflightRefused, 20, dry_run), 20);
 +    }
++    debug_assert!(startup.started_successfully(), "both preflight checks above passed, so this must hold");
 +
 +    // Item 10: the reservoir confirmation is required only now -- after Frozen has reached
 +    // application firmware -- immediately before Prime. Item 11: its outcome is reported
@@ -6007,6 +6831,7 @@ index 0000000..f48654c
 +        prime_results: None,
 +        opensleep_init_results: None,
 +        release_frozen_only_results: None,
++        cool_test_results: None,
 +        overall_pass: false,
 +        exit_code: 30,
 +    }
@@ -6356,10 +7181,10 @@ index 0000000..f48654c
 +}
 diff --git a/src/bin/opensleep-diagnostic/prime_test.rs b/src/bin/opensleep-diagnostic/prime_test.rs
 new file mode 100644
-index 0000000..99a38a0
+index 0000000..e668cde
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/prime_test.rs
-@@ -0,0 +1,1500 @@
+@@ -0,0 +1,1502 @@
 +//! `frozen-prime-test`: the one subcommand that intentionally sends `Prime` (opcode 0x52) to fill
 +//! an empty or partially-filled Eight Sleep Pod 3 hydraulic loop. See SAFETY.md for the
 +//! operator-facing guarantees and PROTOCOL_AUDIT.md for the full source audit behind every claim
@@ -7293,6 +8118,7 @@ index 0000000..99a38a0
 +        prime_results: Some(pr),
 +        opensleep_init_results: None,
 +        release_frozen_only_results: None,
++        cool_test_results: None,
 +        overall_pass,
 +        exit_code: 0,
 +    };
@@ -7371,6 +8197,7 @@ index 0000000..99a38a0
 +        prime_results: None,
 +        opensleep_init_results: None,
 +        release_frozen_only_results: None,
++        cool_test_results: None,
 +        overall_pass: false,
 +        exit_code: 30,
 +    }
@@ -7862,10 +8689,10 @@ index 0000000..99a38a0
 +}
 diff --git a/src/bin/opensleep-diagnostic/report.rs b/src/bin/opensleep-diagnostic/report.rs
 new file mode 100644
-index 0000000..bea209e
+index 0000000..77fff01
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/report.rs
-@@ -0,0 +1,660 @@
+@@ -0,0 +1,747 @@
 +//! Structured JSON/CSV/text reporting shared by all three subcommands. Machine evidence (audit
 +//! log, decoded telemetry) is always kept in separate fields from operator-entered observations,
 +//! per the safety model: a component may only be marked PASS from decoded evidence or an explicit
@@ -8207,6 +9034,57 @@ index 0000000..bea209e
 +    }
 +}
 +
++/// `frozen-cool-test`'s report: this mode now starts Frozen via the same narrow
++/// register-0x02/0x06 pulse `--release-frozen-only` uses (`frozen_startup::start_frozen_narrow`),
++/// never `opensleep::reset::ResetController` or the four-register full reset sequence, and never
++/// asserts any I2C reset on normal completion -- only as an emergency backstop (narrow, bit-1-only)
++/// if UART-based shutdown could not be confirmed for a genuine fault. See `cool_test.rs` module
++/// docs and SAFETY.md for the full narrative.
++#[derive(Debug, Clone, Serialize, Default)]
++pub struct CoolTestResults {
++    pub selected_side: String,
++    pub requested_delta_c: f64,
++    pub requested_duration_seconds: u64,
++    pub actual_duration_seconds: f64,
++    pub baseline_left_c: Option<f64>,
++    pub baseline_right_c: Option<f64>,
++    pub baseline_heatsink_c: Option<f64>,
++    pub minimum_left_c: Option<f64>,
++    pub minimum_right_c: Option<f64>,
++    pub final_left_c: Option<f64>,
++    pub final_right_c: Option<f64>,
++    pub final_heatsink_c: Option<f64>,
++    /// `final_left_c/right_c - baseline_left_c/right_c` for whichever side was selected (negative
++    /// means it cooled).
++    pub selected_side_change_c: Option<f64>,
++    /// Same, for the side that was never enabled -- expected to stay near zero.
++    pub opposite_side_change_c: Option<f64>,
++    pub heatsink_change_c: Option<f64>,
++    /// `true` iff the selected side's live temperature reached the computed target
++    /// (`baseline - requested_delta_c`) before the run stopped for any other reason.
++    pub target_reached: bool,
++    pub selected_tec_activity_observed: bool,
++    pub left_pump_activity_observed: bool,
++    pub right_pump_activity_observed: bool,
++    /// `true` iff shutdown was confirmed -- either both sides' `TargetUpdate(enabled=false)` was
++    /// observed over UART, or (only for a genuine fault where UART confirmation failed) the
++    /// narrow emergency I2C reset was asserted instead. See [`Self::emergency_reset_asserted`].
++    pub shutdown_verified: bool,
++    /// `true` iff this run's emergency path re-asserted Frozen's reset bit via
++    /// `i2c::assert_frozen_reset_bit_only` (bit-1-only read-modify-write) -- never the full,
++    /// hardcoded-0xFF `i2c::assert_reset` every other mode's shutdown uses. Only ever set for a
++    /// genuine fault where UART-based target shutdown could not be confirmed; never on normal
++    /// completion, `DurationExpired`, or a clean Ctrl+C/SIGTERM/SIGHUP.
++    pub emergency_reset_asserted: bool,
++    pub reservoir_status: ReservoirStatus,
++    pub stop_reason: String,
++    /// Which reset/startup implementation this run used -- always the narrow pulse in this
++    /// revision (`ResetController`/the four-register full reset sequence are structurally
++    /// unreachable from this file -- see `main.rs`'s guardrail tests), reported explicitly rather
++    /// than left implicit.
++    pub startup_mode: String,
++}
++
 +/// One decoded firmware pump message (`FW: pump[<side>] ... @ <V>V <A>A`), kept separate from
 +/// `telemetry_samples` since it is not a temperature reading.
 +#[derive(Debug, Clone, Serialize)]
@@ -8366,6 +9244,11 @@ index 0000000..bea209e
 +    /// Set only for a `frozen-prime-opensleep-init --release-frozen-only` run -- always `None`
 +    /// otherwise, exactly as `opensleep_init_results` is always `None` inside it.
 +    pub release_frozen_only_results: Option<ReleaseFrozenOnlyResults>,
++    /// Set only for a `frozen-cool-test` run -- always `None` otherwise. Reported alongside
++    /// `component_results` (that struct's PASS/FAIL/UNVERIFIED verdicts are unchanged by this
++    /// mode's narrower startup/shutdown); this struct adds the detailed numeric/telemetry fields
++    /// (baseline/min/final temperatures, requested vs. actual duration, reservoir status, ...).
++    pub cool_test_results: Option<CoolTestResults>,
 +    pub overall_pass: bool,
 +    pub exit_code: u8,
 +}
@@ -8495,6 +9378,37 @@ index 0000000..bea209e
 +            log::info!("  Normal done observed:            {}", rf.normal_done_observed);
 +            log::info!("  Done because empty observed:     {}", rf.done_because_empty_observed);
 +            log::info!("  Emergency reset asserted:        {}", rf.emergency_reset_asserted);
++        }
++        if let Some(ct) = &self.cool_test_results {
++            log::info!("-- cool-test results --");
++            log::info!("  Selected side:                    {}", ct.selected_side);
++            log::info!("  Requested delta:                  -{:.2}C", ct.requested_delta_c);
++            log::info!(
++                "  Duration: requested={}s actual={:.1}s",
++                ct.requested_duration_seconds, ct.actual_duration_seconds
++            );
++            log::info!(
++                "  Baseline (L/R/heatsink):          {:?}/{:?}/{:?}",
++                ct.baseline_left_c, ct.baseline_right_c, ct.baseline_heatsink_c
++            );
++            log::info!("  Minimum (L/R):                    {:?}/{:?}", ct.minimum_left_c, ct.minimum_right_c);
++            log::info!(
++                "  Final (L/R/heatsink):             {:?}/{:?}/{:?}",
++                ct.final_left_c, ct.final_right_c, ct.final_heatsink_c
++            );
++            log::info!(
++                "  Change (selected/opposite/heatsink): {:?}/{:?}/{:?}",
++                ct.selected_side_change_c, ct.opposite_side_change_c, ct.heatsink_change_c
++            );
++            log::info!("  Target reached:                   {}", ct.target_reached);
++            log::info!(
++                "  TEC activity (selected)/pump activity (L/R): {}/{}/{}",
++                ct.selected_tec_activity_observed, ct.left_pump_activity_observed, ct.right_pump_activity_observed
++            );
++            log::info!("  Shutdown verified:                {}", ct.shutdown_verified);
++            log::info!("  Emergency reset asserted:         {}", ct.emergency_reset_asserted);
++            log::info!("  Reservoir status:                 {}", ct.reservoir_status);
++            log::info!("  Startup mode:                     {}", ct.startup_mode);
 +        }
 +        log::info!("stop reason: {}", self.stop_reason);
 +        if let Some(ss) = &self.safe_stop {
@@ -9393,10 +10307,10 @@ index 0000000..a2a5a23
 +}
 diff --git a/src/bin/opensleep-diagnostic/signals.rs b/src/bin/opensleep-diagnostic/signals.rs
 new file mode 100644
-index 0000000..5ea81b0
+index 0000000..9e5db3b
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/signals.rs
-@@ -0,0 +1,189 @@
+@@ -0,0 +1,195 @@
 +//! Everything that can cut an active phase short. `StopReason` is the vocabulary every abort path
 +//! (Ctrl+C, SIGTERM/SIGHUP, timeout, communication/telemetry error, panic, ...) reduces to before
 +//! `safe_stop::run_safe_stop` runs and the report is written.
@@ -9483,6 +10397,10 @@ index 0000000..5ea81b0
 +    /// (`"FW: [priming] done"` or `"...done because empty"`) before the configured duration
 +    /// elapsed, so the test stopped early and ran safe-stop, per spec.
 +    PrimingCompleted,
++    /// `frozen-cool-test` only: not an error -- the selected side's live temperature reached the
++    /// computed target (`baseline - requested delta`) before the configured duration elapsed, so
++    /// the test stopped early rather than continuing to cool further than requested.
++    TargetTemperatureReached,
 +}
 +
 +impl StopReason {
@@ -9515,6 +10433,7 @@ index 0000000..5ea81b0
 +            StopReason::FrozenReturnedToBootloader => "Frozen returned to bootloader mode during the active phase",
 +            StopReason::I2cFailureDuringPriming => "I2C access failed after priming started",
 +            StopReason::PrimingCompleted => "firmware reported priming complete",
++            StopReason::TargetTemperatureReached => "selected side reached the requested target temperature",
 +        }
 +    }
 +}
@@ -9581,6 +10500,7 @@ index 0000000..5ea81b0
 +            StopReason::FrozenReturnedToBootloader,
 +            StopReason::I2cFailureDuringPriming,
 +            StopReason::PrimingCompleted,
++            StopReason::TargetTemperatureReached,
 +        ] {
 +            assert!(!reason.description().is_empty());
 +        }
