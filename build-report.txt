@@ -1,18 +1,55 @@
 opensleep-diagnostic — build report
 ====================================
 
-Patch revision: 14 (fixes a false TEC-lock abort; extends the active phase to 15 minutes)
-Supersedes revision 13 (decoded the 14-byte GetTemperature reply; fixed a premature 40s baseline
-cutoff), revision 12 (reworked frozen-cool-test onto the narrow startup model; fixed an
-unbounded-write hang), revision 11 (fixed --release-frozen-only to configure the reset pin as an
-output before pulsing it), revision 10 (fixed --release-frozen-only to pulse the reset bit instead
-of one-shot clearing it), revision 9 (added --release-frozen-only: minimal Frozen release, no
-global reset), revision 8 (fixed Frozen/Sensor UART paths for this Hub variant), revision 7
-(replaced --preserve-boot-state with frozen-prime-opensleep-init), revision 6 (added
---preserve-boot-state to frozen-prime-test, now removed), revision 5 (added frozen-prime-test),
-revision 4 (corrected active-test preflight/monitoring), revision 3 (staged, Frozen-only diagnostic
-redesign), revision 2 (sensor-first post-reset bootloader retry-probe), and revision 1 (initial
-diagnostic-only fork). Same upstream base commit; only source.patch changed.
+Patch revision: 15 (fixes a watchdog-clock mismatch and a caller-side TEC control-flow bug)
+Supersedes revision 14 (fixed a false TEC-lock abort; extended the active phase to 15 minutes),
+revision 13 (decoded the 14-byte GetTemperature reply; fixed a premature 40s baseline cutoff),
+revision 12 (reworked frozen-cool-test onto the narrow startup model; fixed an unbounded-write
+hang), revision 11 (fixed --release-frozen-only to configure the reset pin as an output before
+pulsing it), revision 10 (fixed --release-frozen-only to pulse the reset bit instead of one-shot
+clearing it), revision 9 (added --release-frozen-only: minimal Frozen release, no global reset),
+revision 8 (fixed Frozen/Sensor UART paths for this Hub variant), revision 7 (replaced
+--preserve-boot-state with frozen-prime-opensleep-init), revision 6 (added --preserve-boot-state to
+frozen-prime-test, now removed), revision 5 (added frozen-prime-test), revision 4 (corrected
+active-test preflight/monitoring), revision 3 (staged, Frozen-only diagnostic redesign), revision 2
+(sensor-first post-reset bootloader retry-probe), and revision 1 (initial diagnostic-only fork).
+Same upstream base commit; only source.patch changed.
+
+What changed in revision 15
+----------------------------
+Even after revision 14 fixed the TEC-lock substring bug, a live cooling test still shut down
+immediately on "FW: tec[left] safe, unlocking". Root cause: STALE_TELEMETRY_LIMIT (2s, refreshed
+only by unsolicited TemperatureUpdate) was shorter than this firmware's own unsolicited-push
+cadence (~10s, per revision 13's finding) -- the TEC message and the shutdown were coincidentally
+close in the log; the watchdog fired on schedule, not because of the TEC message.
+
+  - Replaced the single clock with four independent ones and three real-hardware-sized limits:
+    ANY_VALID_RX_LIMIT (5s, any decoded packet), TEMPERATURE_FRESHNESS_LIMIT (20s, once a first
+    active-phase temperature sample has been seen), ACTIVE_STARTUP_GRACE (15s, before the first
+    one has). New StopReason variants CommunicationWatchdogExpired/TemperatureWatchdogExpired/
+    TemperatureStartupGraceExpired.
+  - A synchronous GetTemperatures response (both byte shapes) is no longer "raw evidence only"
+    during the active phase -- new shared helper record_active_temperature_sample processes it
+    identically to the unsolicited push, including refreshing the temperature watchdog.
+  - Fixed the active loop trying the safety-state parser on every TEC-tagged message
+    unconditionally, including plain current readings, which produced a spurious "unrecognized
+    TEC safety-state message" warning on every reading. TEC-tagged messages are now routed by
+    type: current is tried first, safety-state only if that doesn't match.
+  - Removed TecSafetyState::is_fault()/is_safe_transition() entirely: even with a correct parser,
+    the caller's own control flow was the actual bug in an earlier draft of this fix. Every call
+    site (including tests) now writes an exhaustive match over all five variants.
+  - Found by this fix's own regression test: "fault" is a substring of "default", and the real,
+    benign message "FW: pump[left] default @ ...V ...A" was misclassified as FirmwareFaultMessage.
+    Fixed the same way as "locked"/"unlocked": word-exact match via WORD_EXACT_FAULT_KEYWORDS.
+  - Every controlled shutdown now logs "beginning controlled shutdown: stop_reason=<code>" from
+    inside run_cool_test_shutdown itself (the sole function every exit path calls), and reports a
+    new stop_reason_code field in text/JSON/CSV.
+  - frozen-cool-test --dry-run's shared mock device now also pushes the exact captured TEC
+    current/"safe, unlocking" sequence once a side is enabled, so this is exercised by the actual
+    packaged ARM64 binary under qemu-aarch64-static, not only cargo test.
+  - Unchanged: default duration (120s), hard maximum (900s), 2.0C delta cap.
+
+4 net new tests (244 total, up from 240). See TEST_RESULTS.md for the full writeup.
 
 What changed in revision 14
 ----------------------------

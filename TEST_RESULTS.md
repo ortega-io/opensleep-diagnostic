@@ -1,11 +1,80 @@
 # TEST_RESULTS.md — opensleep-diagnostic
 
-All 240 unit/integration tests in `src/bin/opensleep-diagnostic/` pass (up from 218; see the
+All 244 unit/integration tests in `src/bin/opensleep-diagnostic/` pass (up from 240; see the
 revision note directly below), plus the 51 pre-existing `opensleep` library tests (unmodified,
-reused as-is) and 0 doc-tests — 291 total, 0 failed. Verified inside the
+reused as-is) and 0 doc-tests — 295 total, 0 failed. Verified inside the
 `messense/rust-musl-cross:aarch64-musl` builder image via `cargo test --locked` under its built-in
 QEMU aarch64 runner (the same environment the release binary is built in) as part of the
-diagnostic-v14 release build -- see `build-report.txt`.
+diagnostic-v15 release build -- see `build-report.txt`.
+
+## Revision note: the fixed TEC-lock parser still aborted -- a caller bug and a watchdog mismatch
+
+Even after revision 14 fixed the substring-matching bug in TEC-lock detection, a live left-side
+cooling test still shut down immediately on `FW: tec[left] safe, unlocking`. Two further,
+independent bugs were found from that single symptom, both now fixed with much better shutdown
+diagnostics added specifically so a third incident like this is never ambiguous from the logs:
+
+* **The real cause: a watchdog clock mismatch, not the TEC message at all.** The incident's
+  captured timing (target enabled, TEC current and `"safe, unlocking"` both received two seconds
+  later, shutdown beginning at that same instant) is exactly `STALE_TELEMETRY_LIMIT` (2s) -- a
+  clock refreshed only by unsolicited `TemperatureUpdate`, shorter than this firmware's own
+  unsolicited-push cadence (~10s, per revision 13's own finding). The TEC message and the shutdown
+  were simply coincidentally close in the log. Fixed by replacing the single clock with four
+  independent ones and three separate, real-hardware-sized limits: `ANY_VALID_RX_LIMIT` (5s, any
+  decoded packet), `TEMPERATURE_FRESHNESS_LIMIT` (20s, once a first active-phase temperature
+  sample has been seen), and `ACTIVE_STARTUP_GRACE` (15s, before the first one has). New
+  `StopReason` variants `CommunicationWatchdogExpired`/`TemperatureWatchdogExpired`/
+  `TemperatureStartupGraceExpired` replace `TelemetryStale` in `frozen-cool-test`'s own active
+  loop (kept in the shared vocabulary -- `frozen-prime-test` still uses the original constant and
+  is unaffected, having not been shown to share this firmware's cadence problem).
+* **A synchronous `GetTemperatures` response is no longer "raw evidence only" during the active
+  phase.** It was already used for baseline collection (revision 13) but silently ignored once the
+  active phase started, even though it's the same signal the temperature watchdog above depends
+  on. A new shared helper, `record_active_temperature_sample`, now processes it identically to the
+  unsolicited push (history, min/max, `evaluate_tick`, target-stability) -- for both the original
+  27-byte reply and this firmware's 14-byte reply, the latter recovered via
+  `frozen_compat::CompatFrameScanner` during the active phase too, not baseline only.
+* **The active loop tried the safety-state parser on every TEC-tagged message unconditionally**,
+  including plain current readings (`"FW: tec[left] current: 11.364773 A"`) -- which
+  `parse_tec_safety_state` correctly classified as `Unknown` (no lock-related word present), but
+  the caller then logged as `"unrecognized TEC safety-state message"` on every single reading.
+  Fixed by routing TEC-tagged messages by type: `parse_tec_current` is tried first, and only if
+  that doesn't match does the safety-state parser run at all.
+* **`TecSafetyState::is_fault()`/`is_safe_transition()` were removed entirely.** Even with a
+  correct parser, the caller's own control flow is what actually caused this incident's shutdown
+  in an earlier draft (`if parse_tec_state(msg).is_some() { break; }`-shaped code). Every call site
+  -- including this file's own tests -- is now required to write an exhaustive `match` over all
+  five `TecSafetyState` variants, so a future positive state can never again be silently folded
+  into "terminal" by a boolean convenience method.
+* **A second, previously undiscovered substring bug, found by this fix's own regression test**:
+  `"fault"` is a literal substring of `"default"`, and `"FW: pump[left] default @ 9.000000V
+  0.200000A"` (a pump reverting to its default drive state -- real vocabulary, confirmed by this
+  incident's own captured timeline) was being misclassified as `FirmwareFaultMessage` by the
+  generic fault-keyword scan's plain `contains("fault")` check. Fixed the same way as the
+  `"locked"`/`"unlocked"` case: `"fault"` is now matched word-exact via
+  `WORD_EXACT_FAULT_KEYWORDS`, alongside `"locked"`.
+* **Every controlled shutdown now logs `"beginning controlled shutdown: stop_reason=<code>"`** from
+  inside `run_cool_test_shutdown` itself -- the sole function every exit path (active loop,
+  baseline-collection interruption, every preflight refusal) calls before returning, so there is no
+  path into shutdown without an assigned, logged reason. New `stop_reason_code` field
+  (`cool_test::stop_reason_code`, a stable underscore_case identifier distinct from the existing
+  human-readable `stop_reason` prose) added to `CoolTestResults` and wired into text, JSON, and CSV.
+* **`frozen-cool-test --dry-run`'s shared mock device** now also pushes the exact captured TEC
+  current/`"safe, unlocking"` sequence once a side is enabled, so this positive-state handling is
+  exercised by the actual packaged ARM64 binary under `qemu-aarch64-static`, not only `cargo test`
+  (`frozen-prime-test`'s dry-run is unaffected -- it never enables a target).
+* **Unchanged**: default duration (120s), hard maximum (900s), and the 2.0C delta cap.
+
+4 net new tests (244 total, up from 240): the exact captured incident timeline replayed end to end
+(`incident_timing_sequence_does_not_trigger_any_watchdog`, which independently caught the
+"fault"/"default" bug above), a temperature-watchdog-with-ongoing-Message-traffic case proving the
+two watchdogs are genuinely independent, and both directions of the new "fault"/"default" fix. Two
+existing tests were corrected to their new, more precise expectations
+(`unsafe_locking_message_triggers_controlled_shutdown` now expects the split `TecUnsafeLocking`
+reason; the renamed `complete_silence_during_active_phase_triggers_communication_watchdog` now
+expects `CommunicationWatchdogExpired`, since its device goes genuinely silent, not merely
+temperature-silent). All `TecSafetyState`-related tests were rewritten to use an exhaustive `match`
+helper rather than the removed boolean methods, matching the caller-discipline fix above.
 
 ## Revision note: fix a false TEC-lock abort; extend the active phase to 15 minutes
 

@@ -496,15 +496,23 @@ fired; see SAFETY.md for the safe-stop sequence itself. All are evaluated inside
 
 | Condition | `StopReason` | Evidence basis |
 |---|---|---|
-| No fresh, valid unsolicited `TemperatureUpdate` for > 2s | `TelemetryStale` | Direct — clock since the last decoded `TemperatureUpdate` |
-| Selected water temperature or heatsink temperature outside the compile-time envelope, or an implausible single-tick jump | `TemperatureRangeExceeded` / `HeatsinkLimitExceeded` / `ImplausibleTemperatureChange` | Direct — decoded `TemperatureUpdate` fields, `cool_test::evaluate_tick` |
+| No successfully decoded packet of *any* kind for > `ANY_VALID_RX_LIMIT` (5s) | `CommunicationWatchdogExpired` | Direct — clock since the last decoded packet, regardless of type |
+| A valid temperature sample had already arrived at least once this active phase, but none for > `TEMPERATURE_FRESHNESS_LIMIT` (20s) | `TemperatureWatchdogExpired` | Direct — clock since the last decoded temperature sample (unsolicited push or solicited reply, either byte shape) |
+| No temperature sample arrived at all within `ACTIVE_STARTUP_GRACE` (15s) of enabling | `TemperatureStartupGraceExpired` | Direct — separate clock from the above; starts at enable, not at the first sample |
+| Selected water temperature or heatsink temperature outside the compile-time envelope, or an implausible single-tick jump | `TemperatureRangeExceeded` / `HeatsinkLimitExceeded` / `ImplausibleTemperatureChange` | Direct — decoded temperature fields (unsolicited push or either solicited reply shape), `cool_test::evaluate_tick`, via the shared `record_active_temperature_sample` path |
 | UART write or read failure | `UartWriteFailure` / `UartReadFailure` | Direct — I/O error from `FrozenLink` |
 | Frozen's own link closes | `TelemetryLost` | Direct |
 | Selected-side pump still reported off/0V more than `PUMP_CONFIRM_GRACE` after the enable command was accepted | `PumpNotConfirmedRunning` | Direct, evidence-gated: only fires if a decoded firmware `Message` for our side's pump was actually observed reporting zero voltage (`cool_test::parse_pump_report`) — never merely from the absence of a message, since absence is not evidence of failure |
-| Firmware `Message` reports the selected TEC's safety interlock as `"unsafe, locking"` or exactly `"locked"` (word-tokenized classification -- see below) | `TecLocked` | Direct — decoded firmware string |
+| Firmware `Message` reports the selected TEC's safety interlock as `"unsafe, locking"` or exactly `"locked"` (word-tokenized classification -- see below) | `TecUnsafeLocking` / `TecLocked` | Direct — decoded firmware string, routed to the safety-state parser only after a `"current:"` line has already been ruled out (see below) |
 | Frozen sends an unsolicited `TargetUpdate` reporting the selected side disabled after this binary successfully enabled it | `TargetDisabledUnexpectedly` | Direct — decoded protocol acknowledgement |
-| Firmware `Message` contains a generic fault keyword (overtemperature, overcurrent, shutdown, fault, failed, locked) after `FAULT_KEYWORD_GRACE` | `FirmwareFaultMessage` | Direct, with a documented carve-out: the literal substring "flash locked" is excluded (see below) |
+| Firmware `Message` contains a generic fault keyword (overtemperature, overcurrent, shutdown, fault, failed, locked) after `FAULT_KEYWORD_GRACE` | `FirmwareFaultMessage` | Direct, with two documented carve-outs: the literal substring "flash locked" is excluded, and "fault"/"locked" are matched word-exact, not by substring (see below) |
 | Operator types a report of a leak, burning smell, or abnormal noise (or the literal word ABORT) | `OperatorAbort` | Explicit operator input, read from a background stdin watcher started only after all confirmation-phrase reads are complete (`cool_test::spawn_operator_abort_watcher`) |
+
+Every one of the above assigns and logs a stable, machine-readable `stop_reason_code`
+(`cool_test::stop_reason_code`) at the moment `run_cool_test_shutdown` begins -- the sole path
+every exit route (active loop, baseline-collection interruption, and every preflight refusal)
+funnels through, so there is no path into shutdown without one. Reported in
+`CoolTestResults::stop_reason_code`, alongside the existing human-readable `stop_reason` prose.
 
 ### The "flash locked" carve-out
 
@@ -521,6 +529,24 @@ message containing the literal substring "flash locked" specifically so this evi
 message is never mistaken for a real "...locked" fault; `cool_test::tests::flash_locked_message_does_not_trigger_shutdown_early`
 proves this does not regress. `parse_tec_safety_state` naturally excludes it too (it only examines
 messages containing the selected side's `"tec[<side>]"` marker), without needing a special case.
+
+### "fault"/"locked": word-exact, not substring -- two real firmware words collide with them
+
+Two of `FAULT_KEYWORDS` are literal substrings of real, benign firmware vocabulary:
+
+- `"locked"` is a substring of `"unlocked"` -- see the TEC section below for the live-hardware
+  incident this caused.
+- `"fault"` is a substring of `"default"` -- a second live-hardware incident's own captured timeline
+  includes the real, benign message `"FW: pump[left] default @ 9.000000V 0.200000A"` (a pump
+  reverting to its default drive state after startup, not a fault), which a plain
+  `contains("fault")` check misclassified as `FirmwareFaultMessage`. Found by this fix's own
+  regression test (`cool_test::tests::incident_timing_sequence_does_not_trigger_any_watchdog`)
+  replaying the incident's exact message sequence, not by a separate live-hardware report.
+
+Both keywords are matched *word-exact* (tokenized on non-alphanumeric characters, then an
+exact-token match) via `cool_test::WORD_EXACT_FAULT_KEYWORDS`; every other entry in
+`FAULT_KEYWORDS` keeps the original substring match, since no evidence has been found of a benign
+word containing any of them.
 
 ### TEC safety-interlock state: word-tokenized, not substring-matched
 
@@ -549,6 +575,44 @@ treated as a fault. The generic fault-keyword scan's `"locked"` entry was fixed 
 (word-exact match for that one keyword only; every other keyword keeps its original substring
 match). `cool_test::tests::unlocking_can_never_be_classified_as_locked` proves the distinction
 directly against the real captured message text.
+
+### Second incident: the fixed parser still aborted -- the caller, not the parser, was the bug
+
+After the fix above shipped, a live left-side cooling test still shut down immediately on `FW:
+tec[left] safe, unlocking`, despite `parse_tec_safety_state` already correctly classifying it as
+`SafeUnlocking`. Two further, independent bugs were found from this single symptom:
+
+1. **The active loop tried the safety-state parser on every TEC-tagged message unconditionally**,
+   including `"FW: tec[left] current: 11.364773 A"` -- a valid current reading, not a safety-state
+   message at all. `parse_tec_safety_state` correctly returned `Unknown` for it (no lock-related
+   word present), but the caller logged that as `"unrecognized TEC safety-state message"` on every
+   single current reading. Fixed by routing TEC-tagged messages by type: `parse_tec_current` is
+   tried first, and only if that doesn't match does `parse_tec_safety_state` run at all -- so a
+   `"current:"` line can never reach the safety-state path, and never produces that warning.
+2. **`STALE_TELEMETRY_LIMIT` (2s), refreshed only by unsolicited `TemperatureUpdate`, was shorter
+   than this firmware's own unsolicited-push cadence** (a separate live capture already on file
+   showed `TemperatureUpdate` arriving only about once every ~10 seconds). The captured incident
+   timing (`target enabled` at 07:59:10, TEC current and `"safe, unlocking"` both received at
+   07:59:12, shutdown beginning at 07:59:12) is *exactly* 2 seconds after enabling -- the real
+   cause was the temperature watchdog firing on schedule, not the TEC message at all; the two
+   events were simply coincidentally close in the log. Fixed by replacing the single clock with
+   four independent ones (`last_any_valid_rx_at`, `last_temperature_sample_at`,
+   `last_selected_pump_telemetry_at`, `last_selected_tec_telemetry_at`) and three separate,
+   evidence-sized limits -- see `ANY_VALID_RX_LIMIT`/`TEMPERATURE_FRESHNESS_LIMIT`/
+   `ACTIVE_STARTUP_GRACE`'s doc comments and the abort-conditions table above. A synchronous
+   `GetTemperatures` response (either byte shape) now also refreshes the temperature clock and
+   updates temperature history during the active phase -- previously "raw evidence only" there,
+   even though baseline collection already used it (see the 14-byte-reply revision above); it must
+   not be decoded only for baseline and then ignored once the active phase starts.
+
+Every controlled shutdown now logs `"beginning controlled shutdown: stop_reason=<code>"` from
+inside `run_cool_test_shutdown` itself -- the sole function every exit path (active loop, baseline
+interruption, and every preflight refusal) calls before returning -- specifically so a future
+incident like this one is never ambiguous from the logs alone.
+`cool_test::tests::incident_timing_sequence_does_not_trigger_any_watchdog` replays the exact
+captured sequence (t=0.1s pump, t=0.2s PID, t=1.8s TEC current, t=2.0s `"safe, unlocking"`, t=5.0s
+more `Message` traffic, t=9.5s a `TemperatureUpdate`) end to end and asserts no watchdog fires --
+this same test independently caught the "fault"/"default" substring bug documented above.
 
 ### Firmware sensor-unavailable messages: recorded as warnings, not fatal
 

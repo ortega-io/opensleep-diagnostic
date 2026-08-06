@@ -645,10 +645,10 @@ index 0000000..9c6296b
 +}
 diff --git a/src/bin/opensleep-diagnostic/cool_test.rs b/src/bin/opensleep-diagnostic/cool_test.rs
 new file mode 100644
-index 0000000..44df14f
+index 0000000..84cc9c2
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/cool_test.rs
-@@ -0,0 +1,3252 @@
+@@ -0,0 +1,3798 @@
 +//! `frozen-cool-test`: the one subcommand that intentionally activates a cooling channel. Every
 +//! hard limit here (max delta, max duration, baseline range, heatsink ceiling) is a compile-time
 +//! constant; no CLI flag can raise any of them. See SAFETY.md for the operator-facing version of
@@ -767,8 +767,41 @@ index 0000000..44df14f
 +/// off before 5 samples could ever arrive on that firmware.
 +pub const BASELINE_MAX_WINDOW: Duration = Duration::from_secs(60);
 +pub const BASELINE_MAX_SPREAD_CENTIDEG: i32 = 300;
-+/// No fresh, valid unsolicited `TemperatureUpdate` for longer than this aborts the active phase.
++/// No longer used by this file's own active loop -- see [`ANY_VALID_RX_LIMIT`]/
++/// [`TEMPERATURE_FRESHNESS_LIMIT`]/[`ACTIVE_STARTUP_GRACE`], which replace the single, too-short
++/// (2s) clock this constant drove with real-hardware-evidenced values. Still `pub` and still used
++/// by `prime_test.rs`'s own, unrelated active-phase staleness check -- priming has not been shown
++/// to share `frozen-cool-test`'s ~10s unsolicited-push cadence problem, so its own watchdog is
++/// intentionally left untouched here.
 +pub const STALE_TELEMETRY_LIMIT: Duration = Duration::from_secs(2);
++/// Detects an actually silent/dead Frozen link during the active phase: no successfully-decoded
++/// packet of *any* kind (`TemperatureUpdate`, `GetTemperature`, `Message`, `TargetUpdate`, ...)
++/// for this long. Deliberately a *separate*, shorter clock from
++/// [`TEMPERATURE_FRESHNESS_LIMIT`] -- see that constant's doc comment for why one shared clock is
++/// wrong for this firmware.
++pub const ANY_VALID_RX_LIMIT: Duration = Duration::from_secs(5);
++/// How long a valid temperature sample (a solicited `GetTemperature` reply -- either the original
++/// 27-byte shape or this firmware's 14-byte shape -- or an unsolicited `TemperatureUpdate`) can go
++/// stale before the active phase aborts, once at least one sample has already been seen (see
++/// [`ACTIVE_STARTUP_GRACE`] for the separate clock covering *before* the first sample).
++///
++/// A live-hardware incident found the active phase shutting down almost immediately after
++/// enabling -- exactly 2 seconds after, in the captured timing -- despite no fault, timeout, or
++/// target attainment. Root cause: the previous single-clock check (`STALE_TELEMETRY_LIMIT`, 2s,
++/// refreshed only by `TemperatureUpdate`) was shorter than this firmware's own unsolicited-push
++/// cadence -- a separate live capture already on file showed `TemperatureUpdate` arriving only
++/// about once every ~10 seconds -- so the 2s watchdog was guaranteed to fire on every active-phase
++/// run regardless of any actual fault. 20s tolerates a missed unsolicited push (~10s) with margin;
++/// a healthy synchronous `GetTemperatures` poll (this binary sends one per ~1s tick) normally
++/// keeps this clock far fresher than 20s whenever the firmware's reply decodes.
++pub const TEMPERATURE_FRESHNESS_LIMIT: Duration = Duration::from_secs(20);
++/// How long after the active phase starts before the *first* temperature sample must have
++/// arrived. Distinct from [`TEMPERATURE_FRESHNESS_LIMIT`]: that clock only starts counting once a
++/// first sample has actually been seen, so a firmware that is simply slow to send its first
++/// reading right after being enabled (busy with pump/solenoid/PID/TEC startup messages -- exactly
++/// the burst of `Message` traffic seen in the incident above) needs its own grace period rather
++/// than being held to a clock that never started ticking.
++pub const ACTIVE_STARTUP_GRACE: Duration = Duration::from_secs(15);
 +/// How long after the enable command is accepted the selected-side pump is allowed to keep
 +/// reporting off/0V before that is treated as an abort condition. Evidence-gated: only fires if a
 +/// firmware pump message for our side was actually observed reporting zero voltage -- see
@@ -776,9 +809,8 @@ index 0000000..44df14f
 +pub const PUMP_CONFIRM_GRACE: Duration = Duration::from_secs(3);
 +/// How long after the active phase starts before generic firmware fault keywords (see
 +/// `is_generic_fault_message`) are treated as fatal, rather than logged only. Chosen conservatively
-+/// (matching `STALE_TELEMETRY_LIMIT`'s magnitude) since no documented firmware startup-timing spec
-+/// exists; a short window avoids mistaking benign boot-time chatter right after the enable command
-+/// for a real fault.
++/// since no documented firmware startup-timing spec exists; a short window avoids mistaking benign
++/// boot-time chatter right after the enable command for a real fault.
 +pub const FAULT_KEYWORD_GRACE: Duration = Duration::from_secs(2);
 +/// Length of each drain window within one ~1-second active-phase/baseline-collection tick.
 +const TICK_DRAIN_WINDOW: Duration = Duration::from_millis(900);
@@ -1005,21 +1037,15 @@ index 0000000..44df14f
 +    Unknown,
 +}
 +
-+impl TecSafetyState {
-+    /// `true` only for the two states that represent a genuine safety shutdown -- both contain
-+    /// the word `"lock"` in some form, so this deliberately never derives from a raw substring
-+    /// check; see this type's doc comment for why that distinction is the entire point.
-+    pub fn is_fault(self) -> bool {
-+        matches!(self, TecSafetyState::UnsafeLocking | TecSafetyState::Locked)
-+    }
-+
-+    /// `true` for the two states that represent the interlock being open/opening -- a positive
-+    /// safety-passed signal, and evidence the selected TEC is (or is becoming) active.
-+    pub fn is_safe_transition(self) -> bool {
-+        matches!(self, TecSafetyState::SafeUnlocking | TecSafetyState::Unlocked)
-+    }
-+}
-+
++/// Deliberately *no* `is_fault()`/`is_safe_transition()` convenience methods here: a second
++/// live-hardware incident found that even after the word-tokenized parser above was fixed, the
++/// *caller* still collapsed a recognized positive state into a generic terminal outcome (the
++/// active loop's own control flow, not the parser, was the bug -- code logically equivalent to
++/// `if parse_tec_state(msg).is_some() { break; }`). Every call site is now required to write an
++/// exhaustive `match` over all five variants instead, so a new positive state can never be
++/// silently folded into "treat as terminal" by a boolean helper that happens to default the wrong
++/// way -- see the active loop's own `match state { ... }` for the pattern this enforces.
++///
 +/// Parses a firmware TEC safety-state message for the given side (e.g. `"FW: tec[left] safe,
 +/// unlocking"`), side-scoped exactly like [`parse_pump_report`]. `None` if this message is not
 +/// about our side's TEC at all. Classifies by *word*, not substring: splits on non-alphanumeric
@@ -1066,16 +1092,24 @@ index 0000000..44df14f
 +}
 +
 +const FAULT_KEYWORDS: [&str; 6] = ["overtemperature", "overcurrent", "shutdown", "fault", "failed", "locked"];
++/// Keywords matched *word-exact* (via tokenizing on non-alphanumeric characters), not by raw
++/// substring, because each is a literal substring of a real, benign firmware word:
++/// - `"locked"` is a substring of `"unlocked"` (a benign TEC-interlock state -- see
++///   [`TecSafetyState`]'s doc comment for the live-hardware regression this guards against).
++/// - `"fault"` is a substring of `"default"` -- confirmed by a second live-hardware incident,
++///   whose own captured timeline includes the real, benign message
++///   `"FW: pump[left] default @ 9.000000V 0.200000A"` (a pump reverting to its default drive
++///   state, not a fault) being misclassified as `FirmwareFaultMessage` by a plain
++///   `contains("fault")` check.
++///
++/// Every other keyword in [`FAULT_KEYWORDS`] keeps the original substring match -- no evidence has
++/// been found of a benign word containing any of them.
++const WORD_EXACT_FAULT_KEYWORDS: [&str; 2] = ["locked", "fault"];
 +
 +/// Generic firmware-fault keyword scan. Excludes the literal substring "flash locked": that is a
 +/// captured, evidenced, benign boot-time firmware message (`frozen/command.rs` source comment,
 +/// paired with "cal_info valid"), not an actuator/safety fault, and would otherwise false-trigger
 +/// on the word "locked" alone.
-+///
-+/// The "locked" keyword specifically is matched *word-exact*, not by substring: "locked" is a
-+/// literal substring of "unlocked" (a benign TEC-interlock state -- see [`TecSafetyState`]'s doc
-+/// comment for the real regression this guards against), so a plain `contains("locked")` would
-+/// false-trigger on it. Every other keyword keeps the original substring match.
 +fn is_generic_fault_message(msg: &str) -> bool {
 +    let lower = msg.to_lowercase();
 +    if lower.contains("flash locked") {
@@ -1083,8 +1117,8 @@ index 0000000..44df14f
 +    }
 +    let words: Vec<&str> = lower.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
 +    FAULT_KEYWORDS.iter().any(|&kw| {
-+        if kw == "locked" {
-+            words.contains(&"locked")
++        if WORD_EXACT_FAULT_KEYWORDS.contains(&kw) {
++            words.contains(&kw)
 +        } else {
 +            lower.contains(kw)
 +        }
@@ -1108,6 +1142,7 @@ index 0000000..44df14f
 +    matches!(
 +        reason,
 +        StopReason::TecLocked
++            | StopReason::TecUnsafeLocking
 +            | StopReason::FirmwareFaultMessage
 +            | StopReason::TemperatureRangeExceeded
 +            | StopReason::HeatsinkLimitExceeded
@@ -1116,11 +1151,49 @@ index 0000000..44df14f
 +            | StopReason::TargetDisabledUnexpectedly
 +            | StopReason::TelemetryLost
 +            | StopReason::TelemetryStale
++            | StopReason::CommunicationWatchdogExpired
++            | StopReason::TemperatureWatchdogExpired
++            | StopReason::TemperatureStartupGraceExpired
 +            | StopReason::UartReadFailure
 +            | StopReason::UartWriteFailure
 +            | StopReason::Panic
 +            | StopReason::OperatorAbort
 +    )
++}
++
++/// Short, stable, machine-readable identifier for `reason`, distinct from
++/// `StopReason::description()`'s human prose -- logged once at the start of every controlled
++/// shutdown (see `run_cool_test_shutdown`, the sole path from the active loop, baseline
++/// collection, and every preflight refusal into shutdown, so there is no path that skips this)
++/// and reported in `CoolTestResults::stop_reason_code`. A live-hardware incident asked for this
++/// vocabulary specifically so a stop reason is never ambiguous from the logs alone.
++fn stop_reason_code(reason: StopReason) -> &'static str {
++    match reason {
++        StopReason::DurationExpired => "requested_duration_expired",
++        StopReason::TargetTemperatureReached => "stable_target_reached",
++        StopReason::OperatorAbort => "operator_abort",
++        StopReason::CtrlC => "sigint",
++        // SIGHUP is handled identically to SIGTERM throughout this file (both simply select
++        // alongside SIGINT in wait_for_termination_signal); no distinct code was requested for it.
++        StopReason::Sigterm | StopReason::Sighup => "sigterm",
++        StopReason::TecUnsafeLocking => "explicit_tec_unsafe_locking",
++        StopReason::TecLocked => "explicit_tec_locked",
++        StopReason::UartReadFailure | StopReason::UartWriteFailure | StopReason::TelemetryLost => "communication_loss",
++        StopReason::CommunicationWatchdogExpired => "communication_watchdog_expired",
++        StopReason::TemperatureWatchdogExpired | StopReason::TelemetryStale => "temperature_watchdog_expired",
++        StopReason::TemperatureStartupGraceExpired => "temperature_startup_grace_expired",
++        StopReason::PumpNotConfirmedRunning => "pump_startup_failure",
++        StopReason::TargetDisabledUnexpectedly => "target_state_lost",
++        StopReason::TemperatureRangeExceeded | StopReason::HeatsinkLimitExceeded | StopReason::ImplausibleTemperatureChange => {
++            "thermal_safety_limit"
++        }
++        StopReason::FirmwareFaultMessage => "thermal_safety_limit",
++        StopReason::Panic => "internal_error",
++        StopReason::PreflightRefused => "preflight_refused",
++        // Never actually produced on any path this file's own code takes; kept for match
++        // exhaustiveness across the enum shared with the other subcommands.
++        _ => "internal_error",
++    }
 +}
 +
 +/// The result of [`run_cool_test_shutdown`].
@@ -1168,6 +1241,11 @@ index 0000000..44df14f
 +    P: I2cPort,
 +{
 +    let side_tag = side_word(side);
++    // Every path into controlled shutdown funnels through this one function -- the active loop,
++    // baseline-collection interruption, and every preflight refusal all call this before
++    // returning -- so this single log line structurally guarantees there is no path from the
++    // active loop to shutdown without an assigned, logged stop reason.
++    log::info!("beginning controlled shutdown: stop_reason={}", stop_reason_code(stop_reason));
 +    let mut result = CoolTestShutdown::default();
 +
 +    if let Some(link) = link {
@@ -1337,6 +1415,7 @@ index 0000000..44df14f
 +    if !startup.pulse.fully_verified() {
 +        log::error!("refusing to run active test: register 0x02/0x06 pulse did not verify");
 +        ct.stop_reason = StopReason::PreflightRefused.to_string();
++        ct.stop_reason_code = stop_reason_code(StopReason::PreflightRefused).to_string();
 +        return finish(
 +            args, dry_run, &audit, &stats, samples, cr, ct, StopReason::PreflightRefused, false, 20,
 +            expander_value, &led, false, false,
@@ -1349,6 +1428,7 @@ index 0000000..44df14f
 +        ct.shutdown_verified = shutdown.verified();
 +        ct.emergency_reset_asserted = shutdown.emergency_reset_asserted;
 +        ct.stop_reason = StopReason::PreflightRefused.to_string();
++        ct.stop_reason_code = stop_reason_code(StopReason::PreflightRefused).to_string();
 +        return finish(
 +            args, dry_run, &audit, &stats, samples, cr, ct, StopReason::PreflightRefused, false, 20,
 +            expander_value, &led, true, startup.frozen_reached_firmware,
@@ -1378,6 +1458,7 @@ index 0000000..44df14f
 +        ct.shutdown_verified = shutdown.verified();
 +        ct.emergency_reset_asserted = shutdown.emergency_reset_asserted;
 +        ct.stop_reason = StopReason::PreflightRefused.to_string();
++        ct.stop_reason_code = stop_reason_code(StopReason::PreflightRefused).to_string();
 +        return finish(
 +            args, dry_run, &audit, &stats, samples, cr, ct, StopReason::PreflightRefused, false, 30,
 +            expander_value, &led, true, true,
@@ -1524,6 +1605,7 @@ index 0000000..44df14f
 +        ct.shutdown_verified = shutdown.verified();
 +        ct.emergency_reset_asserted = shutdown.emergency_reset_asserted;
 +        ct.stop_reason = reason.to_string();
++        ct.stop_reason_code = stop_reason_code(reason).to_string();
 +        return finish(
 +            args, dry_run, &audit, &stats, samples, cr, ct, reason, false, 30, expander_value, &led, true, true,
 +        );
@@ -1550,6 +1632,7 @@ index 0000000..44df14f
 +            ct.shutdown_verified = shutdown.verified();
 +            ct.emergency_reset_asserted = shutdown.emergency_reset_asserted;
 +            ct.stop_reason = StopReason::PreflightRefused.to_string();
++            ct.stop_reason_code = stop_reason_code(StopReason::PreflightRefused).to_string();
 +            return finish(
 +                args, dry_run, &audit, &stats, samples, cr, ct, StopReason::PreflightRefused, false, 30,
 +                expander_value, &led, true, true,
@@ -1575,6 +1658,7 @@ index 0000000..44df14f
 +            ct.shutdown_verified = shutdown.verified();
 +            ct.emergency_reset_asserted = shutdown.emergency_reset_asserted;
 +            ct.stop_reason = StopReason::PreflightRefused.to_string();
++            ct.stop_reason_code = stop_reason_code(StopReason::PreflightRefused).to_string();
 +            return finish(
 +                args, dry_run, &audit, &stats, samples, cr, ct, StopReason::PreflightRefused, false, 30,
 +                expander_value, &led, true, true,
@@ -1597,6 +1681,7 @@ index 0000000..44df14f
 +        ct.shutdown_verified = shutdown.verified();
 +        ct.emergency_reset_asserted = shutdown.emergency_reset_asserted;
 +        ct.stop_reason = StopReason::PreflightRefused.to_string();
++        ct.stop_reason_code = stop_reason_code(StopReason::PreflightRefused).to_string();
 +        return finish(
 +            args, dry_run, &audit, &stats, samples, cr, ct, StopReason::PreflightRefused, false, 30,
 +            expander_value, &led, true, true,
@@ -1622,6 +1707,7 @@ index 0000000..44df14f
 +        ct.shutdown_verified = shutdown.verified();
 +        ct.emergency_reset_asserted = shutdown.emergency_reset_asserted;
 +        ct.stop_reason = StopReason::PreflightRefused.to_string();
++        ct.stop_reason_code = stop_reason_code(StopReason::PreflightRefused).to_string();
 +        return finish(
 +            args, dry_run, &audit, &stats, samples, cr, ct, StopReason::PreflightRefused, false, 30,
 +            expander_value, &led, true, true,
@@ -1652,7 +1738,15 @@ index 0000000..44df14f
 +
 +    let active_start = Instant::now();
 +    let duration = Duration::from_secs(args.duration_seconds.min(HARD_MAX_DURATION_SECONDS));
-+    let mut last_valid_at = Instant::now();
++    // Four separate freshness clocks, not one shared clock -- see ANY_VALID_RX_LIMIT/
++    // TEMPERATURE_FRESHNESS_LIMIT/ACTIVE_STARTUP_GRACE's doc comments for the real-hardware
++    // incident that resulted from conflating "any packet arrived" with "a temperature sample
++    // arrived". The pump/TEC clocks are tracked for visibility but do not themselves gate a stop
++    // condition (pump startup failure already has its own evidence-gated mechanism below).
++    let mut last_any_valid_rx_at = Instant::now();
++    let mut last_temperature_sample_at: Option<Instant> = None;
++    let mut last_selected_pump_telemetry_at: Option<Instant> = None;
++    let mut last_selected_tec_telemetry_at: Option<Instant> = None;
 +    let mut active_left_c: Vec<f64> = Vec::new();
 +    let mut active_right_c: Vec<f64> = Vec::new();
 +    let mut prev_side_centideg: Option<i32> = None;
@@ -1669,6 +1763,7 @@ index 0000000..44df14f
 +    let mut left_pump_activity_observed = false;
 +    let mut right_pump_activity_observed = false;
 +    let mut selected_tec_safety_passed = false;
++    let mut selected_tec_unlocking_observed = false;
 +    let mut tec_current_first_a: Option<f64> = None;
 +    let mut tec_current_min_a: Option<f64> = None;
 +    let mut tec_current_max_a: Option<f64> = None;
@@ -1735,127 +1830,136 @@ index 0000000..44df14f
 +                }
 +                outcome = link.recv(remaining) => {
 +                    match outcome {
-+                        Ok(PacketOutcome::Received(FrozenPacket::TemperatureUpdate(u))) => {
-+                            stats.record(&FrozenPacket::TemperatureUpdate(u.clone()));
-+                            last_valid_at = Instant::now();
-+                            let elapsed_ms = active_start.elapsed().as_millis() as u64;
-+                            samples.push((&sample_from_temperature_update(elapsed_ms, jiff::Timestamp::now().to_string(), &u)).into());
-+                            let left_c = crate::telemetry::centideg_to_celsius(u.left_temp);
-+                            let right_c = crate::telemetry::centideg_to_celsius(u.right_temp);
-+                            let heatsink_c = crate::telemetry::centideg_to_celsius(u.heatsink_temp);
-+                            active_left_c.push(left_c);
-+                            active_right_c.push(right_c);
-+                            min_left_c = Some(min_left_c.map_or(left_c, |m: f64| m.min(left_c)));
-+                            min_right_c = Some(min_right_c.map_or(right_c, |m: f64| m.min(right_c)));
-+                            max_heatsink_c = Some(max_heatsink_c.map_or(heatsink_c, |m: f64| m.max(heatsink_c)));
-+                            final_left_c = Some(left_c);
-+                            final_right_c = Some(right_c);
-+                            final_heatsink_c = Some(heatsink_c);
-+
-+                            let side_centideg = match side {
-+                                BedSide::Left => u.left_temp,
-+                                BedSide::Right => u.right_temp,
-+                            };
-+                            let heatsink_centideg = u.heatsink_temp;
-+
-+                            // Isolated behind `catch_unwind`: `evaluate_tick` is a small, pure,
-+                            // panic-free-by-design function, but wrapping it means a future bug
-+                            // here cannot bring down the whole active loop before shutdown runs.
-+                            match std::panic::catch_unwind(|| evaluate_tick(side_centideg, heatsink_centideg, prev_side_centideg)) {
-+                                Ok(Ok(v)) => prev_side_centideg = Some(v),
-+                                Ok(Err(reason)) => {
-+                                    stop_reason = reason;
-+                                    telemetry_ok = false;
-+                                    break 'active;
++                        Ok(PacketOutcome::Received(pkt)) => {
++                            // Communication-watchdog clock: refreshed by *any* successfully
++                            // decoded packet, regardless of type -- see ANY_VALID_RX_LIMIT's doc
++                            // comment for why this is deliberately separate from the
++                            // temperature-specific clock below.
++                            last_any_valid_rx_at = Instant::now();
++                            match pkt {
++                                FrozenPacket::TemperatureUpdate(u) => {
++                                    stats.record(&FrozenPacket::TemperatureUpdate(u.clone()));
++                                    last_temperature_sample_at = Some(Instant::now());
++                                    let elapsed_ms = active_start.elapsed().as_millis() as u64;
++                                    samples.push((&sample_from_temperature_update(elapsed_ms, jiff::Timestamp::now().to_string(), &u)).into());
++                                    if let Some(reason) = record_active_temperature_sample(
++                                        side, u.left_temp, u.right_temp, u.heatsink_temp, we_enabled_side,
++                                        target_centideg, active_start, &mut active_left_c, &mut active_right_c,
++                                        &mut prev_side_centideg, &mut min_left_c, &mut min_right_c, &mut max_heatsink_c,
++                                        &mut final_left_c, &mut final_right_c, &mut final_heatsink_c,
++                                        &mut target_reached, &mut target_reached_at, &mut time_to_target_seconds,
++                                    ) {
++                                        stop_reason = reason;
++                                        if !matches!(reason, StopReason::TargetTemperatureReached) {
++                                            telemetry_ok = false;
++                                        }
++                                        break 'active;
++                                    }
 +                                }
-+                                Err(_panic) => {
-+                                    log::error!("panic while evaluating a temperature sample; stopping safely");
-+                                    stop_reason = StopReason::Panic;
-+                                    telemetry_ok = false;
-+                                    break 'active;
++                                FrozenPacket::GetTemperature(g) => {
++                                    // No longer "raw evidence only": a synchronous GetTemperatures
++                                    // response is now a first-class temperature source during the
++                                    // active phase too, symmetric with the unsolicited push -- see
++                                    // record_active_temperature_sample's doc comment.
++                                    stats.record(&FrozenPacket::GetTemperature(g.clone()));
++                                    last_temperature_sample_at = Some(Instant::now());
++                                    let elapsed_ms = active_start.elapsed().as_millis() as u64;
++                                    samples.push((&sample_from_get_temperature(elapsed_ms, jiff::Timestamp::now().to_string(), &g)).into());
++                                    if let Some(reason) = record_active_temperature_sample(
++                                        side, g.left_temp, g.right_temp, g.heatsink_temp, we_enabled_side,
++                                        target_centideg, active_start, &mut active_left_c, &mut active_right_c,
++                                        &mut prev_side_centideg, &mut min_left_c, &mut min_right_c, &mut max_heatsink_c,
++                                        &mut final_left_c, &mut final_right_c, &mut final_heatsink_c,
++                                        &mut target_reached, &mut target_reached_at, &mut time_to_target_seconds,
++                                    ) {
++                                        stop_reason = reason;
++                                        if !matches!(reason, StopReason::TargetTemperatureReached) {
++                                            telemetry_ok = false;
++                                        }
++                                        break 'active;
++                                    }
++                                }
++                                FrozenPacket::Message(m) => {
++                                    stats.record(&FrozenPacket::Message(m.clone()));
++                                    if let Some(running) = parse_pump_report(&m, side_tag) {
++                                        pump_confirmed_running |= running;
++                                        pump_last_report_off = !running;
++                                        last_selected_pump_telemetry_at = Some(Instant::now());
++                                    }
++                                    if parse_pump_report(&m, "left") == Some(true) {
++                                        left_pump_activity_observed = true;
++                                    }
++                                    if parse_pump_report(&m, "right") == Some(true) {
++                                        right_pump_activity_observed = true;
++                                    }
++                                    // TEC-prefixed messages are routed by exact type, not tried
++                                    // against every parser unconditionally: a "current:" line
++                                    // must never reach the safety-state parser (it previously
++                                    // did, producing a spurious "unrecognized TEC safety-state
++                                    // message" warning for perfectly valid telemetry).
++                                    if let Some(amps) = parse_tec_current(&m, side_tag) {
++                                        tec_current_samples += 1;
++                                        tec_current_first_a.get_or_insert(amps);
++                                        tec_current_min_a = Some(tec_current_min_a.map_or(amps, |v: f64| v.min(amps)));
++                                        tec_current_max_a = Some(tec_current_max_a.map_or(amps, |v: f64| v.max(amps)));
++                                        tec_current_last_a = Some(amps);
++                                        tec_activity_seen = true;
++                                        last_selected_tec_telemetry_at = Some(Instant::now());
++                                    } else if let Some(state) = parse_tec_safety_state(&m, side_tag) {
++                                        last_selected_tec_telemetry_at = Some(Instant::now());
++                                        match state {
++                                            TecSafetyState::Locked => {
++                                                log::error!("firmware reported the selected TEC locked: {m:?}");
++                                                stop_reason = StopReason::TecLocked;
++                                                telemetry_ok = false;
++                                                break 'active;
++                                            }
++                                            TecSafetyState::UnsafeLocking => {
++                                                log::error!(
++                                                    "firmware reported the selected TEC transitioning unsafe (locking): {m:?}"
++                                                );
++                                                stop_reason = StopReason::TecUnsafeLocking;
++                                                telemetry_ok = false;
++                                                break 'active;
++                                            }
++                                            TecSafetyState::SafeUnlocking => {
++                                                selected_tec_safety_passed = true;
++                                                selected_tec_unlocking_observed = true;
++                                                tec_activity_seen = true;
++                                            }
++                                            TecSafetyState::Unlocked => {
++                                                selected_tec_safety_passed = true;
++                                                tec_activity_seen = true;
++                                            }
++                                            TecSafetyState::Unknown => {
++                                                log::warn!(
++                                                    "unrecognized TEC safety-state message (not treated as a fault): {m:?}"
++                                                );
++                                            }
++                                        }
++                                    }
++                                    if is_known_nonfatal_sensor_message(&m) {
++                                        log::warn!("firmware sensor-unavailable message (non-fatal): {m:?}");
++                                    } else if active_start.elapsed() > FAULT_KEYWORD_GRACE && is_generic_fault_message(&m) {
++                                        log::error!("firmware fault message during active phase: {m:?}");
++                                        stop_reason = StopReason::FirmwareFaultMessage;
++                                        telemetry_ok = false;
++                                        break 'active;
++                                    }
++                                }
++                                FrozenPacket::TargetUpdate((s, target)) => {
++                                    stats.record(&FrozenPacket::TargetUpdate((s, target.clone())));
++                                    if s == side && we_enabled_side && !target.enabled {
++                                        log::error!("Frozen disabled the selected side unexpectedly");
++                                        stop_reason = StopReason::TargetDisabledUnexpectedly;
++                                        telemetry_ok = false;
++                                        break 'active;
++                                    }
++                                }
++                                other => {
++                                    stats.record(&other);
 +                                }
 +                            }
-+
-+                            // Stop early once the requested target has been reached -- never cool
-+                            // further than what was requested and confirmed. A single tick at or
-+                            // below target is not itself sufficient (telemetry noise or a single
-+                            // fast-settling sample); the reading must stay at/below target for
-+                            // TARGET_STABLE_CONFIRM_WINDOW before the active phase actually stops
-+                            // -- and the TEC is never kept enabled merely to consume the rest of
-+                            // the requested duration once that stability is confirmed.
-+                            if we_enabled_side && (side_centideg as i32) <= (target_centideg as i32) {
-+                                let reached_at = *target_reached_at.get_or_insert_with(Instant::now);
-+                                if reached_at.elapsed() >= TARGET_STABLE_CONFIRM_WINDOW {
-+                                    target_reached = true;
-+                                    time_to_target_seconds =
-+                                        Some(reached_at.saturating_duration_since(active_start).as_secs_f64());
-+                                    stop_reason = StopReason::TargetTemperatureReached;
-+                                    break 'active;
-+                                }
-+                            } else {
-+                                target_reached_at = None;
-+                            }
-+                        }
-+                        Ok(PacketOutcome::Received(FrozenPacket::GetTemperature(g))) => {
-+                            // Raw evidence only -- see module docs; never gates a decision.
-+                            stats.record(&FrozenPacket::GetTemperature(g.clone()));
-+                            let elapsed_ms = active_start.elapsed().as_millis() as u64;
-+                            samples.push((&sample_from_get_temperature(elapsed_ms, jiff::Timestamp::now().to_string(), &g)).into());
-+                        }
-+                        Ok(PacketOutcome::Received(FrozenPacket::Message(m))) => {
-+                            stats.record(&FrozenPacket::Message(m.clone()));
-+                            if let Some(running) = parse_pump_report(&m, side_tag) {
-+                                pump_confirmed_running |= running;
-+                                pump_last_report_off = !running;
-+                            }
-+                            if parse_pump_report(&m, "left") == Some(true) {
-+                                left_pump_activity_observed = true;
-+                            }
-+                            if parse_pump_report(&m, "right") == Some(true) {
-+                                right_pump_activity_observed = true;
-+                            }
-+                            if let Some(amps) = parse_tec_current(&m, side_tag) {
-+                                tec_current_samples += 1;
-+                                tec_current_first_a.get_or_insert(amps);
-+                                tec_current_min_a = Some(tec_current_min_a.map_or(amps, |v: f64| v.min(amps)));
-+                                tec_current_max_a = Some(tec_current_max_a.map_or(amps, |v: f64| v.max(amps)));
-+                                tec_current_last_a = Some(amps);
-+                            }
-+                            if let Some(state) = parse_tec_safety_state(&m, side_tag) {
-+                                if state.is_fault() {
-+                                    log::error!("firmware reported the selected TEC {state:?}: {m:?}");
-+                                    stop_reason = StopReason::TecLocked;
-+                                    telemetry_ok = false;
-+                                    break 'active;
-+                                } else if state.is_safe_transition() {
-+                                    selected_tec_safety_passed = true;
-+                                    tec_activity_seen = true;
-+                                } else {
-+                                    log::warn!(
-+                                        "unrecognized TEC safety-state message (not treated as a fault): {m:?}"
-+                                    );
-+                                }
-+                            }
-+                            if is_known_nonfatal_sensor_message(&m) {
-+                                log::warn!("firmware sensor-unavailable message (non-fatal): {m:?}");
-+                            } else if active_start.elapsed() > FAULT_KEYWORD_GRACE && is_generic_fault_message(&m) {
-+                                log::error!("firmware fault message during active phase: {m:?}");
-+                                stop_reason = StopReason::FirmwareFaultMessage;
-+                                telemetry_ok = false;
-+                                break 'active;
-+                            }
-+                        }
-+                        Ok(PacketOutcome::Received(FrozenPacket::TargetUpdate((s, target)))) => {
-+                            stats.record(&FrozenPacket::TargetUpdate((s, target.clone())));
-+                            if s == side && we_enabled_side && !target.enabled {
-+                                log::error!("Frozen disabled the selected side unexpectedly");
-+                                stop_reason = StopReason::TargetDisabledUnexpectedly;
-+                                telemetry_ok = false;
-+                                break 'active;
-+                            }
-+                        }
-+                        Ok(PacketOutcome::Received(other)) => {
-+                            stats.record(&other);
 +                        }
 +                        Ok(PacketOutcome::TimedOut) => break, // nothing more buffered right now
 +                        Ok(PacketOutcome::Closed) => {
@@ -1879,6 +1983,54 @@ index 0000000..44df14f
 +            }
 +        }
 +
++        // Raw-capture-based recovery of the 14-byte GetTemperature shape during the active phase
++        // too, not only baseline collection -- see record_active_temperature_sample's doc comment
++        // for why. Also continues tallying the other known firmware-compatibility frame shapes.
++        if let Some(capture) = &capture {
++            let new_events = crate::io_logging::events_since(capture, &mut raw_scan_checkpoint);
++            for event in new_events.iter().filter(|e| e.direction == "rx") {
++                if let Some(bytes) = crate::io_logging::hex_to_bytes(&event.hex) {
++                    compat_scanner.feed(&bytes);
++                }
++            }
++            for frame in compat_scanner.drain_frames() {
++                match frame.opcode {
++                    crate::frozen_compat::GET_TEMPERATURE_OPCODE => {
++                        if let Some(g) = crate::frozen_compat::decode_get_temperature_14byte(&frame.payload) {
++                            compat_get_temperature_14byte_frames += 1;
++                            last_any_valid_rx_at = Instant::now();
++                            last_temperature_sample_at = Some(Instant::now());
++                            let elapsed_ms = active_start.elapsed().as_millis() as u64;
++                            let sample =
++                                sample_from_get_temperature_compat14(elapsed_ms, jiff::Timestamp::now().to_string(), &g);
++                            samples.push((&sample).into());
++                            if let Some(reason) = record_active_temperature_sample(
++                                side, g.left_temp, g.right_temp, g.heatsink_temp, we_enabled_side,
++                                target_centideg, active_start, &mut active_left_c, &mut active_right_c,
++                                &mut prev_side_centideg, &mut min_left_c, &mut min_right_c, &mut max_heatsink_c,
++                                &mut final_left_c, &mut final_right_c, &mut final_heatsink_c,
++                                &mut target_reached, &mut target_reached_at, &mut time_to_target_seconds,
++                            ) {
++                                stop_reason = reason;
++                                if !matches!(reason, StopReason::TargetTemperatureReached) {
++                                    telemetry_ok = false;
++                                }
++                                break 'active;
++                            }
++                        }
++                    }
++                    crate::frozen_compat::HEARTBEAT_OPCODE
++                        if frame.payload.len() == crate::frozen_compat::HEARTBEAT_OBSERVED_COMPAT_SIZE =>
++                    {
++                        compat_heartbeat_9byte_frames += 1;
++                    }
++                    0x54 => compat_opcode_0x54_frames += 1,
++                    0x55 => compat_opcode_0x55_frames += 1,
++                    _ => {}
++                }
++            }
++        }
++
 +        if active_start.elapsed() >= PUMP_CONFIRM_GRACE && !pump_confirmed_running && pump_last_report_off {
 +            log::error!(
 +                "selected-side pump still reports off/0V {:?} after the target was enabled",
@@ -1889,10 +2041,39 @@ index 0000000..44df14f
 +            break 'active;
 +        }
 +
-+        if last_valid_at.elapsed() > STALE_TELEMETRY_LIMIT {
-+            stop_reason = StopReason::TelemetryStale;
++        if last_any_valid_rx_at.elapsed() > ANY_VALID_RX_LIMIT {
++            log::error!(
++                "no valid packet of any kind for {:?} (limit {:?}) -- communication watchdog. \
++                 Last selected-side pump telemetry: {:?} ago. Last selected-side TEC telemetry: {:?} ago.",
++                last_any_valid_rx_at.elapsed(), ANY_VALID_RX_LIMIT,
++                last_selected_pump_telemetry_at.map(|at| at.elapsed()),
++                last_selected_tec_telemetry_at.map(|at| at.elapsed()),
++            );
++            stop_reason = StopReason::CommunicationWatchdogExpired;
 +            telemetry_ok = false;
 +            break 'active;
++        }
++
++        match last_temperature_sample_at {
++            None if active_start.elapsed() > ACTIVE_STARTUP_GRACE => {
++                log::error!(
++                    "no temperature sample within {:?} of enabling (limit {:?}) -- startup grace expired",
++                    active_start.elapsed(), ACTIVE_STARTUP_GRACE
++                );
++                stop_reason = StopReason::TemperatureStartupGraceExpired;
++                telemetry_ok = false;
++                break 'active;
++            }
++            Some(at) if at.elapsed() > TEMPERATURE_FRESHNESS_LIMIT => {
++                log::error!(
++                    "no fresh temperature sample for {:?} (limit {:?}) -- temperature watchdog",
++                    at.elapsed(), TEMPERATURE_FRESHNESS_LIMIT
++                );
++                stop_reason = StopReason::TemperatureWatchdogExpired;
++                telemetry_ok = false;
++                break 'active;
++            }
++            _ => {}
 +        }
 +    }
 +
@@ -1950,10 +2131,16 @@ index 0000000..44df14f
 +    ct.selected_tec_current_max_a = tec_current_max_a;
 +    ct.selected_tec_current_last_a = tec_current_last_a;
 +    ct.selected_tec_current_samples = tec_current_samples;
-+    ct.telemetry_watchdog_triggered = stop_reason == StopReason::TelemetryStale;
++    ct.telemetry_watchdog_triggered = matches!(
++        stop_reason,
++        StopReason::TelemetryStale | StopReason::TemperatureWatchdogExpired | StopReason::TemperatureStartupGraceExpired
++    );
 +    ct.communication_loss_observed = matches!(
 +        stop_reason,
-+        StopReason::UartReadFailure | StopReason::UartWriteFailure | StopReason::TelemetryLost
++        StopReason::UartReadFailure
++            | StopReason::UartWriteFailure
++            | StopReason::TelemetryLost
++            | StopReason::CommunicationWatchdogExpired
 +    );
 +    ct.operator_abort_observed = stop_reason == StopReason::OperatorAbort;
 +    ct.both_targets_shutdown_confirmed = shutdown.both_confirmed_disabled;
@@ -1963,6 +2150,15 @@ index 0000000..44df14f
 +    ct.emergency_reset_asserted = shutdown.emergency_reset_asserted;
 +    ct.actual_active_duration_seconds = active_start.elapsed().as_secs_f64();
 +    ct.stop_reason = stop_reason.to_string();
++    ct.stop_reason_code = stop_reason_code(stop_reason).to_string();
++    ct.selected_tec_unlocking_observed = selected_tec_unlocking_observed;
++    // Overwrites the baseline-only snapshot taken right after baseline collection (see above) now
++    // that the active phase may have added to the same counters -- see
++    // frozen_compat.rs/record_active_temperature_sample's doc comments.
++    ct.compat_get_temperature_14byte_frames = compat_get_temperature_14byte_frames;
++    ct.compat_heartbeat_9byte_frames = compat_heartbeat_9byte_frames;
++    ct.compat_opcode_0x54_frames = compat_opcode_0x54_frames;
++    ct.compat_opcode_0x55_frames = compat_opcode_0x55_frames;
 +
 +    // stop_reason here is never PreflightRefused (every such path above already returned its own
 +    // exit code directly): a normal active-test outcome is 0 on PASS, 21 if shutdown itself could
@@ -1998,6 +2194,86 @@ index 0000000..44df14f
 +        return Err(StopReason::ImplausibleTemperatureChange);
 +    }
 +    Ok(side_centideg)
++}
++
++/// One tick's worth of processing for a valid, decoded temperature reading during the active
++/// phase, regardless of source: an unsolicited `TemperatureUpdate`, a solicited `GetTemperature`
++/// reply via the normal, unmodified upstream 27-byte decode path, or one recovered via
++/// `frozen_compat::CompatFrameScanner` from this firmware's 14-byte reply. All three now share
++/// this one path (history, min/max, `evaluate_tick`, target-stability tracking) instead of only
++/// `TemperatureUpdate` being wired up and the other two being "raw evidence only" -- a real
++/// synchronous `GetTemperatures` response must not be decoded only for baseline collection and
++/// then ignored once the active phase starts. Returns `Some(reason)` if this sample itself must
++/// end the active phase (an implausible jump, an out-of-range value, the heatsink ceiling, a panic
++/// while evaluating, or the target being *stably* reached).
++#[allow(clippy::too_many_arguments)]
++fn record_active_temperature_sample(
++    side: BedSide,
++    left_temp: u16,
++    right_temp: u16,
++    heatsink_temp: u16,
++    we_enabled_side: bool,
++    target_centideg: u16,
++    active_start: Instant,
++    active_left_c: &mut Vec<f64>,
++    active_right_c: &mut Vec<f64>,
++    prev_side_centideg: &mut Option<i32>,
++    min_left_c: &mut Option<f64>,
++    min_right_c: &mut Option<f64>,
++    max_heatsink_c: &mut Option<f64>,
++    final_left_c: &mut Option<f64>,
++    final_right_c: &mut Option<f64>,
++    final_heatsink_c: &mut Option<f64>,
++    target_reached: &mut bool,
++    target_reached_at: &mut Option<Instant>,
++    time_to_target_seconds: &mut Option<f64>,
++) -> Option<StopReason> {
++    let left_c = crate::telemetry::centideg_to_celsius(left_temp);
++    let right_c = crate::telemetry::centideg_to_celsius(right_temp);
++    let heatsink_c = crate::telemetry::centideg_to_celsius(heatsink_temp);
++    active_left_c.push(left_c);
++    active_right_c.push(right_c);
++    *min_left_c = Some(min_left_c.map_or(left_c, |m: f64| m.min(left_c)));
++    *min_right_c = Some(min_right_c.map_or(right_c, |m: f64| m.min(right_c)));
++    *max_heatsink_c = Some(max_heatsink_c.map_or(heatsink_c, |m: f64| m.max(heatsink_c)));
++    *final_left_c = Some(left_c);
++    *final_right_c = Some(right_c);
++    *final_heatsink_c = Some(heatsink_c);
++
++    let side_centideg = match side {
++        BedSide::Left => left_temp,
++        BedSide::Right => right_temp,
++    };
++
++    // Isolated behind `catch_unwind`: `evaluate_tick` is a small, pure, panic-free-by-design
++    // function, but wrapping it means a future bug here cannot bring down the whole active loop
++    // before shutdown runs.
++    match std::panic::catch_unwind(|| evaluate_tick(side_centideg, heatsink_temp, *prev_side_centideg)) {
++        Ok(Ok(v)) => *prev_side_centideg = Some(v),
++        Ok(Err(reason)) => return Some(reason),
++        Err(_panic) => {
++            log::error!("panic while evaluating a temperature sample; stopping safely");
++            return Some(StopReason::Panic);
++        }
++    }
++
++    // Stop early once the requested target has been reached -- never cool further than what was
++    // requested and confirmed. A single tick at or below target is not itself sufficient
++    // (telemetry noise or a single fast-settling sample); the reading must stay at/below target
++    // for TARGET_STABLE_CONFIRM_WINDOW before the active phase actually stops -- and the TEC is
++    // never kept enabled merely to consume the rest of the requested duration once that stability
++    // is confirmed.
++    if we_enabled_side && (side_centideg as i32) <= (target_centideg as i32) {
++        let reached_at = *target_reached_at.get_or_insert_with(Instant::now);
++        if reached_at.elapsed() >= TARGET_STABLE_CONFIRM_WINDOW {
++            *target_reached = true;
++            *time_to_target_seconds = Some(reached_at.saturating_duration_since(active_start).as_secs_f64());
++            return Some(StopReason::TargetTemperatureReached);
++        }
++    } else {
++        *target_reached_at = None;
++    }
++    None
 +}
 +
 +fn tec_trend_verdict(side: BedSide, left: &[f64], right: &[f64], telemetry_ok: bool) -> Verdict {
@@ -2661,36 +2937,46 @@ index 0000000..44df14f
 +
 +    // -- TecSafetyState: item 1's regression fixtures, verbatim --
 +
++    /// A parser returning a recognized positive state must not be treated as a generic terminal
++    /// `Some(...)` result by its caller -- so these tests exercise the caller's own exhaustive
++    /// `match` logic via [`tec_state_terminal_outcome`], not a boolean convenience method (this
++    /// crate deliberately has none -- see `TecSafetyState`'s doc comment for why a second
++    /// live-hardware incident found exactly that class of caller-side bug even after the parser
++    /// itself was already correct).
++    fn tec_state_terminal_outcome(state: TecSafetyState) -> Option<StopReason> {
++        match state {
++            TecSafetyState::Locked => Some(StopReason::TecLocked),
++            TecSafetyState::UnsafeLocking => Some(StopReason::TecUnsafeLocking),
++            TecSafetyState::SafeUnlocking | TecSafetyState::Unlocked | TecSafetyState::Unknown => None,
++        }
++    }
++
 +    #[test]
 +    fn safe_unlocking_is_not_a_fault() {
 +        let state = parse_tec_safety_state("FW: tec[left] safe, unlocking", "left").unwrap();
 +        assert_eq!(state, TecSafetyState::SafeUnlocking);
-+        assert!(!state.is_fault());
-+        assert!(state.is_safe_transition());
++        assert_eq!(tec_state_terminal_outcome(state), None);
 +    }
 +
 +    #[test]
 +    fn unlocked_is_not_a_fault() {
 +        let state = parse_tec_safety_state("FW: tec[left] unlocked", "left").unwrap();
 +        assert_eq!(state, TecSafetyState::Unlocked);
-+        assert!(!state.is_fault());
-+        assert!(state.is_safe_transition());
++        assert_eq!(tec_state_terminal_outcome(state), None);
 +    }
 +
 +    #[test]
 +    fn unsafe_locking_is_a_fault() {
 +        let state = parse_tec_safety_state("FW: tec[left] unsafe, locking", "left").unwrap();
 +        assert_eq!(state, TecSafetyState::UnsafeLocking);
-+        assert!(state.is_fault());
-+        assert!(!state.is_safe_transition());
++        assert_eq!(tec_state_terminal_outcome(state), Some(StopReason::TecUnsafeLocking));
 +    }
 +
 +    #[test]
 +    fn exact_locked_is_a_fault() {
 +        let state = parse_tec_safety_state("FW: tec[left] locked", "left").unwrap();
 +        assert_eq!(state, TecSafetyState::Locked);
-+        assert!(state.is_fault());
-+        assert!(!state.is_safe_transition());
++        assert_eq!(tec_state_terminal_outcome(state), Some(StopReason::TecLocked));
 +    }
 +
 +    #[test]
@@ -2702,7 +2988,7 @@ index 0000000..44df14f
 +            let state = parse_tec_safety_state(msg, "left").unwrap();
 +            assert_ne!(state, TecSafetyState::Locked, "{msg:?} must never classify as Locked");
 +            assert_ne!(state, TecSafetyState::UnsafeLocking, "{msg:?} must never classify as UnsafeLocking");
-+            assert!(!state.is_fault(), "{msg:?} must never be treated as a fault");
++            assert_eq!(tec_state_terminal_outcome(state), None, "{msg:?} must never be treated as a fault");
 +        }
 +    }
 +
@@ -2710,13 +2996,14 @@ index 0000000..44df14f
 +    fn unrecognized_tec_message_is_unknown_not_a_fault() {
 +        let state = parse_tec_safety_state("FW: tec[left] recalibrating", "left").unwrap();
 +        assert_eq!(state, TecSafetyState::Unknown);
-+        assert!(!state.is_fault());
++        assert_eq!(tec_state_terminal_outcome(state), None);
 +    }
 +
 +    #[test]
 +    fn tec_safety_state_is_scoped_to_the_named_side() {
 +        assert_eq!(parse_tec_safety_state("FW: tec[right] locked", "left"), None);
-+        assert!(parse_tec_safety_state("FW: tec[right] locked", "right").unwrap().is_fault());
++        let state = parse_tec_safety_state("FW: tec[right] locked", "right").unwrap();
++        assert_eq!(tec_state_terminal_outcome(state), Some(StopReason::TecLocked));
 +    }
 +
 +    #[test]
@@ -2753,6 +3040,20 @@ index 0000000..44df14f
 +    #[test]
 +    fn generic_fault_scan_still_detects_the_exact_word_locked() {
 +        assert!(is_generic_fault_message("FW: tec[left] locked"));
++    }
++
++    #[test]
++    fn generic_fault_scan_does_not_false_trigger_on_default() {
++        // A second live-hardware incident, found via this fix's own regression test: "default" is
++        // a literal substring of "fault", so a plain contains("fault") misclassified the real,
++        // benign message a pump sends when reverting to its default drive state as a
++        // FirmwareFaultMessage.
++        assert!(!is_generic_fault_message("FW: pump[left] default @ 9.000000V 0.200000A"));
++    }
++
++    #[test]
++    fn generic_fault_scan_still_detects_the_exact_word_fault() {
++        assert!(is_generic_fault_message("FW: pump[left] fault"));
 +    }
 +
 +    #[test]
@@ -3119,19 +3420,121 @@ index 0000000..44df14f
 +    }
 +
 +    #[tokio::test]
-+    async fn stale_telemetry_during_active_phase_triggers_shutdown() {
++    async fn complete_silence_during_active_phase_triggers_communication_watchdog() {
++        // This device stops answering *anything* once its scripted pushes run out (see its own
++        // doc comment) -- genuine silence, not merely "no temperature samples while other
++        // telemetry continues" -- so the correct new-architecture reason is the communication
++        // watchdog (ANY_VALID_RX_LIMIT), not the temperature-specific one. See
++        // no_temperature_sample_but_ongoing_message_traffic_triggers_temperature_watchdog for the
++        // complementary case this split was added to distinguish.
 +        let (client, device) = tokio::io::duplex(8192);
 +        let device_task = spawn_device_that_goes_silent_during_active_phase(device, 6);
 +        let mut link = FrozenLink::wrap(client, "test");
 +        let mut i2c = MockI2c::always_succeed();
 +
 +        let mut a = args(Side::Left, false);
-+        a.duration_seconds = 10; // long enough that only staleness (not duration) ends the run
++        a.duration_seconds = 10; // long enough that only the watchdog (not duration) ends the run
 +        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None).await;
 +
-+        assert_eq!(report.stop_reason, StopReason::TelemetryStale.to_string());
++        assert_eq!(report.stop_reason, StopReason::CommunicationWatchdogExpired.to_string());
 +        let ct = report.cool_test_results.expect("cool_test_results must be set");
++        assert_eq!(ct.stop_reason_code, "communication_watchdog_expired");
++        assert!(ct.communication_loss_observed);
 +        assert!(ct.shutdown_verified);
++
++        drop(link);
++        device_task.abort();
++    }
++
++    /// A fake device that, once enabled, keeps sending pump/TEC-current `Message` traffic every
++    /// ~1s tick (well under `ANY_VALID_RX_LIMIT`, so the communication watchdog never fires) but
++    /// never sends a temperature sample of any kind -- proving the two watchdogs are genuinely
++    /// independent: `last_any_valid_rx_at` stays fresh from the `Message` traffic alone, while
++    /// `last_temperature_sample_at` (seeded once during baseline) goes stale on its own separate
++    /// clock.
++    fn spawn_device_with_message_traffic_but_no_active_phase_temperature(
++        mut device_side: tokio::io::DuplexStream,
++    ) -> tokio::task::JoinHandle<()> {
++        use bytes::{Buf, BytesMut};
++        use tokio::io::{AsyncReadExt, AsyncWriteExt};
++        tokio::spawn(async move {
++            let mut acc = BytesMut::new();
++            let mut read_buf = [0u8; 256];
++            let mut enabled = false;
++            let mut count: u8 = 0;
++            loop {
++                if acc.len() >= 2 {
++                    let len = acc[1] as usize;
++                    let total = 1 + 1 + len + 2;
++                    if acc.len() >= total {
++                        let opcode = acc[2];
++                        let payload = acc[2..2 + len].to_vec();
++                        acc.advance(total);
++                        let response = match opcode {
++                            0x01 => Some(opensleep::common::codec::command(vec![0x81, 0x00, 0b0100_0110])),
++                            0x41 if !enabled => {
++                                count = count.wrapping_add(1);
++                                Some(opensleep::common::codec::command(vec![
++                                    0x41, 0x09, 0x9A, 0x09, 0xA4, 0x0A, 0x28, 9, count,
++                                ]))
++                            }
++                            0x41 => {
++                                // Once enabled: valid Message traffic every tick, but never a
++                                // temperature sample of any kind.
++                                let mut p = vec![0x07u8, 0x00];
++                                p.extend_from_slice(b"FW: tec[left] current: 11.364773 A");
++                                Some(opensleep::common::codec::command(p))
++                            }
++                            0x40 if payload.len() == 5 => {
++                                if payload[2] == 1 {
++                                    enabled = true;
++                                }
++                                Some(opensleep::common::codec::command(vec![
++                                    0xC0, 0x00, payload[1], payload[2], payload[3], payload[4],
++                                ]))
++                            }
++                            _ => None,
++                        };
++                        if let Some(resp) = response
++                            && device_side.write_all(&resp).await.is_err()
++                        {
++                            break;
++                        }
++                        continue;
++                    }
++                }
++                match device_side.read(&mut read_buf).await {
++                    Ok(0) | Err(_) => break,
++                    Ok(n) => acc.extend_from_slice(&read_buf[..n]),
++                }
++            }
++        })
++    }
++
++    #[tokio::test]
++    async fn no_temperature_sample_but_ongoing_message_traffic_triggers_temperature_watchdog() {
++        let (client, device) = tokio::io::duplex(8192);
++        let device_task = spawn_device_with_message_traffic_but_no_active_phase_temperature(device);
++        let mut link = FrozenLink::wrap(client, "test");
++        let mut i2c = MockI2c::always_succeed();
++
++        let mut a = args(Side::Left, false);
++        a.duration_seconds = ACTIVE_STARTUP_GRACE.as_secs() + 5;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None).await;
++
++        // The active phase's own temperature-freshness clock starts fresh (`None`) when it
++        // begins -- baseline having already validated is not itself carried forward as an active-
++        // phase sample -- so a device that never sends a temperature reading once enabled hits
++        // the *startup grace* clock (ACTIVE_STARTUP_GRACE), not the steady-state one
++        // (TEMPERATURE_FRESHNESS_LIMIT, which only starts once a first active-phase sample has
++        // been seen). Message traffic keeps the communication watchdog satisfied the whole time,
++        // proving the two watchdogs are genuinely independent.
++        assert_eq!(report.stop_reason, StopReason::TemperatureStartupGraceExpired.to_string());
++        let ct = report.cool_test_results.expect("cool_test_results must be set");
++        assert_eq!(ct.stop_reason_code, "temperature_startup_grace_expired");
++        assert!(ct.telemetry_watchdog_triggered);
++        assert!(!ct.communication_loss_observed, "Message traffic must have kept the communication watchdog satisfied");
++        assert!(ct.selected_tec_current_samples > 0, "Message traffic must have been processed, not ignored");
 +
 +        drop(link);
 +        device_task.abort();
@@ -3462,6 +3865,148 @@ index 0000000..44df14f
 +        device_task.abort();
 +    }
 +
++    /// A fake device replaying the exact real-hardware timing that caused a live incident: during
++    /// baseline collection it behaves like any other constant-reading device, but once the
++    /// selected side is enabled it stops answering `GetTemperatures` synchronously and instead
++    /// pushes a fixed schedule of unsolicited packets at wall-clock offsets from the moment
++    /// enabling was acknowledged -- t=0.1s pump, t=0.2s a PID-style message, t=1.8s TEC current,
++    /// t=2.0s `"safe, unlocking"` (the exact instant the old, single 2s `STALE_TELEMETRY_LIMIT`
++    /// clock would have fired), t=5.0s more `Message` traffic, t=9.5s a valid `TemperatureUpdate`.
++    fn spawn_device_replaying_the_incident_timing(mut device_side: tokio::io::DuplexStream) -> tokio::task::JoinHandle<()> {
++        use bytes::{Buf, BytesMut};
++        use tokio::io::{AsyncReadExt, AsyncWriteExt};
++
++        fn message_frame(text: &str) -> Vec<u8> {
++            let mut p = vec![0x07u8, 0x00];
++            p.extend_from_slice(text.as_bytes());
++            opensleep::common::codec::command(p)
++        }
++
++        tokio::spawn(async move {
++            let mut acc = BytesMut::new();
++            let mut read_buf = [0u8; 256];
++            let mut enabled = false;
++            let mut count: u8 = 0;
++            let mut active_start: Option<tokio::time::Instant> = None;
++            let schedule: Vec<(u64, Vec<u8>)> = vec![
++                (100, message_frame("FW: pump[left] slow @ 6.030475V 0.169202A")),
++                (200, message_frame("FW: pid[left] 25.250000 -1.000000")),
++                (1800, message_frame("FW: tec[left] current: 11.364773 A")),
++                (2000, message_frame("FW: tec[left] safe, unlocking")),
++                (5000, message_frame("FW: pump[left] default @ 9.000000V 0.200000A")),
++                (9500, opensleep::common::codec::command(vec![0x41, 0x09, 0x9A, 0x09, 0xA4, 0x0A, 0x28, 9, 200])),
++            ];
++            let mut next_idx = 0usize;
++
++            loop {
++                let sleep_deadline = match active_start {
++                    Some(t0) if next_idx < schedule.len() => Some(t0 + Duration::from_millis(schedule[next_idx].0)),
++                    _ => None,
++                };
++                tokio::select! {
++                    _ = async {
++                        match sleep_deadline {
++                            Some(d) => tokio::time::sleep_until(d).await,
++                            None => std::future::pending::<()>().await,
++                        }
++                    } => {
++                        let (_, frame) = &schedule[next_idx];
++                        if device_side.write_all(frame).await.is_err() {
++                            break;
++                        }
++                        next_idx += 1;
++                        continue;
++                    }
++                    res = device_side.read(&mut read_buf) => {
++                        match res {
++                            Ok(0) | Err(_) => break,
++                            Ok(n) => acc.extend_from_slice(&read_buf[..n]),
++                        }
++                    }
++                }
++
++                loop {
++                    if acc.len() < 2 {
++                        break;
++                    }
++                    let len = acc[1] as usize;
++                    let total = 1 + 1 + len + 2;
++                    if acc.len() < total {
++                        break;
++                    }
++                    let opcode = acc[2];
++                    let payload = acc[2..2 + len].to_vec();
++                    acc.advance(total);
++                    let response = match opcode {
++                        0x01 => Some(opensleep::common::codec::command(vec![0x81, 0x00, 0b0100_0110])),
++                        0x41 if !enabled => {
++                            count = count.wrapping_add(1);
++                            Some(opensleep::common::codec::command(vec![
++                                0x41, 0x09, 0x9A, 0x09, 0xA4, 0x0A, 0x28, 9, count,
++                            ]))
++                        }
++                        0x41 => None, // once enabled, only the scheduled pushes above answer
++                        0x40 if payload.len() == 5 => {
++                            if payload[2] == 1 && !enabled {
++                                enabled = true;
++                                active_start = Some(tokio::time::Instant::now());
++                            }
++                            Some(opensleep::common::codec::command(vec![
++                                0xC0, 0x00, payload[1], payload[2], payload[3], payload[4],
++                            ]))
++                        }
++                        _ => None,
++                    };
++                    if let Some(resp) = response
++                        && device_side.write_all(&resp).await.is_err()
++                    {
++                        return;
++                    }
++                }
++            }
++        })
++    }
++
++    #[tokio::test]
++    async fn incident_timing_sequence_does_not_trigger_any_watchdog() {
++        let (client, device) = tokio::io::duplex(8192);
++        let device_task = spawn_device_replaying_the_incident_timing(device);
++        let mut link = FrozenLink::wrap(client, "test");
++        let mut i2c = MockI2c::always_succeed();
++
++        let mut a = args(Side::Left, false);
++        // Long enough to observe the t=9.5s TemperatureUpdate and confirm it's processed, short
++        // enough to land safely before either watchdog could fire on the silence that follows the
++        // schedule's last entry (ANY_VALID_RX_LIMIT=5s after t=9.5s => ~14.5s).
++        a.duration_seconds = 12;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None).await;
++
++        assert_eq!(
++            report.stop_reason,
++            StopReason::DurationExpired.to_string(),
++            "no watchdog may fire anywhere in this timeline"
++        );
++        let ct = report.cool_test_results.expect("cool_test_results must be set");
++        assert_eq!(ct.stop_reason_code, "requested_duration_expired");
++        assert!(!ct.telemetry_watchdog_triggered, "the 2s-vs-10s mismatch this fix corrects must not resurface");
++        assert!(!ct.communication_loss_observed);
++        // The exact positive-state fields the incident asked for: recorded and nonterminal.
++        assert!(ct.selected_tec_safety_passed);
++        assert!(ct.selected_tec_unlocking_observed);
++        assert!(ct.selected_tec_activity_observed);
++        // The current: line must have been parsed as current telemetry, not misrouted to the
++        // safety-state parser.
++        assert!(ct.selected_tec_current_samples >= 1);
++        assert_eq!(ct.selected_tec_current_last_a, Some(11.364773));
++        // Pump telemetry (t=0.1s and t=5.0s) and the t=9.5s TemperatureUpdate must all have been
++        // processed, not merely survived.
++        assert!(ct.left_pump_activity_observed);
++        assert!(ct.final_left_c.is_some(), "the t=9.5s TemperatureUpdate must have updated temperature history");
++
++        drop(link);
++        device_task.abort();
++    }
++
 +    /// A fake device that acks Ping/JumpToFirmware/enable and always pushes an unsolicited
 +    /// TemperatureUpdate, and additionally pushes a fixed `Message` on every GetTemperatures
 +    /// request after preflight (`messages_after` counts every 0x41 request, so preflight baseline
@@ -3573,8 +4118,9 @@ index 0000000..44df14f
 +        a.duration_seconds = 10;
 +        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None).await;
 +
-+        assert_eq!(report.stop_reason, StopReason::TecLocked.to_string());
++        assert_eq!(report.stop_reason, StopReason::TecUnsafeLocking.to_string());
 +        let ct = report.cool_test_results.expect("cool_test_results must be set");
++        assert_eq!(ct.stop_reason_code, "explicit_tec_unsafe_locking");
 +        assert!(!ct.selected_tec_safety_passed);
 +        assert!(ct.shutdown_verified);
 +        assert!(!ct.emergency_reset_asserted, "UART-based shutdown must succeed against the mock device");
@@ -6599,10 +7145,10 @@ index 0000000..10b2951
 +}
 diff --git a/src/bin/opensleep-diagnostic/mock.rs b/src/bin/opensleep-diagnostic/mock.rs
 new file mode 100644
-index 0000000..f955a50
+index 0000000..fe4933f
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/mock.rs
-@@ -0,0 +1,263 @@
+@@ -0,0 +1,288 @@
 +//! Mock Frozen device used by `--dry-run` (so dry-run is testable on a normal development
 +//! computer with no real hardware attached) and reused directly by integration tests. Speaks the
 +//! exact real wire framing (`opensleep::common::codec::command`) on one end of a
@@ -6697,6 +7243,12 @@ index 0000000..f955a50
 +/// `frozen-prime-test`'s dry-run/tests see a realistic multi-tick sequence rather than everything
 +/// at once -- a pump `Message` for each side and finally `"FW: [priming] done"`. All four message
 +/// strings are exactly as captured in `frozen/state.rs`'s source (see PROTOCOL_AUDIT.md).
++///
++/// SetTargetTemperature(enabled=true) additionally arms one more paced push, on the next
++/// `GetTemperatures` tick: the exact real-hardware TEC sequence a live-hardware incident was found
++/// from (`"current: 11.402626 A"` then `"safe, unlocking"`, for whichever side was enabled) -- so
++/// `frozen-cool-test --dry-run` exercises this positive, nonterminal sequence too, including when
++/// run as the actual packaged ARM64 binary under `qemu-aarch64-static`.
 +pub fn spawn_mock_frozen_device(mut device_side: DuplexStream) -> tokio::task::JoinHandle<()> {
 +    tokio::spawn(async move {
 +        let mut acc = BytesMut::new();
@@ -6704,6 +7256,13 @@ index 0000000..f955a50
 +        let mut temperature_update_count: u8 = 0;
 +        let mut primed = false;
 +        let mut post_prime_ticks: u32 = 0;
++        // Set once `frozen-cool-test --dry-run` enables a side, so its own smoke-testing (via the
++        // real packaged binary under qemu-aarch64-static, not just `cargo test`) exercises the
++        // exact positive-TEC-state sequence a live-hardware incident was found from: a current
++        // reading followed by "safe, unlocking" must not itself end the run. `prime_test.rs` never
++        // enables a target, so this never fires there.
++        let mut enabled_side_word: Option<&'static str> = None;
++        let mut post_enable_ticks: u32 = 0;
 +        loop {
 +            if acc.len() >= 2 {
 +                let len = acc[1] as usize;
@@ -6735,6 +7294,15 @@ index 0000000..f955a50
 +                                combined.extend(mock_message_frame("FW: [priming] done"));
 +                            }
 +                        }
++                        if let Some(side_word) = enabled_side_word {
++                            post_enable_ticks += 1;
++                            if post_enable_ticks == 1 {
++                                // Exact real-hardware capture: a current reading immediately
++                                // followed by the interlock reporting it is safe to run.
++                                combined.extend(mock_message_frame(&format!("FW: tec[{side_word}] current: 11.402626 A")));
++                                combined.extend(mock_message_frame(&format!("FW: tec[{side_word}] safe, unlocking")));
++                            }
++                        }
 +                        if device_side.write_all(&combined).await.is_err() {
 +                            break;
 +                        }
@@ -6758,6 +7326,9 @@ index 0000000..f955a50
 +                            let side = payload[1];
 +                            let enabled = payload[2] != 0;
 +                            let temp = u16::from_be_bytes([payload[3], payload[4]]);
++                            if enabled {
++                                enabled_side_word = Some(if side == 0 { "left" } else { "right" });
++                            }
 +                            Some(mock_target_update_frame(side, enabled, temp))
 +                        }
 +                        _ => None,
@@ -10352,10 +10923,10 @@ index 0000000..e668cde
 +}
 diff --git a/src/bin/opensleep-diagnostic/report.rs b/src/bin/opensleep-diagnostic/report.rs
 new file mode 100644
-index 0000000..ec2bedc
+index 0000000..7f04686
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/report.rs
-@@ -0,0 +1,919 @@
+@@ -0,0 +1,933 @@
 +//! Structured JSON/CSV/text reporting shared by all three subcommands. Machine evidence (audit
 +//! log, decoded telemetry) is always kept in separate fields from operator-entered observations,
 +//! per the safety model: a component may only be marked PASS from decoded evidence or an explicit
@@ -10789,6 +11360,10 @@ index 0000000..ec2bedc
 +    /// `contains("tec") && contains("lock")` check, which also matched `"unlocking"`/`"unlocked"`
 +    /// and aborted a healthy run on exactly that message.
 +    pub selected_tec_safety_passed: bool,
++    /// `true` iff a firmware message specifically reported the selected TEC's safety interlock
++    /// transitioning (`"safe, unlocking"`, not the steady-state `"unlocked"`) during the active
++    /// phase -- narrower than `selected_tec_safety_passed`, which is `true` for either.
++    pub selected_tec_unlocking_observed: bool,
 +    /// First, minimum, maximum, and most recent reported TEC current (amps) for the selected side,
 +    /// and how many such messages were seen -- see `cool_test::parse_tec_current`. Purely
 +    /// descriptive: never independently classified as safe or unsafe (Frozen firmware remains the
@@ -10835,6 +11410,10 @@ index 0000000..ec2bedc
 +    pub emergency_reset_asserted: bool,
 +    pub reservoir_status: ReservoirStatus,
 +    pub stop_reason: String,
++    /// Short, stable, machine-readable identifier for `stop_reason` (e.g.
++    /// `"stable_target_reached"`, `"explicit_tec_unsafe_locking"`) -- see
++    /// `cool_test::stop_reason_code`. Distinct from `stop_reason`'s human-readable prose.
++    pub stop_reason_code: String,
 +    /// Which reset/startup implementation this run used -- always the narrow pulse in this
 +    /// revision (`ResetController`/the four-register full reset sequence are structurally
 +    /// unreachable from this file -- see `main.rs`'s guardrail tests), reported explicitly rather
@@ -11048,6 +11627,7 @@ index 0000000..ec2bedc
 +            csv_field!("actual_active_duration_seconds", ct.actual_active_duration_seconds);
 +            csv_field!("extended_test_confirmation_received", ct.extended_test_confirmation_received);
 +            csv_field!("stop_reason", ct.stop_reason);
++            csv_field!("stop_reason_code", ct.stop_reason_code);
 +            csv_field!("target_reached", ct.target_reached);
 +            csv_field!("time_to_target_seconds", ct.time_to_target_seconds.map(|v| v.to_string()).unwrap_or_default());
 +            csv_field!("baseline_left_c", ct.baseline_left_c.map(|v| v.to_string()).unwrap_or_default());
@@ -11072,6 +11652,7 @@ index 0000000..ec2bedc
 +                ct.heatsink_temperature_change_c.map(|v| v.to_string()).unwrap_or_default()
 +            );
 +            csv_field!("selected_tec_safety_passed", ct.selected_tec_safety_passed);
++            csv_field!("selected_tec_unlocking_observed", ct.selected_tec_unlocking_observed);
 +            csv_field!("selected_tec_activity_observed", ct.selected_tec_activity_observed);
 +            csv_field!("selected_pump_activity_observed", ct.selected_pump_activity_observed);
 +            csv_field!(
@@ -11223,9 +11804,9 @@ index 0000000..ec2bedc
 +                ct.target_reached, ct.time_to_target_seconds
 +            );
 +            log::info!(
-+                "  TEC activity (selected)/safety passed/pump activity (selected/L/R): {}/{}/{}/{}/{}",
-+                ct.selected_tec_activity_observed, ct.selected_tec_safety_passed, ct.selected_pump_activity_observed,
-+                ct.left_pump_activity_observed, ct.right_pump_activity_observed
++                "  TEC activity (selected)/safety passed/unlocking observed/pump activity (selected/L/R): {}/{}/{}/{}/{}/{}",
++                ct.selected_tec_activity_observed, ct.selected_tec_safety_passed, ct.selected_tec_unlocking_observed,
++                ct.selected_pump_activity_observed, ct.left_pump_activity_observed, ct.right_pump_activity_observed
 +            );
 +            log::info!(
 +                "  TEC current A (first/min/max/last, n={}): {:?}/{:?}/{:?}/{:?}",
@@ -11245,7 +11826,11 @@ index 0000000..ec2bedc
 +            log::info!("  Reservoir status:                 {}", ct.reservoir_status);
 +            log::info!("  Startup mode:                     {}", ct.startup_mode);
 +        }
-+        log::info!("stop reason: {}", self.stop_reason);
++        if let Some(ct) = &self.cool_test_results {
++            log::info!("stop reason: {} (code: {})", self.stop_reason, ct.stop_reason_code);
++        } else {
++            log::info!("stop reason: {}", self.stop_reason);
++        }
 +        if let Some(ss) = &self.safe_stop {
 +            log::info!(
 +                "safe-stop: fully_succeeded={} degraded={} catastrophic={}",
@@ -12142,10 +12727,10 @@ index 0000000..a2a5a23
 +}
 diff --git a/src/bin/opensleep-diagnostic/signals.rs b/src/bin/opensleep-diagnostic/signals.rs
 new file mode 100644
-index 0000000..9e5db3b
+index 0000000..edcc6b3
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/signals.rs
-@@ -0,0 +1,195 @@
+@@ -0,0 +1,232 @@
 +//! Everything that can cut an active phase short. `StopReason` is the vocabulary every abort path
 +//! (Ctrl+C, SIGTERM/SIGHUP, timeout, communication/telemetry error, panic, ...) reduces to before
 +//! `safe_stop::run_safe_stop` runs and the report is written.
@@ -12180,7 +12765,29 @@ index 0000000..9e5db3b
 +    UartWriteFailure,
 +    UartReadFailure,
 +    TelemetryLost,
++    /// `frozen-cool-test`'s original single-clock staleness check (2s, refreshed only by
++    /// `TemperatureUpdate`) -- no longer produced by that file's own active loop (see
++    /// `cool_test::TemperatureWatchdogExpired`/`TemperatureStartupGraceExpired`, which replace it
++    /// with two clocks and real-hardware-evidenced limits; a live capture showed this firmware
++    /// pushes unsolicited `TemperatureUpdate` only about once every ~10 seconds, so the 2s limit
++    /// fired on every single active-phase run regardless of any actual fault). Kept in the
++    /// vocabulary (still produced by `frozen-prime-test`) rather than removed.
 +    TelemetryStale,
++    /// No successfully-decoded packet of *any* kind (`TemperatureUpdate`, `GetTemperature`,
++    /// `Message`, `TargetUpdate`, ...) for longer than `cool_test::ANY_VALID_RX_LIMIT` -- a
++    /// silence *timeout*, distinct from a genuine I/O error (`UartWriteFailure`/`UartReadFailure`)
++    /// or the link closing outright (`TelemetryLost`), which the transport itself reports
++    /// immediately rather than after a grace period.
++    CommunicationWatchdogExpired,
++    /// A valid temperature sample (synchronous `GetTemperature` reply, either byte shape, or
++    /// unsolicited `TemperatureUpdate`) had already been seen at least once during the active
++    /// phase, but none arrived for longer than `cool_test::TEMPERATURE_FRESHNESS_LIMIT`. See that
++    /// constant's doc comment for the real-hardware evidence behind its value.
++    TemperatureWatchdogExpired,
++    /// No valid temperature sample arrived at all within `cool_test::ACTIVE_STARTUP_GRACE` of the
++    /// active phase starting -- distinct from `TemperatureWatchdogExpired`, whose clock only
++    /// starts once a first sample has actually been seen.
++    TemperatureStartupGraceExpired,
 +    /// Named in the safety spec but not constructed by this build: `PacketCodec::decode` (reused
 +    /// unmodified from `opensleep`) never surfaces a per-frame decode error to callers of
 +    /// `Framed::next()` -- it swallows bad-checksum/unparseable frames internally via
@@ -12203,9 +12810,16 @@ index 0000000..9e5db3b
 +    /// only fires when a firmware pump message for our side was actually observed reporting
 +    /// zero voltage, never merely from the absence of a message. See `cool_test::parse_pump_report`.
 +    PumpNotConfirmedRunning,
-+    /// A firmware message named the selected TEC as locked (matched by the literal substrings
-+    /// "tec" and "lock" together, case-insensitively -- see `cool_test::is_tec_locked_message`).
++    /// A firmware message reported the selected TEC's safety interlock as exactly `"locked"` --
++    /// word-tokenized classification, not substring matching (see `cool_test::TecSafetyState`,
++    /// whose doc comment covers a real regression where a `contains("lock")` check false-triggered
++    /// on the positive, non-fault state `"safe, unlocking"`).
 +    TecLocked,
++    /// Same evidence basis as `TecLocked`, but for the distinct transitional state `"unsafe,
++    /// locking"` -- kept as its own variant (rather than folded into `TecLocked`) so
++    /// `cool_test::stop_reason_code` can report the two as the distinct codes
++    /// `explicit_tec_unsafe_locking`/`explicit_tec_locked` a live-hardware incident asked for.
++    TecUnsafeLocking,
 +    /// Frozen sent an unsolicited `TargetUpdate` reporting the selected side disabled after we
 +    /// had successfully enabled it -- i.e. the device turned the channel off on its own.
 +    TargetDisabledUnexpectedly,
@@ -12250,6 +12864,9 @@ index 0000000..9e5db3b
 +            StopReason::UartReadFailure => "UART read failure",
 +            StopReason::TelemetryLost => "lost valid telemetry",
 +            StopReason::TelemetryStale => "telemetry stale for more than 2 seconds",
++            StopReason::CommunicationWatchdogExpired => "no valid packet of any kind for longer than the communication watchdog limit",
++            StopReason::TemperatureWatchdogExpired => "no fresh temperature sample for longer than the temperature watchdog limit",
++            StopReason::TemperatureStartupGraceExpired => "no temperature sample arrived within the active-phase startup grace period",
 +            StopReason::DecodeFailure => "temperature decode failure during active phase",
 +            StopReason::FatalStatus => "documented fatal error/status",
 +            StopReason::UnknownNonzeroStatus => "unknown nonzero status that cannot be proven harmless",
@@ -12260,6 +12877,7 @@ index 0000000..9e5db3b
 +            StopReason::PreflightRefused => "preflight checks refused to start the active test",
 +            StopReason::PumpNotConfirmedRunning => "selected-side pump still reported off/0V after the startup grace period",
 +            StopReason::TecLocked => "firmware reported the selected TEC locked",
++            StopReason::TecUnsafeLocking => "firmware reported the selected TEC transitioning to unsafe (locking)",
 +            StopReason::TargetDisabledUnexpectedly => "Frozen disabled the selected target unexpectedly",
 +            StopReason::FirmwareFaultMessage => "firmware reported a fault condition by message",
 +            StopReason::OperatorAbort => "operator reported a leak, smell, or abnormal noise",
@@ -12317,6 +12935,9 @@ index 0000000..9e5db3b
 +            StopReason::UartReadFailure,
 +            StopReason::TelemetryLost,
 +            StopReason::TelemetryStale,
++            StopReason::CommunicationWatchdogExpired,
++            StopReason::TemperatureWatchdogExpired,
++            StopReason::TemperatureStartupGraceExpired,
 +            StopReason::DecodeFailure,
 +            StopReason::FatalStatus,
 +            StopReason::UnknownNonzeroStatus,
@@ -12327,6 +12948,7 @@ index 0000000..9e5db3b
 +            StopReason::PreflightRefused,
 +            StopReason::PumpNotConfirmedRunning,
 +            StopReason::TecLocked,
++            StopReason::TecUnsafeLocking,
 +            StopReason::TargetDisabledUnexpectedly,
 +            StopReason::FirmwareFaultMessage,
 +            StopReason::OperatorAbort,

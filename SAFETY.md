@@ -340,21 +340,55 @@ PROTOCOL_AUDIT.md.
 ## Automatic abort conditions during `frozen-cool-test`'s active phase
 
 The active phase aborts itself (and always runs safe-stop) on any of the following, in addition to
-Ctrl+C, SIGTERM/SIGHUP, and the duration expiring:
+Ctrl+C, SIGTERM/SIGHUP, and the duration expiring. Every abort assigns and logs a specific reason
+before shutdown begins (`beginning controlled shutdown: stop_reason=<code>`), and that reason
+appears in the text, JSON, and CSV reports (`stop_reason`/`stop_reason_code`) — there is no path
+into shutdown that skips this.
 
-* No fresh, valid unsolicited temperature update for more than 2 seconds.
+* **Communication watchdog**: no successfully decoded packet of *any* kind (temperature update,
+  firmware message, target state, ...) for more than 5 seconds — a genuine silence timeout,
+  distinct from a UART write/read failure or the link closing outright, which abort immediately
+  rather than after a grace period.
+* **Temperature watchdog**: a valid temperature sample (either the unsolicited push or a decoded
+  solicited reply — see below) had already arrived at least once during the active phase, but none
+  arrived for more than 20 seconds. **Temperature startup grace**: no temperature sample arrived at
+  all within 15 seconds of the target being enabled. These two are deliberately *not* the same
+  clock as the communication watchdog above: a live-hardware incident found the active phase
+  aborting almost exactly 2 seconds after enabling, on ordinary pump/TEC startup chatter, because
+  an earlier revision used one 2-second clock refreshed only by the unsolicited temperature push —
+  shorter than this firmware's own ~10-second unsolicited-push cadence, so it fired on every run
+  regardless of any actual fault. The current 20s/15s limits were sized from that same real-hardware
+  evidence, with margin.
 * The selected-side water temperature or the heatsink temperature leaves the compile-time safe
-  range, or changes implausibly fast in a single ~1-second tick.
-* A UART write or read failure, or the link to Frozen closing.
+  range, or changes implausibly fast in a single ~1-second tick. This check now runs on *every*
+  decoded temperature reading — the unsolicited push, a solicited 27-byte reply, or this firmware's
+  14-byte reply — not the unsolicited push alone.
 * The selected-side pump still reports off/0V (via a decoded firmware message) more than 3 seconds
   after the enable command was accepted. This only fires if the firmware has actually reported the
   pump as off — it never fires merely because no pump message was seen at all.
-* A firmware message reports the selected TEC as locked.
+* A firmware message reports the selected TEC's safety interlock as `"unsafe, locking"` or exactly
+  `"locked"` — parsed by explicit word, never by substring (see below for why that distinction
+  matters). The positive states `"safe, unlocking"` and `"unlocked"` are recorded and the active
+  phase continues; they never abort anything.
 * Frozen reports the selected side disabled on its own, after this tool enabled it.
 * A firmware message contains a fault keyword (overtemperature, overcurrent, shutdown, fault,
   failed, locked) more than 2 seconds into the active phase — giving a brief startup grace period
-  so ordinary boot-time chatter isn't mistaken for a fault.
+  so ordinary boot-time chatter isn't mistaken for a fault. As with the TEC check, "locked" here is
+  matched by exact word, not substring — it does not match `"unlocked"`.
 * **You type `ABORT` and press Enter** (or a report of a leak, smell, or noise — see below).
+
+### TEC safety-interlock false positive (fixed)
+
+A live left-side cooling test successfully enabled the target and reached active hardware control
+(`FW: tec[left] current: 11.402626 A`), then aborted immediately on `FW: tec[left] safe,
+unlocking` — logged as "firmware reported the selected TEC locked". False positive: "safe,
+unlocking" is the interlock reporting it is safe to run, not a fault. Two bugs, found and fixed
+across two passes: first, `contains("tec") && contains("lock")` also matches `"unlocking"`/
+`"unlocked"` (both contain the substring `"lock"`) — replaced with word-tokenized classification
+that can never conflate the two. Second, even after that parser fix, the *caller* still collapsed
+the parser's recognized positive result into a generic terminal outcome — replaced with an
+exhaustive match over every state, so a positive state can never again be silently treated as
+terminal by a caller that only checked "did the parser recognize something."
 
 Firmware messages reporting `[capwater]` or `[flowrate]` sensor unavailable are recorded as
 warnings, not treated as an automatic abort condition on their own — they have been observed with
