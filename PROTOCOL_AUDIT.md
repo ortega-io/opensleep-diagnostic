@@ -501,7 +501,7 @@ fired; see SAFETY.md for the safe-stop sequence itself. All are evaluated inside
 | UART write or read failure | `UartWriteFailure` / `UartReadFailure` | Direct — I/O error from `FrozenLink` |
 | Frozen's own link closes | `TelemetryLost` | Direct |
 | Selected-side pump still reported off/0V more than `PUMP_CONFIRM_GRACE` after the enable command was accepted | `PumpNotConfirmedRunning` | Direct, evidence-gated: only fires if a decoded firmware `Message` for our side's pump was actually observed reporting zero voltage (`cool_test::parse_pump_report`) — never merely from the absence of a message, since absence is not evidence of failure |
-| Firmware `Message` names the selected TEC as locked (matched narrowly: both "tec" and "lock" must appear) | `TecLocked` | Direct — decoded firmware string |
+| Firmware `Message` reports the selected TEC's safety interlock as `"unsafe, locking"` or exactly `"locked"` (word-tokenized classification -- see below) | `TecLocked` | Direct — decoded firmware string |
 | Frozen sends an unsolicited `TargetUpdate` reporting the selected side disabled after this binary successfully enabled it | `TargetDisabledUnexpectedly` | Direct — decoded protocol acknowledgement |
 | Firmware `Message` contains a generic fault keyword (overtemperature, overcurrent, shutdown, fault, failed, locked) after `FAULT_KEYWORD_GRACE` | `FirmwareFaultMessage` | Direct, with a documented carve-out: the literal substring "flash locked" is excluded (see below) |
 | Operator types a report of a leak, burning smell, or abnormal noise (or the literal word ABORT) | `OperatorAbort` | Explicit operator input, read from a background stdin watcher started only after all confirmation-phrase reads are complete (`cool_test::spawn_operator_abort_watcher`) |
@@ -518,9 +518,37 @@ Message: FW: cal_info valid
 — paired together, in a context unrelated to any actuator or safety condition (a flash/calibration
 status query). The generic fault-keyword scan (`cool_test::is_generic_fault_message`) excludes any
 message containing the literal substring "flash locked" specifically so this evidenced, benign
-message is never mistaken for a real "...locked" fault; `cool_test::tests::flash_locked_message_does_not_trigger_safe_stop`
-proves this does not regress. The narrower TEC-lock check (`is_tec_locked_message`, requiring both
-"tec" and "lock") naturally excludes it too, without needing a special case.
+message is never mistaken for a real "...locked" fault; `cool_test::tests::flash_locked_message_does_not_trigger_shutdown_early`
+proves this does not regress. `parse_tec_safety_state` naturally excludes it too (it only examines
+messages containing the selected side's `"tec[<side>]"` marker), without needing a special case.
+
+### TEC safety-interlock state: word-tokenized, not substring-matched
+
+A live active-phase run against real hardware successfully enabled the target, reached active TEC
+control (`FW: tec[left] current: 11.402626 A`), and then aborted on:
+
+```
+FW: tec[left] safe, unlocking
+```
+
+logged as `firmware reported the selected TEC locked` -- a false positive. `"safe, unlocking"` is
+the interlock reporting it is safe to run, not a lock/fault condition. The earlier check,
+`contains("tec") && contains("lock")`, matches this message because `"unlocking"` itself contains
+the substring `"lock"` -- the same trap independently existed in the generic fault-keyword scan's
+flat `contains("locked")` check, since `"locked"` is a literal substring of `"unlocked"`.
+
+`cool_test::TecSafetyState`/`parse_tec_safety_state` replace this with word-tokenized
+classification (split on non-alphanumeric characters, then an exact-token match): `"unlocking"` and
+`"unlocked"` are distinct words from `"locking"` and `"locked"` at the tokenizer level, so no
+message wording can conflate them, regardless of what other text surrounds them. Only
+`TecSafetyState::UnsafeLocking` (`"unsafe, locking"`) and `TecSafetyState::Locked` (exact word
+`"locked"`) are treated as `TecLocked`; `SafeUnlocking` (`"safe, unlocking"`) and `Unlocked`
+(`"unlocked"`) set `selected_tec_safety_passed`/`selected_tec_activity_observed` and let the active
+phase continue; any other TEC-tagged message classifies as `Unknown` and is logged only, never
+treated as a fault. The generic fault-keyword scan's `"locked"` entry was fixed the same way
+(word-exact match for that one keyword only; every other keyword keeps its original substring
+match). `cool_test::tests::unlocking_can_never_be_classified_as_locked` proves the distinction
+directly against the real captured message text.
 
 ### Firmware sensor-unavailable messages: recorded as warnings, not fatal
 
@@ -576,6 +604,7 @@ stated plainly rather than faked:
 | Pump operation | PASS only if a decoded firmware `Message` for the selected side's pump (`cool_test::parse_pump_report`, e.g. `FW: pump[left] slow @ 6.03V 0.17A`) reports nonzero voltage at least once; FAIL only if the most recent such message reports 0V/off; UNVERIFIED if no pump message for our side was ever decoded | **Direct** (the firmware itself named the pump, side, and a numeric voltage in a decoded string) when present; **UNVERIFIED**, never assumed PASS, if absent |
 | Fan operation | Only if a firmware `Message` is received during the active phase whose text contains `"fan"` (case-insensitive) *and* the side tag for the tested side (e.g. `[left]`) | **Direct evidence when present** (the firmware itself named the component and side in a decoded string); **UNVERIFIED, never assumed PASS, if absent** — absence of a message is not proof of failure, so it is not scored FAIL either |
 | TEC cooling operation | Only if the tested side's decoded water-temperature samples show a sustained drop (>= 0.10C, last sample vs. first sample) across the active phase | **Inferred** from a telemetry *trend* across multiple samples, per the task's own requirement ("a short test may not appreciably change water temperature... require a defensible trend, not just one sample"); a flat or rising trend is UNVERIFIED (not FAIL), since a short test may simply not show a measurable change |
+| TEC current (reported, not scored) | `cool_test::parse_tec_current` decodes `FW: tec[<side>] current: <amps> A`; first/min/max/last and a sample count are reported (`selected_tec_current_*`) | **Direct**, purely descriptive -- never independently classified as safe/unsafe (no validated hardware-specific current threshold exists; Frozen firmware remains the sole authority on its own internal current safety), and never itself gates PASS/FAIL |
 | Telemetry remained valid | No stale/lost/decode/range/heatsink abort fired, and at least one sample was decoded | **Direct** |
 | Emergency shutdown | `safe_stop::SafeStopResult::fully_succeeded()` — I2C reset confirmed and (if a UART link was open) the disable sends confirmed | **Direct** |
 | Overall selected-side result | PASS only if command-accepted, telemetry-valid, and emergency-shutdown are all PASS, and no component is an explicit FAIL; otherwise FAIL if anything hard-failed, else INCONCLUSIVE | derived (`cool_test::overall_verdict`) |

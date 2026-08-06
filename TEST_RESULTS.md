@@ -1,11 +1,80 @@
 # TEST_RESULTS.md — opensleep-diagnostic
 
-All 218 unit/integration tests in `src/bin/opensleep-diagnostic/` pass (up from 186; see the
+All 240 unit/integration tests in `src/bin/opensleep-diagnostic/` pass (up from 218; see the
 revision note directly below), plus the 51 pre-existing `opensleep` library tests (unmodified,
-reused as-is) and 0 doc-tests — 269 total, 0 failed. Verified inside the
+reused as-is) and 0 doc-tests — 291 total, 0 failed. Verified inside the
 `messense/rust-musl-cross:aarch64-musl` builder image via `cargo test --locked` under its built-in
 QEMU aarch64 runner (the same environment the release binary is built in) as part of the
-diagnostic-v13 release build -- see `build-report.txt`.
+diagnostic-v14 release build -- see `build-report.txt`.
+
+## Revision note: fix a false TEC-lock abort; extend the active phase to 15 minutes
+
+A live left-side cooling test successfully enabled the target, reached active hardware control
+(`FW: tec[left] current: 11.402626 A`), and then aborted on `FW: tec[left] safe, unlocking` --
+logged as `firmware reported the selected TEC locked`. This is a false positive: "safe, unlocking"
+is a positive safety transition (the interlock reporting it is safe to run), not a lock/fault.
+
+* **`cool_test::TecSafetyState`/`parse_tec_safety_state`** replace the previous
+  `contains("tec") && contains("lock")` check (which also matches `"unlocking"`/`"unlocked"`, both
+  of which contain the substring `"lock"`) with word-tokenized classification: split on
+  non-alphanumeric characters, then an exact-token match against `"unlocking"`/`"unlocked"`/
+  `"locking"`/`"locked"`. Only `UnsafeLocking` (`"unsafe, locking"`) and the exact word `"locked"`
+  abort (`TecLocked`); `SafeUnlocking`/`Unlocked` set `selected_tec_safety_passed` and let the
+  active phase continue; anything else classifies as `Unknown` and is logged, never a fault. The
+  identical substring trap independently existed in the generic fault-keyword scan's flat
+  `contains("locked")` check (`"locked"` is a literal substring of `"unlocked"`) and was fixed the
+  same way -- word-exact match for that one keyword, every other keyword unchanged.
+* **`cool_test::parse_tec_current`** parses `FW: tec[<side>] current: <amps> A` and tracks
+  first/min/max/last plus a sample count (`selected_tec_current_*` report fields) -- purely
+  descriptive, never independently classified as safe/unsafe (no validated hardware-specific
+  current threshold exists; Frozen firmware remains the sole authority on its own internal current
+  safety).
+* **Active-phase duration**: hard maximum raised from 300 to **900 seconds (15 minutes)**; default
+  stays 120s; the 2.0C delta cap is unchanged. Requesting more than 300 seconds requires an
+  additional, exact confirmation phrase (`RUN EXTENDED COOLING TEST FOR UP TO 15 MINUTES`, checked
+  early, before any I2C/UART access) and prints a reminder that the operator must remain present
+  for the whole run and continuously monitor for leaks, a burning smell, abnormal pump noise, loss
+  of circulation, or unexpected heating.
+* **Target-reached is now confirmed stable, not single-tick**: the selected side's temperature
+  must stay at or below the computed target for `TARGET_STABLE_CONFIRM_WINDOW` (5s) before the
+  active phase actually stops -- a lone noisy or fast-settling sample is no longer sufficient, and
+  the TEC is never kept enabled merely to consume the rest of the requested duration once
+  stability is confirmed. `time_to_target_seconds` records when the target was first reached
+  (distinct from the total active duration, which includes the confirmation window).
+* **Ctrl+C/SIGTERM/SIGHUP now reach controlled shutdown from baseline collection onward, not only
+  the active phase**: `wait_for_termination_signal` is now raced via `tokio::select!` in the
+  baseline loop too (baseline can now take up to 60s -- see the previous revision). This closes a
+  real gap: `tokio::signal::ctrl_c()` only replaces the OS's default "kill immediately" SIGINT
+  disposition once it has actually been awaited somewhere in the process; without this, the first
+  Ctrl+C during baseline collection would have terminated the process outright, bypassing
+  `run_cool_test_shutdown` entirely.
+* **New/renamed `CoolTestResults` fields**: `actual_duration_seconds` ->
+  `actual_active_duration_seconds`; `selected_side_change_c`/`opposite_side_change_c`/
+  `heatsink_change_c` -> `selected_side_temperature_change_c`/`opposite_side_temperature_change_c`/
+  `heatsink_temperature_change_c` (exact names now match the fix request). New:
+  `extended_test_confirmation_received`, `time_to_target_seconds`, `maximum_heatsink_c`,
+  `selected_tec_safety_passed`, `selected_pump_activity_observed`,
+  `selected_tec_current_first/min/max/last_a`, `selected_tec_current_samples`,
+  `telemetry_watchdog_triggered`, `communication_loss_observed`, `operator_abort_observed`,
+  `both_targets_shutdown_confirmed`, `selected_pump_shutdown_observed`,
+  `selected_tec_shutdown_observed`. The shutdown-verify window now also watches for pump/TEC
+  status messages for the selected side (best-effort, in addition to the primary `TargetUpdate`
+  confirmation). Wired into text, JSON, and a new trailing `field,value` summary section in the
+  CSV export (the per-sample time-series rows are unchanged).
+* **All previously-working behavior verified unchanged** by the existing (still-passing) test
+  suite: shared narrow Frozen reset, no `ResetController`, only expander bit 1 modified, reservoir
+  confirmation before active cooling, exactly one cooling side enabled, three-times-repeated
+  both-side shutdown, no global subsystem reset on normal completion, no raw serial dumps by
+  default.
+
+22 net new tests (240 total, up from 218), all in `cool_test.rs`, including: the exact 4 fixture
+messages from the fix request (`"safe, unlocking"`/`"unlocked"`/`"unsafe, locking"`/`"locked"`)
+proven both at the parser level and end to end through the active loop; the same distinction
+proven against the generic fault-keyword scan; 900s accepted and 901s rejected with an explicit
+message; the extended-duration phrase gate (required above 300s, never checked at or below it);
+early stop confirmed to wait out the full stability window, not a single tick; TEC current
+parsing; communication loss (a dropped link) and selected-pump startup failure each triggering
+controlled shutdown; and a SIGTERM-specific shutdown test alongside the existing Ctrl+C one.
 
 ## Revision note: decode the 14-byte `GetTemperature` reply; fix a premature baseline cutoff
 

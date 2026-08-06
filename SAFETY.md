@@ -291,11 +291,24 @@ PROTOCOL_AUDIT.md.
   `safety::FrozenAction::enable_cooling` refuses to construct a command for a larger delta. This
   cap is unchanged by the duration/startup changes below.
 * Default active duration: **120 seconds** — long enough to establish meaningful water-temperature
-  movement through the filled cover loop. **Absolute maximum: 300 seconds** — `cool_test::run`
-  refuses to start at all if `--duration-seconds` exceeds this. A long duration is not a long
-  minimum wait: the test always stops early once the requested target temperature is reached, a
-  safety condition triggers, communication with Frozen is lost, or the operator interrupts (see
-  below).
+  movement through the filled cover loop. **Absolute maximum: 900 seconds (15 minutes)** —
+  `cool_test::run` refuses to start at all if `--duration-seconds` exceeds this. Requesting more
+  than 300 seconds requires an additional, exact typed confirmation (`RUN EXTENDED COOLING TEST
+  FOR UP TO 15 MINUTES`) and prints a reminder that the operator must remain present for the whole
+  run and continuously monitor for leaks, a burning smell, abnormal pump noise, loss of
+  circulation, or unexpected heating. A long duration is not a long minimum wait: the test always
+  stops early once the requested target temperature is reached *and stays reached* for a short
+  confirmation window (never on a single noisy sample, and the TEC is never kept enabled merely to
+  consume the rest of the requested duration once that's confirmed), a safety condition triggers,
+  communication with Frozen is lost, or the operator interrupts (see below).
+* The selected TEC's safety-interlock state is parsed into explicit states
+  (`cool_test::TecSafetyState`), not matched by raw substring: `"safe, unlocking"` and `"unlocked"`
+  are positive, non-fault transitions; only `"unsafe, locking"` and the exact word `"locked"` are
+  treated as a safety shutdown. An earlier revision matched TEC lock state with
+  `contains("tec") && contains("lock")`, which also matches `"unlocking"`/`"unlocked"` (both
+  contain the substring `"lock"`) and aborted a healthy, actively-cooling run on exactly that
+  message — a real live-hardware regression this fix corrected. The same substring trap existed
+  independently in the generic firmware-fault keyword scan and was fixed the same way.
 * The baseline is collected over **at least 10 seconds** of stable samples (at least 5), and
   collection continues for up to **60 seconds** if that many valid samples haven't arrived yet —
   never a single reading. Samples come from unsolicited `TemperatureUpdate` pushes and decoded

@@ -1,8 +1,9 @@
 opensleep-diagnostic — build report
 ====================================
 
-Patch revision: 13 (decodes the 14-byte GetTemperature reply; fixes a premature 40s baseline cutoff)
-Supersedes revision 12 (reworked frozen-cool-test onto the narrow startup model; fixed an
+Patch revision: 14 (fixes a false TEC-lock abort; extends the active phase to 15 minutes)
+Supersedes revision 13 (decoded the 14-byte GetTemperature reply; fixed a premature 40s baseline
+cutoff), revision 12 (reworked frozen-cool-test onto the narrow startup model; fixed an
 unbounded-write hang), revision 11 (fixed --release-frozen-only to configure the reset pin as an
 output before pulsing it), revision 10 (fixed --release-frozen-only to pulse the reset bit instead
 of one-shot clearing it), revision 9 (added --release-frozen-only: minimal Frozen release, no
@@ -12,6 +13,43 @@ global reset), revision 8 (fixed Frozen/Sensor UART paths for this Hub variant),
 revision 4 (corrected active-test preflight/monitoring), revision 3 (staged, Frozen-only diagnostic
 redesign), revision 2 (sensor-first post-reset bootloader retry-probe), and revision 1 (initial
 diagnostic-only fork). Same upstream base commit; only source.patch changed.
+
+What changed in revision 14
+----------------------------
+A live left-side cooling test successfully enabled the target and reached active hardware control
+(FW: tec[left] current: 11.402626 A), then aborted on FW: tec[left] safe, unlocking -- logged as
+"firmware reported the selected TEC locked". False positive: "safe, unlocking" is a positive
+safety transition, not a lock/fault. Root cause: contains("tec") && contains("lock") also matches
+"unlocking"/"unlocked" (both contain the substring "lock"). The identical trap independently
+existed in the generic fault-keyword scan's flat contains("locked") check.
+
+  - New TecSafetyState/parse_tec_safety_state: word-tokenized classification (split on
+    non-alphanumeric characters, exact-token match), not substring matching. Only "unsafe,
+    locking" and the exact word "locked" abort; "safe, unlocking"/"unlocked" set
+    selected_tec_safety_passed and let the run continue; anything else is Unknown, logged only.
+    The generic fault-keyword scan's "locked" entry got the same word-exact fix.
+  - New parse_tec_current: FW: tec[<side>] current: <amps> A -> first/min/max/last/sample-count,
+    purely descriptive, never independently classified as safe/unsafe.
+  - Hard maximum active duration: 300 -> 900 seconds (15 minutes); default (120s) and the 2.0C
+    delta cap unchanged. Durations above 300s require an additional exact confirmation phrase
+    (checked early, before any I2C/UART access) and print an operator-presence reminder.
+  - Target-reached now requires TARGET_STABLE_CONFIRM_WINDOW (5s) of continued at-or-below-target
+    readings, not a single tick -- the TEC is never kept enabled merely to consume the rest of the
+    requested duration once stability is confirmed.
+  - wait_for_termination_signal is now raced in the baseline loop too (previously only the active
+    loop), so the first Ctrl+C/SIGTERM/SIGHUP reaches controlled shutdown starting from baseline
+    collection (up to 60s), not only the active phase -- closes a real gap, since
+    tokio::signal::ctrl_c() only replaces the OS default "kill immediately" SIGINT disposition
+    once actually awaited somewhere in the process.
+  - CoolTestResults: renamed 4 fields to match the fix request's exact names
+    (actual_active_duration_seconds, selected/opposite_side_temperature_change_c,
+    heatsink_temperature_change_c); added 14 new fields (extended-duration confirmation,
+    time-to-target, maximum heatsink, TEC safety/current tracking, watchdog/communication-loss/
+    operator-abort flags, granular shutdown confirmation). Wired into text, JSON, and a new
+    trailing CSV summary section.
+
+22 net new tests (240 total, up from 218), all in cool_test.rs. See TEST_RESULTS.md for the full
+writeup.
 
 What changed in revision 13
 ----------------------------

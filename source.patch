@@ -144,10 +144,10 @@ index 0000000..be05be7
 +}
 diff --git a/src/bin/opensleep-diagnostic/cli.rs b/src/bin/opensleep-diagnostic/cli.rs
 new file mode 100644
-index 0000000..236e5bb
+index 0000000..666fa36
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/cli.rs
-@@ -0,0 +1,301 @@
+@@ -0,0 +1,310 @@
 +//! CLI surface. Every flag here maps to a fixed, validated field -- there is no flag that accepts
 +//! a raw opcode, a raw frame, or an arbitrary absolute temperature target. Side selection is a
 +//! closed `ValueEnum`; the cooling delta and duration are validated in `cool_test.rs` against
@@ -259,10 +259,15 @@ index 0000000..236e5bb
 +    pub delta_c: f64,
 +
 +    /// Active-phase duration in seconds. Defaults to 120 seconds -- long enough to establish
-+    /// meaningful water-temperature movement through the filled cover loop; hard-capped at 300
-+    /// seconds regardless -- no flag can raise that cap. The test still stops early if the
-+    /// requested target temperature is reached, a safety condition triggers, communication is
-+    /// lost, or the operator interrupts, so a long duration is not a long minimum wait.
++    /// meaningful water-temperature movement through the filled cover loop; hard-capped at 900
++    /// seconds (15 minutes) regardless -- no flag can raise that cap. The test still stops early
++    /// once the requested target temperature is reached (and stays reached for a short
++    /// confirmation period), a safety condition triggers, communication is lost, or the operator
++    /// interrupts, so a long duration is not a long minimum wait. Durations above 300 seconds
++    /// require an additional interactive confirmation (see
++    /// `--assume-extended-duration-phrase`) and print a reminder that the operator must remain
++    /// present and monitor for leaks, burning smell, abnormal pump noise, loss of circulation, or
++    /// unexpected heating for the whole run.
 +    #[arg(long, default_value_t = crate::cool_test::DEFAULT_DURATION_SECONDS)]
 +    pub duration_seconds: u64,
 +
@@ -320,6 +325,10 @@ index 0000000..236e5bb
 +    /// confirmation phrase required immediately before enabling cooling.
 +    #[arg(long, hide = true)]
 +    pub assume_reservoir_phrase: Option<String>,
++    /// Testing/CI escape hatch only: supplies the "RUN EXTENDED COOLING TEST FOR UP TO 15
++    /// MINUTES" confirmation phrase required when `--duration-seconds` exceeds 300.
++    #[arg(long, hide = true)]
++    pub assume_extended_duration_phrase: Option<String>,
 +}
 +
 +#[derive(clap::Args, Debug, Clone)]
@@ -636,23 +645,29 @@ index 0000000..9c6296b
 +}
 diff --git a/src/bin/opensleep-diagnostic/cool_test.rs b/src/bin/opensleep-diagnostic/cool_test.rs
 new file mode 100644
-index 0000000..b54e491
+index 0000000..44df14f
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/cool_test.rs
-@@ -0,0 +1,2591 @@
+@@ -0,0 +1,3252 @@
 +//! `frozen-cool-test`: the one subcommand that intentionally activates a cooling channel. Every
 +//! hard limit here (max delta, max duration, baseline range, heatsink ceiling) is a compile-time
 +//! constant; no CLI flag can raise any of them. See SAFETY.md for the operator-facing version of
 +//! this file's guarantees.
 +//!
-+//! Safety telemetry (baseline validation and the active-phase per-tick checks) is driven
-+//! exclusively by the unsolicited `TemperatureUpdate` push (raw opcode 0x41, the same byte as the
-+//! `GetTemperatures` command itself -- Frozen appears to broadcast this on its own schedule,
-+//! independent of being polled). The solicited `GetTemperature` reply (opcode 0xC1) is still
-+//! requested each tick and, if it decodes, preserved in the report as raw evidence, but it is
-+//! never required: real hardware has been observed sending a 14-byte 0xC1 frame, while
-+//! `FrozenPacket::parse_get_temperature` (reused unmodified from `opensleep`) requires exactly 27
-+//! bytes and so never decodes it. See PROTOCOL_AUDIT.md for the full account.
++//! Baseline validation accepts both the unsolicited `TemperatureUpdate` push (raw opcode 0x41,
++//! the same byte as the `GetTemperatures` command itself -- Frozen appears to broadcast this on
++//! its own schedule, independent of being polled) and a decoded solicited `GetTemperature` reply
++//! (opcode 0xC1) -- the original 27-byte reply via the unmodified upstream parser, or this
++//! firmware's 14-byte reply via `frozen_compat::CompatFrameScanner` (real hardware has been
++//! observed sending both shapes; see PROTOCOL_AUDIT.md). The *active-phase* per-tick safety
++//! checks, by contrast, still rely exclusively on the unsolicited `TemperatureUpdate` push --
++//! `GetTemperature` replies received during the active phase are preserved in the report as raw
++//! evidence only, never required or used for a safety decision there.
++//!
++//! Firmware `Message` text (pump/TEC status, generic fault keywords) is parsed word-by-word where
++//! the wording matters, never by raw substring: `TecSafetyState`'s doc comment covers a real
++//! regression this guards against (`contains("lock")` also matches `"unlocking"`/`"unlocked"`,
++//! aborting a healthy run on a message that is actually reporting the interlock is safe).
 +//!
 +//! ## Startup: the same narrow pulse `--release-frozen-only` uses
 +//!
@@ -675,6 +690,15 @@ index 0000000..b54e491
 +//! not be confirmed *and* the stop reason is a genuine fault does it fall back to the narrow,
 +//! bit-1-only `i2c::assert_frozen_reset_bit_only` -- never the full reset, never registers
 +//! 0x06/0x07.
++//!
++//! The first Ctrl+C/SIGTERM/SIGHUP always reaches this same controlled shutdown, never an
++//! immediate process exit -- including during baseline collection (up to `BASELINE_MAX_WINDOW` =
++//! 60s), not only the active phase: `wait_for_termination_signal` is raced via `tokio::select!` in
++//! both loops. This matters because `tokio::signal::ctrl_c()` only replaces the OS's default
++//! "kill immediately" SIGINT disposition once it has actually been awaited somewhere in the
++//! process; if baseline collection were the only place a real run spent significant time before
++//! that first await, a Ctrl+C there would terminate the process outright, bypassing shutdown
++//! entirely.
 +
 +use std::io::IsTerminal;
 +use std::time::Duration;
@@ -711,8 +735,19 @@ index 0000000..b54e491
 +/// through the filled cover loop. The test still stops early on target-reached/safety/
 +/// communication-loss/interrupt, so this is not a long minimum wait.
 +pub const DEFAULT_DURATION_SECONDS: u64 = 120;
-+/// Hard, non-overridable maximum active duration.
-+pub const HARD_MAX_DURATION_SECONDS: u64 = 300;
++/// Hard, non-overridable maximum active duration: 15 minutes. No flag can raise this.
++pub const HARD_MAX_DURATION_SECONDS: u64 = 900;
++/// Durations above this require the additional [`EXTENDED_DURATION_PHRASE`] confirmation.
++pub const EXTENDED_DURATION_THRESHOLD_SECONDS: u64 = 300;
++/// How long the selected side's live temperature must remain at or below the computed target
++/// before the active phase stops for [`crate::signals::StopReason::TargetTemperatureReached`] --
++/// a single tick at/below target is not itself sufficient (a brief undershoot from telemetry
++/// noise or a single fast-settling sample should not by itself end the test), but the target must
++/// not be held indefinitely either (see item 3 of the fix this constant was added for: never keep
++/// the TEC enabled merely to consume the rest of the requested duration once the target is
++/// genuinely reached). Chosen to be a handful of ticks (this loop polls roughly once per second)
++/// without adding a meaningful delay to a short default-duration run.
++pub const TARGET_STABLE_CONFIRM_WINDOW: Duration = Duration::from_secs(5);
 +/// Conservative baseline/active-phase water temperature envelope: 15-35C. See SAFETY.md for why.
 +pub const MIN_WATER_CENTIDEG: i32 = 1500;
 +pub const MAX_WATER_CENTIDEG: i32 = 3500;
@@ -762,9 +797,22 @@ index 0000000..b54e491
 +/// and the baseline has validated -- distinct from `INTERACTIVE_PHRASE`. Same text and placement
 +/// convention as `frozen-prime-opensleep-init --release-frozen-only`'s own reservoir confirmation.
 +const RESERVOIR_PHRASE: &str = "RESERVOIR INDICATOR IS STILL WORKING";
++/// Required in addition to every other confirmation when `--duration-seconds` exceeds
++/// [`EXTENDED_DURATION_THRESHOLD_SECONDS`]. Checked early, before any I2C/UART access, alongside
++/// [`INTERACTIVE_PHRASE`] -- the requested duration is known from the CLI args alone, so there is
++/// no reason to touch hardware first only to refuse later.
++const EXTENDED_DURATION_PHRASE: &str = "RUN EXTENDED COOLING TEST FOR UP TO 15 MINUTES";
 +/// Reported in `CoolTestResults::startup_mode`: the only startup implementation this file can ever
 +/// use (see module docs and `main.rs`'s guardrail tests).
 +const STARTUP_MODE_LABEL: &str = "narrow (i2c::pulse_frozen_reset_bit)";
++/// A reported TEC current at or below this magnitude, observed *after* a disable command, is
++/// treated as evidence the TEC has stopped drawing significant current -- **not** a safety/hazard
++/// threshold (item 4 of the fix this constant was added for explicitly forbids inventing one of
++/// those): the only claim this makes is "the reported number dropped back down near zero," a
++/// purely descriptive signal, exactly like `parse_pump_report`'s existing `> 0.0005` V "is
++/// running" cutoff. Frozen firmware remains the sole authority on whether any current value it
++/// reports while the TEC is active is itself safe.
++const TEC_STOPPED_CURRENT_THRESHOLD_A: f64 = 0.5;
 +
 +pub async fn run(args: &CoolTestArgs) -> (Report, u8) {
 +    // Recognizes the same, stable set of known-firmware-compatibility log lines this run's own
@@ -799,6 +847,25 @@ index 0000000..b54e491
 +    if !interactive_ok {
 +        log::error!("refusing to run: interactive confirmation phrase was not matched exactly");
 +        return (refused_report(args, false, "interactive confirmation phrase mismatch"), 30);
++    }
++
++    if args.duration_seconds > EXTENDED_DURATION_THRESHOLD_SECONDS {
++        eprintln!(
++            "--frozen-cool-test: requested duration ({}) exceeds {}s. This test may run for up to \
++             15 minutes. The operator must remain present for the entire run and continuously \
++             monitor for leaks, a burning smell, abnormal pump noise, loss of circulation, or \
++             unexpected heating.",
++            args.duration_seconds, EXTENDED_DURATION_THRESHOLD_SECONDS
++        );
++        let extended_confirmation_ok = confirm_phrase(
++            args.assume_extended_duration_phrase.clone(),
++            EXTENDED_DURATION_PHRASE,
++            "Type RUN EXTENDED COOLING TEST FOR UP TO 15 MINUTES to continue: ",
++        );
++        if !extended_confirmation_ok {
++            log::error!("refusing to run: extended-duration confirmation phrase was not matched exactly");
++            return (refused_report(args, false, "extended-duration confirmation phrase mismatch"), 30);
++        }
 +    }
 +
 +    if args.dry_run {
@@ -913,11 +980,89 @@ index 0000000..b54e491
 +    Some(voltage > 0.0005)
 +}
 +
-+/// True if `msg` names the selected TEC as locked. Matched narrowly (both "tec" and "lock" must
-+/// appear) so this does not fire on unrelated messages.
-+fn is_tec_locked_message(msg: &str) -> bool {
++/// The selected TEC's safety-interlock state, as reported in a firmware `Message`. Captured
++/// real-hardware evidence for a normal, successful active phase: `"FW: tec[left] current:
++/// 11.402626 A"` followed by `"FW: tec[left] safe, unlocking"` -- a *positive* transition (the
++/// interlock confirming it is safe to run), not a fault. An earlier version of this file matched
++/// TEC lock state with `contains("tec") && contains("lock")`, which also matches `"unlocking"` and
++/// `"unlocked"` (both contain the substring `"lock"`) and aborted a healthy run on exactly that
++/// message. This type/parser replaces that with explicit, word-tokenized classification instead
++/// of substring matching, so `"lock"` appearing inside a longer word can never be confused with
++/// the standalone word `"locked"`.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum TecSafetyState {
++    /// `"safe, unlocking"` -- interlock transitioning to unlocked; not a fault.
++    SafeUnlocking,
++    /// `"unlocked"` -- interlock already open; active/normal; not a fault.
++    Unlocked,
++    /// `"unsafe, locking"` -- interlock transitioning to locked in response to an unsafe
++    /// condition; a genuine safety shutdown.
++    UnsafeLocking,
++    /// The exact word `"locked"` -- interlock engaged; a genuine safety shutdown.
++    Locked,
++    /// The message named our side's TEC but didn't contain any of the four known state words
++    /// above. Never treated as a fault by itself -- see this type's doc comment.
++    Unknown,
++}
++
++impl TecSafetyState {
++    /// `true` only for the two states that represent a genuine safety shutdown -- both contain
++    /// the word `"lock"` in some form, so this deliberately never derives from a raw substring
++    /// check; see this type's doc comment for why that distinction is the entire point.
++    pub fn is_fault(self) -> bool {
++        matches!(self, TecSafetyState::UnsafeLocking | TecSafetyState::Locked)
++    }
++
++    /// `true` for the two states that represent the interlock being open/opening -- a positive
++    /// safety-passed signal, and evidence the selected TEC is (or is becoming) active.
++    pub fn is_safe_transition(self) -> bool {
++        matches!(self, TecSafetyState::SafeUnlocking | TecSafetyState::Unlocked)
++    }
++}
++
++/// Parses a firmware TEC safety-state message for the given side (e.g. `"FW: tec[left] safe,
++/// unlocking"`), side-scoped exactly like [`parse_pump_report`]. `None` if this message is not
++/// about our side's TEC at all. Classifies by *word*, not substring: splits on non-alphanumeric
++/// characters and looks for an exact token match against `"unlocking"`, `"unlocked"`, `"locking"`,
++/// or `"locked"` -- `"unlocked"` tokenizes to one word, `"unlocked"`, which can never equal the
++/// word `"locked"`, so there is no possible confusion between the two regardless of message
++/// wording, unlike a `contains("lock")` check.
++fn parse_tec_safety_state(msg: &str, side_word: &str) -> Option<TecSafetyState> {
 +    let lower = msg.to_lowercase();
-+    lower.contains("tec") && lower.contains("lock")
++    let marker = format!("tec[{side_word}]");
++    if !lower.contains(&marker) {
++        return None;
++    }
++    let words: Vec<&str> = lower.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
++    let has = |w: &str| words.contains(&w);
++    Some(if has("unlocking") {
++        TecSafetyState::SafeUnlocking
++    } else if has("unlocked") {
++        TecSafetyState::Unlocked
++    } else if has("locking") {
++        TecSafetyState::UnsafeLocking
++    } else if has("locked") {
++        TecSafetyState::Locked
++    } else {
++        TecSafetyState::Unknown
++    })
++}
++
++/// Parses a firmware TEC current message for the given side (e.g. `"FW: tec[left] current:
++/// 11.402626 A"`, per real-hardware capture), side-scoped exactly like [`parse_pump_report`].
++/// Returns the raw reported amperage. Never itself classifies a value as safe or unsafe -- see
++/// [`TEC_STOPPED_CURRENT_THRESHOLD_A`]'s doc comment and item 4 of the fix this parser was added
++/// for: Frozen firmware remains the sole authority on its own internal current safety.
++fn parse_tec_current(msg: &str, side_word: &str) -> Option<f64> {
++    let lower = msg.to_lowercase();
++    let marker = format!("tec[{side_word}]");
++    let idx = lower.find(&marker)?;
++    let rest = &lower[idx + marker.len()..];
++    let cpos = rest.find("current:")?;
++    let after = &rest[cpos + "current:".len()..];
++    let apos = after.find('a')?;
++    let num_str = after[..apos].trim();
++    num_str.parse().ok()
 +}
 +
 +const FAULT_KEYWORDS: [&str; 6] = ["overtemperature", "overcurrent", "shutdown", "fault", "failed", "locked"];
@@ -926,12 +1071,24 @@ index 0000000..b54e491
 +/// captured, evidenced, benign boot-time firmware message (`frozen/command.rs` source comment,
 +/// paired with "cal_info valid"), not an actuator/safety fault, and would otherwise false-trigger
 +/// on the word "locked" alone.
++///
++/// The "locked" keyword specifically is matched *word-exact*, not by substring: "locked" is a
++/// literal substring of "unlocked" (a benign TEC-interlock state -- see [`TecSafetyState`]'s doc
++/// comment for the real regression this guards against), so a plain `contains("locked")` would
++/// false-trigger on it. Every other keyword keeps the original substring match.
 +fn is_generic_fault_message(msg: &str) -> bool {
 +    let lower = msg.to_lowercase();
 +    if lower.contains("flash locked") {
 +        return false;
 +    }
-+    FAULT_KEYWORDS.iter().any(|kw| lower.contains(kw))
++    let words: Vec<&str> = lower.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
++    FAULT_KEYWORDS.iter().any(|&kw| {
++        if kw == "locked" {
++            words.contains(&"locked")
++        } else {
++            lower.contains(kw)
++        }
++    })
 +}
 +
 +/// True if a firmware `Message` about the selected water/heatsink sensor is a known, non-fatal
@@ -976,6 +1133,15 @@ index 0000000..b54e491
 +    both_confirmed_disabled: bool,
 +    uart_flushed: bool,
 +    emergency_reset_asserted: bool,
++    /// `true` iff a firmware pump message for the selected side reported off/0V during the
++    /// shutdown verify window -- best-effort: `false` just means no such message happened to
++    /// arrive in that window, not that the pump is still running (`both_confirmed_disabled`, from
++    /// the protocol-level `TargetUpdate` ack, is the primary shutdown confirmation).
++    selected_pump_shutdown_observed: bool,
++    /// `true` iff a firmware TEC-current message for the selected side reported a near-zero
++    /// reading (see [`TEC_STOPPED_CURRENT_THRESHOLD_A`]) during the shutdown verify window.
++    /// Same best-effort caveat as `selected_pump_shutdown_observed`.
++    selected_tec_shutdown_observed: bool,
 +}
 +
 +impl CoolTestShutdown {
@@ -995,11 +1161,13 @@ index 0000000..b54e491
 +    audit: &mut AuditedTransport,
 +    i2c: &mut P,
 +    stop_reason: StopReason,
++    side: BedSide,
 +) -> CoolTestShutdown
 +where
 +    T: AsyncRead + AsyncWrite + Unpin,
 +    P: I2cPort,
 +{
++    let side_tag = side_word(side);
 +    let mut result = CoolTestShutdown::default();
 +
 +    if let Some(link) = link {
@@ -1058,6 +1226,18 @@ index 0000000..b54e491
 +                        BedSide::Left => left_confirmed_disabled = true,
 +                        BedSide::Right => right_confirmed_disabled = true,
 +                    },
++                    // Best-effort pump/TEC shutdown evidence -- see `CoolTestShutdown`'s doc
++                    // comments on these two fields for why this is "when available", not required.
++                    Ok(PacketOutcome::Received(FrozenPacket::Message(m))) => {
++                        if parse_pump_report(&m, side_tag) == Some(false) {
++                            result.selected_pump_shutdown_observed = true;
++                        }
++                        if let Some(amps) = parse_tec_current(&m, side_tag)
++                            && amps.abs() <= TEC_STOPPED_CURRENT_THRESHOLD_A
++                        {
++                            result.selected_tec_shutdown_observed = true;
++                        }
++                    }
 +                    Ok(PacketOutcome::Closed) | Err(_) => break,
 +                    _ => {}
 +                }
@@ -1132,6 +1312,13 @@ index 0000000..b54e491
 +        requested_delta_c: args.delta_c,
 +        requested_duration_seconds: args.duration_seconds,
 +        startup_mode: STARTUP_MODE_LABEL.to_string(),
++        // `run_core` is only ever reached (via `run()`) after any *required* confirmation has
++        // already succeeded -- `run()` returns early otherwise, before opening any hardware --
++        // so reaching this line already proves the extended-duration phrase was received whenever
++        // it was required. Tests that call `run_core` directly (bypassing `run()`'s prompt
++        // entirely) get the same, correct answer: no prompt was needed unless the duration itself
++        // exceeds the threshold.
++        extended_test_confirmation_received: args.duration_seconds > EXTENDED_DURATION_THRESHOLD_SECONDS,
 +        ..Default::default()
 +    };
 +
@@ -1157,7 +1344,7 @@ index 0000000..b54e491
 +    }
 +    if !startup.ping_ok || !startup.frozen_reached_firmware {
 +        log::error!("refusing to run active test: Frozen did not reach application firmware");
-+        let shutdown = run_cool_test_shutdown(Some(link), &mut audit, i2c, StopReason::PreflightRefused).await;
++        let shutdown = run_cool_test_shutdown(Some(link), &mut audit, i2c, StopReason::PreflightRefused, side).await;
 +        cr.emergency_shutdown = if shutdown.verified() { Verdict::Pass } else { Verdict::Fail };
 +        ct.shutdown_verified = shutdown.verified();
 +        ct.emergency_reset_asserted = shutdown.emergency_reset_asserted;
@@ -1186,7 +1373,7 @@ index 0000000..b54e491
 +    }
 +    if left_enabled_after_disable == Some(true) || right_enabled_after_disable == Some(true) {
 +        log::error!("refusing to run active test: an enabled target is still active after safety-off");
-+        let shutdown = run_cool_test_shutdown(Some(link), &mut audit, i2c, StopReason::PreflightRefused).await;
++        let shutdown = run_cool_test_shutdown(Some(link), &mut audit, i2c, StopReason::PreflightRefused, side).await;
 +        cr.emergency_shutdown = if shutdown.verified() { Verdict::Pass } else { Verdict::Fail };
 +        ct.shutdown_verified = shutdown.verified();
 +        ct.emergency_reset_asserted = shutdown.emergency_reset_asserted;
@@ -1219,7 +1406,15 @@ index 0000000..b54e491
 +    // arrive from here on are relevant to baseline compat scanning.
 +    let mut raw_scan_checkpoint: usize = capture.as_ref().and_then(|c| c.lock().ok()).map(|c| c.len()).unwrap_or(0);
 +
-+    while baseline_should_continue(baseline_samples.len(), baseline_start.elapsed()) {
++    // Racing `wait_for_termination_signal()` here (not just in the active loop below) closes a
++    // real gap: `tokio::signal::ctrl_c()` only replaces the OS's default "kill immediately"
++    // SIGINT disposition once it has been awaited somewhere in the process, and baseline
++    // collection (up to BASELINE_MAX_WINDOW = 60s) runs entirely before the active loop ever
++    // reaches its own signal race. Without this, the first Ctrl+C during baseline collection would
++    // terminate the process outright -- skipping `run_cool_test_shutdown` entirely -- instead of
++    // triggering the same controlled shutdown every other exit path uses.
++    let mut baseline_interrupted: Option<StopReason> = None;
++    'baseline: while baseline_should_continue(baseline_samples.len(), baseline_start.elapsed()) {
 +        if let Err(e) = link.send_only(&mut audit, FrozenAction::get_temperatures()).await {
 +            log::error!("failed to send GetTemperatures during baseline collection: {e}");
 +            stats.record_timeout();
@@ -1234,29 +1429,38 @@ index 0000000..b54e491
 +            if remaining.is_zero() {
 +                break;
 +            }
-+            match link.recv(remaining).await {
-+                Ok(PacketOutcome::Received(pkt)) => {
-+                    stats.record(&pkt);
-+                    let elapsed_ms = baseline_start.elapsed().as_millis() as u64;
-+                    match pkt {
-+                        FrozenPacket::TemperatureUpdate(u) => {
-+                            let sample = sample_from_temperature_update(elapsed_ms, jiff::Timestamp::now().to_string(), &u);
-+                            samples.push((&sample).into());
-+                            tick_candidates.push(sample);
-+                        }
-+                        FrozenPacket::GetTemperature(g) => {
-+                            let sample = sample_from_get_temperature(elapsed_ms, jiff::Timestamp::now().to_string(), &g);
-+                            samples.push((&sample).into());
-+                            tick_candidates.push(sample);
-+                        }
-+                        _ => {}
-+                    }
++            tokio::select! {
++                biased;
++                reason = wait_for_termination_signal() => {
++                    baseline_interrupted = Some(reason);
++                    break 'baseline;
 +                }
-+                Ok(PacketOutcome::TimedOut) => break,
-+                Ok(PacketOutcome::Closed) => break,
-+                Err(e) => {
-+                    log::debug!("baseline collection: {e}");
-+                    break;
++                outcome = link.recv(remaining) => {
++                    match outcome {
++                        Ok(PacketOutcome::Received(pkt)) => {
++                            stats.record(&pkt);
++                            let elapsed_ms = baseline_start.elapsed().as_millis() as u64;
++                            match pkt {
++                                FrozenPacket::TemperatureUpdate(u) => {
++                                    let sample = sample_from_temperature_update(elapsed_ms, jiff::Timestamp::now().to_string(), &u);
++                                    samples.push((&sample).into());
++                                    tick_candidates.push(sample);
++                                }
++                                FrozenPacket::GetTemperature(g) => {
++                                    let sample = sample_from_get_temperature(elapsed_ms, jiff::Timestamp::now().to_string(), &g);
++                                    samples.push((&sample).into());
++                                    tick_candidates.push(sample);
++                                }
++                                _ => {}
++                            }
++                        }
++                        Ok(PacketOutcome::TimedOut) => break,
++                        Ok(PacketOutcome::Closed) => break,
++                        Err(e) => {
++                            log::debug!("baseline collection: {e}");
++                            break;
++                        }
++                    }
 +                }
 +            }
 +        }
@@ -1313,6 +1517,18 @@ index 0000000..b54e491
 +        }
 +    }
 +
++    if let Some(reason) = baseline_interrupted {
++        log::error!("baseline collection interrupted: {reason}");
++        let shutdown = run_cool_test_shutdown(Some(link), &mut audit, i2c, reason, side).await;
++        cr.emergency_shutdown = if shutdown.verified() { Verdict::Pass } else { Verdict::Fail };
++        ct.shutdown_verified = shutdown.verified();
++        ct.emergency_reset_asserted = shutdown.emergency_reset_asserted;
++        ct.stop_reason = reason.to_string();
++        return finish(
++            args, dry_run, &audit, &stats, samples, cr, ct, reason, false, 30, expander_value, &led, true, true,
++        );
++    }
++
 +    let baseline_collection_duration = baseline_start.elapsed();
 +    ct.baseline_samples_requested = BASELINE_MIN_SAMPLES;
 +    ct.baseline_synchronous_samples_decoded = baseline_synchronous_decoded;
@@ -1329,7 +1545,7 @@ index 0000000..b54e491
 +        Some(b) => b,
 +        None => {
 +            log::error!("refusing to run active test: baseline temperature did not pass validation");
-+            let shutdown = run_cool_test_shutdown(Some(link), &mut audit, i2c, StopReason::PreflightRefused).await;
++            let shutdown = run_cool_test_shutdown(Some(link), &mut audit, i2c, StopReason::PreflightRefused, side).await;
 +            cr.emergency_shutdown = if shutdown.verified() { Verdict::Pass } else { Verdict::Fail };
 +            ct.shutdown_verified = shutdown.verified();
 +            ct.emergency_reset_asserted = shutdown.emergency_reset_asserted;
@@ -1354,7 +1570,7 @@ index 0000000..b54e491
 +        Ok(a) => a,
 +        Err(e) => {
 +            log::error!("refusing to run active test: {e}");
-+            let shutdown = run_cool_test_shutdown(Some(link), &mut audit, i2c, StopReason::PreflightRefused).await;
++            let shutdown = run_cool_test_shutdown(Some(link), &mut audit, i2c, StopReason::PreflightRefused, side).await;
 +            cr.emergency_shutdown = if shutdown.verified() { Verdict::Pass } else { Verdict::Fail };
 +            ct.shutdown_verified = shutdown.verified();
 +            ct.emergency_reset_asserted = shutdown.emergency_reset_asserted;
@@ -1376,7 +1592,7 @@ index 0000000..b54e491
 +    );
 +    if !start_ok {
 +        log::error!("refusing to run active test: final start phrase was not matched exactly");
-+        let shutdown = run_cool_test_shutdown(Some(link), &mut audit, i2c, StopReason::PreflightRefused).await;
++        let shutdown = run_cool_test_shutdown(Some(link), &mut audit, i2c, StopReason::PreflightRefused, side).await;
 +        cr.emergency_shutdown = if shutdown.verified() { Verdict::Pass } else { Verdict::Fail };
 +        ct.shutdown_verified = shutdown.verified();
 +        ct.emergency_reset_asserted = shutdown.emergency_reset_asserted;
@@ -1401,7 +1617,7 @@ index 0000000..b54e491
 +    };
 +    if !reservoir_ok {
 +        log::error!("refusing to run active test: reservoir confirmation phrase was not matched exactly");
-+        let shutdown = run_cool_test_shutdown(Some(link), &mut audit, i2c, StopReason::PreflightRefused).await;
++        let shutdown = run_cool_test_shutdown(Some(link), &mut audit, i2c, StopReason::PreflightRefused, side).await;
 +        cr.emergency_shutdown = if shutdown.verified() { Verdict::Pass } else { Verdict::Fail };
 +        ct.shutdown_verified = shutdown.verified();
 +        ct.emergency_reset_asserted = shutdown.emergency_reset_asserted;
@@ -1445,10 +1661,19 @@ index 0000000..b54e491
 +    let mut final_left_c: Option<f64> = None;
 +    let mut final_right_c: Option<f64> = None;
 +    let mut final_heatsink_c: Option<f64> = None;
++    let mut max_heatsink_c: Option<f64> = None;
 +    let mut target_reached = false;
++    let mut target_reached_at: Option<Instant> = None;
++    let mut time_to_target_seconds: Option<f64> = None;
 +    let mut tec_activity_seen = false;
 +    let mut left_pump_activity_observed = false;
 +    let mut right_pump_activity_observed = false;
++    let mut selected_tec_safety_passed = false;
++    let mut tec_current_first_a: Option<f64> = None;
++    let mut tec_current_min_a: Option<f64> = None;
++    let mut tec_current_max_a: Option<f64> = None;
++    let mut tec_current_last_a: Option<f64> = None;
++    let mut tec_current_samples: u64 = 0;
 +    #[allow(unused_assignments)]
 +    let mut stop_reason = StopReason::Normal;
 +    let mut telemetry_ok = true;
@@ -1522,6 +1747,7 @@ index 0000000..b54e491
 +                            active_right_c.push(right_c);
 +                            min_left_c = Some(min_left_c.map_or(left_c, |m: f64| m.min(left_c)));
 +                            min_right_c = Some(min_right_c.map_or(right_c, |m: f64| m.min(right_c)));
++                            max_heatsink_c = Some(max_heatsink_c.map_or(heatsink_c, |m: f64| m.max(heatsink_c)));
 +                            final_left_c = Some(left_c);
 +                            final_right_c = Some(right_c);
 +                            final_heatsink_c = Some(heatsink_c);
@@ -1551,11 +1777,23 @@ index 0000000..b54e491
 +                            }
 +
 +                            // Stop early once the requested target has been reached -- never cool
-+                            // further than what was requested and confirmed.
++                            // further than what was requested and confirmed. A single tick at or
++                            // below target is not itself sufficient (telemetry noise or a single
++                            // fast-settling sample); the reading must stay at/below target for
++                            // TARGET_STABLE_CONFIRM_WINDOW before the active phase actually stops
++                            // -- and the TEC is never kept enabled merely to consume the rest of
++                            // the requested duration once that stability is confirmed.
 +                            if we_enabled_side && (side_centideg as i32) <= (target_centideg as i32) {
-+                                target_reached = true;
-+                                stop_reason = StopReason::TargetTemperatureReached;
-+                                break 'active;
++                                let reached_at = *target_reached_at.get_or_insert_with(Instant::now);
++                                if reached_at.elapsed() >= TARGET_STABLE_CONFIRM_WINDOW {
++                                    target_reached = true;
++                                    time_to_target_seconds =
++                                        Some(reached_at.saturating_duration_since(active_start).as_secs_f64());
++                                    stop_reason = StopReason::TargetTemperatureReached;
++                                    break 'active;
++                                }
++                            } else {
++                                target_reached_at = None;
 +                            }
 +                        }
 +                        Ok(PacketOutcome::Received(FrozenPacket::GetTemperature(g))) => {
@@ -1576,11 +1814,27 @@ index 0000000..b54e491
 +                            if parse_pump_report(&m, "right") == Some(true) {
 +                                right_pump_activity_observed = true;
 +                            }
-+                            if is_tec_locked_message(&m) {
-+                                log::error!("firmware reported the selected TEC locked: {m:?}");
-+                                stop_reason = StopReason::TecLocked;
-+                                telemetry_ok = false;
-+                                break 'active;
++                            if let Some(amps) = parse_tec_current(&m, side_tag) {
++                                tec_current_samples += 1;
++                                tec_current_first_a.get_or_insert(amps);
++                                tec_current_min_a = Some(tec_current_min_a.map_or(amps, |v: f64| v.min(amps)));
++                                tec_current_max_a = Some(tec_current_max_a.map_or(amps, |v: f64| v.max(amps)));
++                                tec_current_last_a = Some(amps);
++                            }
++                            if let Some(state) = parse_tec_safety_state(&m, side_tag) {
++                                if state.is_fault() {
++                                    log::error!("firmware reported the selected TEC {state:?}: {m:?}");
++                                    stop_reason = StopReason::TecLocked;
++                                    telemetry_ok = false;
++                                    break 'active;
++                                } else if state.is_safe_transition() {
++                                    selected_tec_safety_passed = true;
++                                    tec_activity_seen = true;
++                                } else {
++                                    log::warn!(
++                                        "unrecognized TEC safety-state message (not treated as a fault): {m:?}"
++                                    );
++                                }
 +                            }
 +                            if is_known_nonfatal_sensor_message(&m) {
 +                                log::warn!("firmware sensor-unavailable message (non-fatal): {m:?}");
@@ -1649,7 +1903,7 @@ index 0000000..b54e491
 +        || stats.messages.iter().any(|m| m.to_lowercase().contains("tec") && m.contains(&side_bracket_tag));
 +    let fan_seen = stats.messages.iter().any(|m| m.to_lowercase().contains("fan") && m.contains(&side_bracket_tag));
 +
-+    let shutdown = run_cool_test_shutdown(Some(link), &mut audit, i2c, stop_reason).await;
++    let shutdown = run_cool_test_shutdown(Some(link), &mut audit, i2c, stop_reason, side).await;
 +    cr.emergency_shutdown = if shutdown.verified() { Verdict::Pass } else { Verdict::Fail };
 +
 +    // Pump/fan/TEC results: only ever PASS from decoded evidence, never from "the command was
@@ -1668,25 +1922,46 @@ index 0000000..b54e491
 +
 +    ct.minimum_left_c = min_left_c;
 +    ct.minimum_right_c = min_right_c;
++    ct.maximum_heatsink_c = max_heatsink_c;
 +    ct.final_left_c = final_left_c;
 +    ct.final_right_c = final_right_c;
 +    ct.final_heatsink_c = final_heatsink_c;
-+    ct.selected_side_change_c = match side {
++    ct.selected_side_temperature_change_c = match side {
 +        BedSide::Left => final_left_c.zip(ct.baseline_left_c).map(|(f, b)| f - b),
 +        BedSide::Right => final_right_c.zip(ct.baseline_right_c).map(|(f, b)| f - b),
 +    };
-+    ct.opposite_side_change_c = match side {
++    ct.opposite_side_temperature_change_c = match side {
 +        BedSide::Left => final_right_c.zip(ct.baseline_right_c).map(|(f, b)| f - b),
 +        BedSide::Right => final_left_c.zip(ct.baseline_left_c).map(|(f, b)| f - b),
 +    };
-+    ct.heatsink_change_c = final_heatsink_c.zip(ct.baseline_heatsink_c).map(|(f, b)| f - b);
++    ct.heatsink_temperature_change_c = final_heatsink_c.zip(ct.baseline_heatsink_c).map(|(f, b)| f - b);
 +    ct.target_reached = target_reached;
++    ct.time_to_target_seconds = time_to_target_seconds;
 +    ct.selected_tec_activity_observed = tec_activity_seen;
++    ct.selected_tec_safety_passed = selected_tec_safety_passed;
 +    ct.left_pump_activity_observed = left_pump_activity_observed;
 +    ct.right_pump_activity_observed = right_pump_activity_observed;
++    ct.selected_pump_activity_observed = match side {
++        BedSide::Left => left_pump_activity_observed,
++        BedSide::Right => right_pump_activity_observed,
++    };
++    ct.selected_tec_current_first_a = tec_current_first_a;
++    ct.selected_tec_current_min_a = tec_current_min_a;
++    ct.selected_tec_current_max_a = tec_current_max_a;
++    ct.selected_tec_current_last_a = tec_current_last_a;
++    ct.selected_tec_current_samples = tec_current_samples;
++    ct.telemetry_watchdog_triggered = stop_reason == StopReason::TelemetryStale;
++    ct.communication_loss_observed = matches!(
++        stop_reason,
++        StopReason::UartReadFailure | StopReason::UartWriteFailure | StopReason::TelemetryLost
++    );
++    ct.operator_abort_observed = stop_reason == StopReason::OperatorAbort;
++    ct.both_targets_shutdown_confirmed = shutdown.both_confirmed_disabled;
++    ct.selected_pump_shutdown_observed = shutdown.selected_pump_shutdown_observed;
++    ct.selected_tec_shutdown_observed = shutdown.selected_tec_shutdown_observed;
 +    ct.shutdown_verified = shutdown.verified();
 +    ct.emergency_reset_asserted = shutdown.emergency_reset_asserted;
-+    ct.actual_duration_seconds = active_start.elapsed().as_secs_f64();
++    ct.actual_active_duration_seconds = active_start.elapsed().as_secs_f64();
 +    ct.stop_reason = stop_reason.to_string();
 +
 +    // stop_reason here is never PreflightRefused (every such path above already returned its own
@@ -2085,6 +2360,7 @@ index 0000000..b54e491
 +            assume_interactive_phrase: Some(INTERACTIVE_PHRASE.to_string()),
 +            assume_start_phrase: Some("START LEFT COOLING TEST".to_string()),
 +            assume_reservoir_phrase: Some(RESERVOIR_PHRASE.to_string()),
++            assume_extended_duration_phrase: Some(EXTENDED_DURATION_PHRASE.to_string()),
 +        }
 +    }
 +
@@ -2174,7 +2450,66 @@ index 0000000..b54e491
 +
 +    #[test]
 +    fn max_duration_constant_matches_spec() {
-+        assert_eq!(HARD_MAX_DURATION_SECONDS, 300);
++        assert_eq!(HARD_MAX_DURATION_SECONDS, 900);
++    }
++
++    #[tokio::test]
++    async fn nine_hundred_seconds_does_not_trigger_the_duration_refusal() {
++        // Forces a fast, early refusal for an *unrelated* reason (missing confirmation flags) so
++        // this never has to run the full active phase (900s of mock-device polling) just to prove
++        // the duration check itself doesn't reject 900.
++        let mut a = args(Side::Left, true);
++        a.duration_seconds = 900;
++        a.confirm_active_test = false;
++        let (report, code) = run(&a).await;
++        assert_eq!(code, 30);
++        assert!(!report.stop_reason.contains("duration"), "900s must not itself be refused: {}", report.stop_reason);
++    }
++
++    #[tokio::test]
++    async fn above_nine_hundred_seconds_is_rejected_with_an_explicit_message() {
++        let mut a = args(Side::Left, true);
++        a.duration_seconds = HARD_MAX_DURATION_SECONDS + 1;
++        let (report, code) = run(&a).await;
++        assert_eq!(code, 30);
++        assert!(report.stop_reason.contains("hard maximum"), "got: {}", report.stop_reason);
++    }
++
++    #[tokio::test]
++    async fn durations_above_three_hundred_seconds_require_the_extended_confirmation_phrase() {
++        let mut a = args(Side::Left, true);
++        a.duration_seconds = EXTENDED_DURATION_THRESHOLD_SECONDS + 1;
++        a.assume_extended_duration_phrase = Some("wrong".to_string());
++        let (report, code) = run(&a).await;
++        assert_eq!(code, 30);
++        assert!(report.stop_reason.contains("extended-duration"), "got: {}", report.stop_reason);
++    }
++
++    #[tokio::test]
++    async fn duration_at_or_below_three_hundred_seconds_never_needs_the_extended_confirmation_phrase() {
++        // Forces a fast, early refusal for an unrelated reason so this never has to run the full
++        // active phase (300s, with the constant-temperature dry-run mock never reaching target)
++        // just to prove the extended-duration gate was skipped entirely for a non-extended duration.
++        let mut a = args(Side::Left, true);
++        a.duration_seconds = EXTENDED_DURATION_THRESHOLD_SECONDS;
++        a.assume_extended_duration_phrase = Some("wrong".to_string()); // must never even be checked
++        a.confirm_active_test = false;
++        let (report, code) = run(&a).await;
++        assert_eq!(code, 30);
++        assert_ne!(report.stop_reason, "extended-duration confirmation phrase mismatch");
++    }
++
++    #[tokio::test]
++    async fn correct_extended_duration_phrase_lets_the_run_proceed_past_that_gate() {
++        // Forces a refusal further along (wrong reservoir phrase, reached only after baseline
++        // validates) to prove the extended-duration gate itself was satisfied and passed, without
++        // waiting out a full 300+s active phase just to observe a normal completion.
++        let mut a = args(Side::Left, true);
++        a.duration_seconds = EXTENDED_DURATION_THRESHOLD_SECONDS + 1;
++        a.assume_reservoir_phrase = Some("wrong".to_string());
++        let (report, code) = run(&a).await;
++        assert_eq!(code, 30);
++        assert_ne!(report.stop_reason, "extended-duration confirmation phrase mismatch");
 +    }
 +
 +    #[test]
@@ -2324,14 +2659,100 @@ index 0000000..b54e491
 +        assert_eq!(parse_pump_report("FW: pid[heatsink] 3.0625 0.69 0.69 0.0 0.0", "left"), None);
 +    }
 +
++    // -- TecSafetyState: item 1's regression fixtures, verbatim --
++
 +    #[test]
-+    fn tec_locked_message_is_detected() {
-+        assert!(is_tec_locked_message("FW: tec[left] locked"));
++    fn safe_unlocking_is_not_a_fault() {
++        let state = parse_tec_safety_state("FW: tec[left] safe, unlocking", "left").unwrap();
++        assert_eq!(state, TecSafetyState::SafeUnlocking);
++        assert!(!state.is_fault());
++        assert!(state.is_safe_transition());
 +    }
 +
 +    #[test]
-+    fn flash_locked_is_not_a_tec_lock() {
-+        assert!(!is_tec_locked_message("FW: flash locked"));
++    fn unlocked_is_not_a_fault() {
++        let state = parse_tec_safety_state("FW: tec[left] unlocked", "left").unwrap();
++        assert_eq!(state, TecSafetyState::Unlocked);
++        assert!(!state.is_fault());
++        assert!(state.is_safe_transition());
++    }
++
++    #[test]
++    fn unsafe_locking_is_a_fault() {
++        let state = parse_tec_safety_state("FW: tec[left] unsafe, locking", "left").unwrap();
++        assert_eq!(state, TecSafetyState::UnsafeLocking);
++        assert!(state.is_fault());
++        assert!(!state.is_safe_transition());
++    }
++
++    #[test]
++    fn exact_locked_is_a_fault() {
++        let state = parse_tec_safety_state("FW: tec[left] locked", "left").unwrap();
++        assert_eq!(state, TecSafetyState::Locked);
++        assert!(state.is_fault());
++        assert!(!state.is_safe_transition());
++    }
++
++    #[test]
++    fn unlocking_can_never_be_classified_as_locked() {
++        // The exact regression this fix addresses: a real active-phase run aborted on
++        // "FW: tec[left] safe, unlocking" because the old check was `contains("lock")`, which
++        // matches "unlocking" too. Word-tokenized classification must never conflate the two.
++        for msg in ["FW: tec[left] safe, unlocking", "FW: tec[left] unlocked"] {
++            let state = parse_tec_safety_state(msg, "left").unwrap();
++            assert_ne!(state, TecSafetyState::Locked, "{msg:?} must never classify as Locked");
++            assert_ne!(state, TecSafetyState::UnsafeLocking, "{msg:?} must never classify as UnsafeLocking");
++            assert!(!state.is_fault(), "{msg:?} must never be treated as a fault");
++        }
++    }
++
++    #[test]
++    fn unrecognized_tec_message_is_unknown_not_a_fault() {
++        let state = parse_tec_safety_state("FW: tec[left] recalibrating", "left").unwrap();
++        assert_eq!(state, TecSafetyState::Unknown);
++        assert!(!state.is_fault());
++    }
++
++    #[test]
++    fn tec_safety_state_is_scoped_to_the_named_side() {
++        assert_eq!(parse_tec_safety_state("FW: tec[right] locked", "left"), None);
++        assert!(parse_tec_safety_state("FW: tec[right] locked", "right").unwrap().is_fault());
++    }
++
++    #[test]
++    fn tec_safety_state_ignores_unrelated_messages() {
++        assert_eq!(parse_tec_safety_state("FW: flash locked", "left"), None);
++        assert_eq!(parse_tec_safety_state("FW: pump[left] slow @ 6.03V 0.17A", "left"), None);
++    }
++
++    // -- parse_tec_current: item 4 --
++
++    #[test]
++    fn tec_current_is_parsed() {
++        assert_eq!(parse_tec_current("FW: tec[left] current: 11.402626 A", "left"), Some(11.402626));
++    }
++
++    #[test]
++    fn tec_current_is_scoped_to_the_named_side() {
++        assert_eq!(parse_tec_current("FW: tec[right] current: 5.0 A", "left"), None);
++    }
++
++    #[test]
++    fn tec_current_ignores_unrelated_messages() {
++        assert_eq!(parse_tec_current("FW: tec[left] safe, unlocking", "left"), None);
++    }
++
++    // -- is_generic_fault_message: the same substring bug, in a second function --
++
++    #[test]
++    fn generic_fault_scan_does_not_false_trigger_on_unlocked_or_unlocking() {
++        assert!(!is_generic_fault_message("FW: tec[left] unlocked"));
++        assert!(!is_generic_fault_message("FW: tec[left] safe, unlocking"));
++    }
++
++    #[test]
++    fn generic_fault_scan_still_detects_the_exact_word_locked() {
++        assert!(is_generic_fault_message("FW: tec[left] locked"));
 +    }
 +
 +    #[test]
@@ -2431,7 +2852,133 @@ index 0000000..b54e491
 +        assert!(report.stop_reason.contains("duration") || report.stop_reason == StopReason::DurationExpired.to_string());
 +        let ct = report.cool_test_results.expect("cool_test_results must be set");
 +        assert!(ct.shutdown_verified);
++        assert!(ct.both_targets_shutdown_confirmed, "normal completion must confirm both TargetUpdate(enabled=false) acks");
 +        assert!(!ct.emergency_reset_asserted, "a clean duration-expired stop must never assert the emergency reset");
++    }
++
++    #[tokio::test]
++    async fn selected_pump_startup_failure_stops_before_extended_tec_operation() {
++        let (client, device) = tokio::io::duplex(8192);
++        let device_task = spawn_device_with_a_message(device, "FW: pump[left] off", 1);
++        let mut link = FrozenLink::wrap(client, "test");
++        let mut i2c = MockI2c::always_succeed();
++
++        let mut a = args(Side::Left, false);
++        a.duration_seconds = 10;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None).await;
++
++        assert_eq!(report.stop_reason, StopReason::PumpNotConfirmedRunning.to_string());
++        let ct = report.cool_test_results.expect("cool_test_results must be set");
++        assert!(!ct.selected_pump_activity_observed);
++        assert!(ct.shutdown_verified);
++
++        drop(link);
++        device_task.abort();
++    }
++
++    #[tokio::test]
++    async fn sigterm_stop_reason_triggers_both_side_disable_and_no_i2c_write() {
++        let (client, device_task) = mock_frozen_link_pair();
++        let mut link = FrozenLink::wrap(client, "test");
++        let mut audit = AuditedTransport::new(Mode::CoolTest { side: BedSide::Left });
++        let mut i2c = MockI2c::always_succeed();
++
++        let result = run_cool_test_shutdown(Some(&mut link), &mut audit, &mut i2c, StopReason::Sigterm, BedSide::Left).await;
++
++        assert!(result.both_confirmed_disabled);
++        assert!(i2c.writes.is_empty(), "SIGTERM is not a full subsystem reset -- no I2C write at all");
++        assert!(!result.emergency_reset_asserted);
++
++        drop(link);
++        device_task.abort();
++    }
++
++    /// A fake device that reports the baseline-consistent constant reading (matching every other
++    /// baseline-phase device in this file) until the selected side's target is enabled, then
++    /// immediately reports a reading well below any plausible computed target -- used to prove the
++    /// active loop's `TARGET_STABLE_CONFIRM_WINDOW` actually gates the stop (item 3): a single
++    /// tick at/below target must not by itself end the test.
++    fn spawn_device_that_reaches_target_once_enabled(mut device_side: tokio::io::DuplexStream) -> tokio::task::JoinHandle<()> {
++        use bytes::{Buf, BytesMut};
++        use tokio::io::{AsyncReadExt, AsyncWriteExt};
++        tokio::spawn(async move {
++            let mut acc = BytesMut::new();
++            let mut read_buf = [0u8; 256];
++            let mut enabled = false;
++            let mut count: u8 = 0;
++            loop {
++                if acc.len() >= 2 {
++                    let len = acc[1] as usize;
++                    let total = 1 + 1 + len + 2;
++                    if acc.len() >= total {
++                        let opcode = acc[2];
++                        let payload = acc[2..2 + len].to_vec();
++                        acc.advance(total);
++                        let response = match opcode {
++                            0x01 => Some(opensleep::common::codec::command(vec![0x81, 0x00, 0b0100_0110])),
++                            0x41 => {
++                                count = count.wrapping_add(1);
++                                let left: u16 = if enabled { 2200 } else { 2450 };
++                                Some(opensleep::common::codec::command(vec![
++                                    0x41,
++                                    (left >> 8) as u8,
++                                    left as u8,
++                                    0x09,
++                                    0xA4,
++                                    0x0A,
++                                    0x28,
++                                    9,
++                                    count,
++                                ]))
++                            }
++                            0x40 if payload.len() == 5 => {
++                                enabled = payload[2] == 1;
++                                Some(opensleep::common::codec::command(vec![
++                                    0xC0, 0x00, payload[1], payload[2], payload[3], payload[4],
++                                ]))
++                            }
++                            _ => None,
++                        };
++                        if let Some(resp) = response
++                            && device_side.write_all(&resp).await.is_err()
++                        {
++                            break;
++                        }
++                        continue;
++                    }
++                }
++                match device_side.read(&mut read_buf).await {
++                    Ok(0) | Err(_) => break,
++                    Ok(n) => acc.extend_from_slice(&read_buf[..n]),
++                }
++            }
++        })
++    }
++
++    #[tokio::test]
++    async fn cooling_stops_early_once_target_is_stably_reached() {
++        let (client, device) = tokio::io::duplex(8192);
++        let device_task = spawn_device_that_reaches_target_once_enabled(device);
++        let mut link = FrozenLink::wrap(client, "test");
++        let mut i2c = MockI2c::always_succeed();
++
++        let mut a = args(Side::Left, false);
++        a.delta_c = 1.0; // baseline ~24.50C -> target ~23.50C (2350 centideg), well above the mock's post-enable 2200
++        a.duration_seconds = 60; // long enough that DurationExpired is never what stops it
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None).await;
++
++        assert_eq!(report.stop_reason, StopReason::TargetTemperatureReached.to_string());
++        let ct = report.cool_test_results.expect("cool_test_results must be set");
++        assert!(ct.target_reached);
++        assert!(ct.time_to_target_seconds.is_some());
++        assert!(
++            ct.actual_active_duration_seconds >= TARGET_STABLE_CONFIRM_WINDOW.as_secs_f64(),
++            "a single tick at/below target must not by itself stop the test: actual={}",
++            ct.actual_active_duration_seconds
++        );
++
++        drop(link);
++        device_task.abort();
 +    }
 +
 +    /// A fake device that answers Ping/JumpToFirmware/SetTargetTemperature plausibly, and for
@@ -2489,6 +3036,86 @@ index 0000000..b54e491
 +                }
 +            }
 +        })
++    }
++
++    /// A fake device that answers Ping/JumpToFirmware/SetTargetTemperature and pushes a plausible
++    /// unsolicited TemperatureUpdate for `pushes_before_disconnect` requests, then drops its side
++    /// of the connection entirely -- unlike "going silent" (the connection stays open, so the
++    /// client eventually times out to `TelemetryStale`), this simulates the link actually closing
++    /// (`PacketOutcome::Closed` -> `StopReason::TelemetryLost`), i.e. genuine communication loss.
++    fn spawn_device_that_disconnects_during_active_phase(
++        mut device_side: tokio::io::DuplexStream,
++        pushes_before_disconnect: usize,
++    ) -> tokio::task::JoinHandle<()> {
++        use bytes::{Buf, BytesMut};
++        use tokio::io::{AsyncReadExt, AsyncWriteExt};
++        tokio::spawn(async move {
++            let mut acc = BytesMut::new();
++            let mut read_buf = [0u8; 256];
++            let mut pushes_remaining = pushes_before_disconnect;
++            let mut count: u8 = 0;
++            loop {
++                if acc.len() >= 2 {
++                    let len = acc[1] as usize;
++                    let total = 1 + 1 + len + 2;
++                    if acc.len() >= total {
++                        let opcode = acc[2];
++                        let payload = acc[2..2 + len].to_vec();
++                        acc.advance(total);
++                        let response = match opcode {
++                            0x01 => Some(opensleep::common::codec::command(vec![0x81, 0x00, 0b0100_0110])),
++                            0x41 => {
++                                if pushes_remaining == 0 {
++                                    return; // drop device_side: the client sees the link close
++                                }
++                                pushes_remaining -= 1;
++                                count = count.wrapping_add(1);
++                                Some(opensleep::common::codec::command(vec![
++                                    0x41, 0x09, 0x9A, 0x09, 0xA4, 0x0A, 0x28, 9, count,
++                                ]))
++                            }
++                            0x40 if payload.len() == 5 => Some(opensleep::common::codec::command(vec![
++                                0xC0, 0x00, payload[1], payload[2], payload[3], payload[4],
++                            ])),
++                            _ => None,
++                        };
++                        if let Some(resp) = response
++                            && device_side.write_all(&resp).await.is_err()
++                        {
++                            break;
++                        }
++                        continue;
++                    }
++                }
++                match device_side.read(&mut read_buf).await {
++                    Ok(0) | Err(_) => break,
++                    Ok(n) => acc.extend_from_slice(&read_buf[..n]),
++                }
++            }
++        })
++    }
++
++    #[tokio::test]
++    async fn communication_loss_triggers_controlled_shutdown_attempt() {
++        let (client, device) = tokio::io::duplex(8192);
++        let device_task = spawn_device_that_disconnects_during_active_phase(device, 6);
++        let mut link = FrozenLink::wrap(client, "test");
++        let mut i2c = MockI2c::always_succeed();
++
++        let mut a = args(Side::Left, false);
++        a.duration_seconds = 10;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None).await;
++
++        // The disconnect can surface as either a closed read (`TelemetryLost`) or a failed write
++        // to the now-gone peer (`UartWriteFailure`), depending on exactly when the duplex notices
++        // the other side is gone -- `communication_loss_observed` covers both, which is the actual
++        // property this test cares about (a real device dropping off mid-run is not itself a
++        // deterministic single StopReason on real hardware either).
++        let ct = report.cool_test_results.expect("cool_test_results must be set");
++        assert!(ct.communication_loss_observed, "stop_reason was: {}", report.stop_reason);
++
++        drop(link);
++        device_task.abort();
 +    }
 +
 +    #[tokio::test]
@@ -2914,6 +3541,49 @@ index 0000000..b54e491
 +    }
 +
 +    #[tokio::test]
++    async fn safe_unlocking_message_permits_the_active_phase_to_continue() {
++        // Item 1's exact real-hardware regression, end to end: a healthy active phase that
++        // receives "FW: tec[left] safe, unlocking" every tick must run its full duration, not
++        // abort on the very message that reports the interlock is safe.
++        let (client, device) = tokio::io::duplex(8192);
++        let device_task = spawn_device_with_a_message(device, "FW: tec[left] safe, unlocking", 1);
++        let mut link = FrozenLink::wrap(client, "test");
++        let mut i2c = MockI2c::always_succeed();
++
++        let mut a = args(Side::Left, false);
++        a.duration_seconds = 2;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None).await;
++
++        assert_eq!(report.stop_reason, StopReason::DurationExpired.to_string());
++        let ct = report.cool_test_results.expect("cool_test_results must be set");
++        assert!(ct.selected_tec_safety_passed);
++
++        drop(link);
++        device_task.abort();
++    }
++
++    #[tokio::test]
++    async fn unsafe_locking_message_triggers_controlled_shutdown() {
++        let (client, device) = tokio::io::duplex(8192);
++        let device_task = spawn_device_with_a_message(device, "FW: tec[left] unsafe, locking", 3);
++        let mut link = FrozenLink::wrap(client, "test");
++        let mut i2c = MockI2c::always_succeed();
++
++        let mut a = args(Side::Left, false);
++        a.duration_seconds = 10;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None).await;
++
++        assert_eq!(report.stop_reason, StopReason::TecLocked.to_string());
++        let ct = report.cool_test_results.expect("cool_test_results must be set");
++        assert!(!ct.selected_tec_safety_passed);
++        assert!(ct.shutdown_verified);
++        assert!(!ct.emergency_reset_asserted, "UART-based shutdown must succeed against the mock device");
++
++        drop(link);
++        device_task.abort();
++    }
++
++    #[tokio::test]
 +    async fn flash_locked_message_does_not_trigger_shutdown_early() {
 +        let (client, device) = tokio::io::duplex(8192);
 +        // Sent on essentially every tick (messages_after=1); if this were mistaken for a fault
@@ -3074,7 +3744,7 @@ index 0000000..b54e491
 +        let mut audit = AuditedTransport::new(Mode::CoolTest { side: BedSide::Left });
 +        let mut i2c = MockI2c::always_succeed();
 +
-+        let result = run_cool_test_shutdown(Some(&mut link), &mut audit, &mut i2c, StopReason::Normal).await;
++        let result = run_cool_test_shutdown(Some(&mut link), &mut audit, &mut i2c, StopReason::Normal, BedSide::Left).await;
 +
 +        assert_eq!(result.left_disable_attempts.len(), SHUTDOWN_REPEAT_COUNT);
 +        assert_eq!(result.right_disable_attempts.len(), SHUTDOWN_REPEAT_COUNT);
@@ -3098,7 +3768,7 @@ index 0000000..b54e491
 +        let mut audit = AuditedTransport::new(Mode::CoolTest { side: BedSide::Left });
 +        let mut i2c = MockI2c::always_succeed();
 +
-+        let result = run_cool_test_shutdown(Some(&mut link), &mut audit, &mut i2c, StopReason::CtrlC).await;
++        let result = run_cool_test_shutdown(Some(&mut link), &mut audit, &mut i2c, StopReason::CtrlC, BedSide::Left).await;
 +
 +        assert_eq!(result.left_disable_attempts.len(), SHUTDOWN_REPEAT_COUNT);
 +        assert_eq!(result.right_disable_attempts.len(), SHUTDOWN_REPEAT_COUNT);
@@ -3121,7 +3791,7 @@ index 0000000..b54e491
 +
 +        for reason in [StopReason::Normal, StopReason::DurationExpired, StopReason::TargetTemperatureReached, StopReason::CtrlC] {
 +            i2c.writes.clear();
-+            let result = run_cool_test_shutdown(Some(&mut link), &mut audit, &mut i2c, reason).await;
++            let result = run_cool_test_shutdown(Some(&mut link), &mut audit, &mut i2c, reason, BedSide::Left).await;
 +            assert!(i2c.writes.is_empty(), "stop_reason={reason} must never write I2C");
 +            assert!(!result.emergency_reset_asserted, "stop_reason={reason} must never assert the emergency reset");
 +        }
@@ -3138,7 +3808,7 @@ index 0000000..b54e491
 +        let mut audit = AuditedTransport::new(Mode::CoolTest { side: BedSide::Left });
 +        let mut i2c = MockI2c::always_succeed();
 +
-+        let result = run_cool_test_shutdown(Some(&mut link), &mut audit, &mut i2c, StopReason::TecLocked).await;
++        let result = run_cool_test_shutdown(Some(&mut link), &mut audit, &mut i2c, StopReason::TecLocked, BedSide::Left).await;
 +
 +        assert!(result.emergency_reset_asserted);
 +        assert!(result.verified());
@@ -3161,7 +3831,7 @@ index 0000000..b54e491
 +        let mut audit = AuditedTransport::new(Mode::CoolTest { side: BedSide::Left });
 +        let mut i2c = MockI2c::always_succeed();
 +
-+        let result = run_cool_test_shutdown(Some(&mut link), &mut audit, &mut i2c, StopReason::DurationExpired).await;
++        let result = run_cool_test_shutdown(Some(&mut link), &mut audit, &mut i2c, StopReason::DurationExpired, BedSide::Left).await;
 +
 +        assert!(!result.emergency_reset_asserted);
 +        assert!(i2c.writes.is_empty());
@@ -9682,10 +10352,10 @@ index 0000000..e668cde
 +}
 diff --git a/src/bin/opensleep-diagnostic/report.rs b/src/bin/opensleep-diagnostic/report.rs
 new file mode 100644
-index 0000000..b46765b
+index 0000000..ec2bedc
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/report.rs
-@@ -0,0 +1,785 @@
+@@ -0,0 +1,919 @@
 +//! Structured JSON/CSV/text reporting shared by all three subcommands. Machine evidence (audit
 +//! log, decoded telemetry) is always kept in separate fields from operator-entered observations,
 +//! per the safety model: a component may only be marked PASS from decoded evidence or an explicit
@@ -10039,7 +10709,17 @@ index 0000000..b46765b
 +    pub selected_side: String,
 +    pub requested_delta_c: f64,
 +    pub requested_duration_seconds: u64,
-+    pub actual_duration_seconds: f64,
++    pub actual_active_duration_seconds: f64,
++    /// `true` iff the operator typed `RUN EXTENDED COOLING TEST FOR UP TO 15 MINUTES` (required
++    /// whenever `requested_duration_seconds` exceeds `cool_test::EXTENDED_DURATION_THRESHOLD_SECONDS`,
++    /// i.e. 300s). `false` when the requested duration didn't require it -- see `cool_test::run`.
++    pub extended_test_confirmation_received: bool,
++    /// Seconds from the active phase starting to the selected side's temperature first reaching
++    /// the computed target -- `None` if the target was never reached. Distinct from
++    /// `actual_active_duration_seconds`: the active phase keeps running for
++    /// `cool_test::TARGET_STABLE_CONFIRM_WINDOW` after this point to confirm the reading is
++    /// stable, not a single noisy sample, before actually stopping.
++    pub time_to_target_seconds: Option<f64>,
 +    pub baseline_left_c: Option<f64>,
 +    pub baseline_right_c: Option<f64>,
 +    pub baseline_heatsink_c: Option<f64>,
@@ -10082,21 +10762,67 @@ index 0000000..b46765b
 +    pub compat_opcode_0x55_frames: u64,
 +    pub minimum_left_c: Option<f64>,
 +    pub minimum_right_c: Option<f64>,
++    /// Highest heatsink reading observed during the active phase.
++    pub maximum_heatsink_c: Option<f64>,
 +    pub final_left_c: Option<f64>,
 +    pub final_right_c: Option<f64>,
 +    pub final_heatsink_c: Option<f64>,
 +    /// `final_left_c/right_c - baseline_left_c/right_c` for whichever side was selected (negative
 +    /// means it cooled).
-+    pub selected_side_change_c: Option<f64>,
++    pub selected_side_temperature_change_c: Option<f64>,
 +    /// Same, for the side that was never enabled -- expected to stay near zero.
-+    pub opposite_side_change_c: Option<f64>,
-+    pub heatsink_change_c: Option<f64>,
++    pub opposite_side_temperature_change_c: Option<f64>,
++    pub heatsink_temperature_change_c: Option<f64>,
 +    /// `true` iff the selected side's live temperature reached the computed target
 +    /// (`baseline - requested_delta_c`) before the run stopped for any other reason.
 +    pub target_reached: bool,
 +    pub selected_tec_activity_observed: bool,
 +    pub left_pump_activity_observed: bool,
 +    pub right_pump_activity_observed: bool,
++    /// `left_pump_activity_observed`/`right_pump_activity_observed`, whichever corresponds to
++    /// `selected_side` -- provided directly so a consumer doesn't need to cross-reference the two
++    /// side-specific fields against `selected_side` itself.
++    pub selected_pump_activity_observed: bool,
++    /// `true` iff a firmware message reported the selected TEC's safety interlock in a
++    /// *safe* state (`"safe, unlocking"` or `"unlocked"`) during the active phase -- see
++    /// `cool_test::TecSafetyState`. This is the corrected replacement for the previous broad
++    /// `contains("tec") && contains("lock")` check, which also matched `"unlocking"`/`"unlocked"`
++    /// and aborted a healthy run on exactly that message.
++    pub selected_tec_safety_passed: bool,
++    /// First, minimum, maximum, and most recent reported TEC current (amps) for the selected side,
++    /// and how many such messages were seen -- see `cool_test::parse_tec_current`. Purely
++    /// descriptive: never independently classified as safe or unsafe (Frozen firmware remains the
++    /// sole authority on its own internal current safety).
++    pub selected_tec_current_first_a: Option<f64>,
++    pub selected_tec_current_min_a: Option<f64>,
++    pub selected_tec_current_max_a: Option<f64>,
++    pub selected_tec_current_last_a: Option<f64>,
++    pub selected_tec_current_samples: u64,
++    /// `true` iff the active phase stopped because no fresh, valid `TemperatureUpdate` arrived for
++    /// longer than `cool_test::STALE_TELEMETRY_LIMIT` (`stop_reason ==
++    /// "telemetry stale for more than 2 seconds"`). Freshness is timestamp-based (last time a new
++    /// packet was actually received), never inferred from a cached value being reused.
++    pub telemetry_watchdog_triggered: bool,
++    /// `true` iff the active phase stopped because of a UART read/write failure or the link
++    /// closing outright (`StopReason::UartReadFailure`/`UartWriteFailure`/`TelemetryLost`).
++    pub communication_loss_observed: bool,
++    /// `true` iff the active phase stopped because the operator typed a leak/smell/noise report
++    /// or the literal word ABORT (`StopReason::OperatorAbort`).
++    pub operator_abort_observed: bool,
++    /// `true` iff a `TargetUpdate(enabled=false)` was observed for *both* sides during shutdown --
++    /// the literal protocol-level confirmation, distinct from `shutdown_verified` (which is also
++    /// `true` when the narrow emergency I2C reset fired instead, for a genuine fault where this
++    /// couldn't be confirmed).
++    pub both_targets_shutdown_confirmed: bool,
++    /// Best-effort: `true` iff a firmware pump message for the selected side reported off/0V
++    /// during the shutdown verify window. See `cool_test::CoolTestShutdown`'s doc comment --
++    /// `false` only means no such message happened to arrive in that window, not that the pump is
++    /// still running.
++    pub selected_pump_shutdown_observed: bool,
++    /// Best-effort: `true` iff a firmware TEC-current message for the selected side reported a
++    /// near-zero reading during the shutdown verify window. Same caveat as
++    /// `selected_pump_shutdown_observed`.
++    pub selected_tec_shutdown_observed: bool,
 +    /// `true` iff shutdown was confirmed -- either both sides' `TargetUpdate(enabled=false)` was
 +    /// observed over UART, or (only for a genuine fault where UART confirmation failed) the
 +    /// narrow emergency I2C reset was asserted instead. See [`Self::emergency_reset_asserted`].
@@ -10307,6 +11033,64 @@ index 0000000..b46765b
 +                s.control_error_c.map(|v| v.to_string()).unwrap_or_default(),
 +            )?;
 +        }
++        // `cool_test_results` is a scalar summary, not a per-sample time series, so it doesn't fit
++        // the row shape above -- appended as a separate field,value block after a blank line
++        // (common practice for a trailing metadata section in an otherwise tabular CSV export).
++        if let Some(ct) = &self.cool_test_results {
++            writeln!(w)?;
++            writeln!(w, "field,value")?;
++            macro_rules! csv_field {
++                ($name:literal, $val:expr) => {
++                    writeln!(w, "{},{}", $name, $val)?;
++                };
++            }
++            csv_field!("requested_duration_seconds", ct.requested_duration_seconds);
++            csv_field!("actual_active_duration_seconds", ct.actual_active_duration_seconds);
++            csv_field!("extended_test_confirmation_received", ct.extended_test_confirmation_received);
++            csv_field!("stop_reason", ct.stop_reason);
++            csv_field!("target_reached", ct.target_reached);
++            csv_field!("time_to_target_seconds", ct.time_to_target_seconds.map(|v| v.to_string()).unwrap_or_default());
++            csv_field!("baseline_left_c", ct.baseline_left_c.map(|v| v.to_string()).unwrap_or_default());
++            csv_field!("baseline_right_c", ct.baseline_right_c.map(|v| v.to_string()).unwrap_or_default());
++            csv_field!("baseline_heatsink_c", ct.baseline_heatsink_c.map(|v| v.to_string()).unwrap_or_default());
++            csv_field!("minimum_left_c", ct.minimum_left_c.map(|v| v.to_string()).unwrap_or_default());
++            csv_field!("minimum_right_c", ct.minimum_right_c.map(|v| v.to_string()).unwrap_or_default());
++            csv_field!("maximum_heatsink_c", ct.maximum_heatsink_c.map(|v| v.to_string()).unwrap_or_default());
++            csv_field!("final_left_c", ct.final_left_c.map(|v| v.to_string()).unwrap_or_default());
++            csv_field!("final_right_c", ct.final_right_c.map(|v| v.to_string()).unwrap_or_default());
++            csv_field!("final_heatsink_c", ct.final_heatsink_c.map(|v| v.to_string()).unwrap_or_default());
++            csv_field!(
++                "selected_side_temperature_change_c",
++                ct.selected_side_temperature_change_c.map(|v| v.to_string()).unwrap_or_default()
++            );
++            csv_field!(
++                "opposite_side_temperature_change_c",
++                ct.opposite_side_temperature_change_c.map(|v| v.to_string()).unwrap_or_default()
++            );
++            csv_field!(
++                "heatsink_temperature_change_c",
++                ct.heatsink_temperature_change_c.map(|v| v.to_string()).unwrap_or_default()
++            );
++            csv_field!("selected_tec_safety_passed", ct.selected_tec_safety_passed);
++            csv_field!("selected_tec_activity_observed", ct.selected_tec_activity_observed);
++            csv_field!("selected_pump_activity_observed", ct.selected_pump_activity_observed);
++            csv_field!(
++                "selected_tec_current_first_a",
++                ct.selected_tec_current_first_a.map(|v| v.to_string()).unwrap_or_default()
++            );
++            csv_field!("selected_tec_current_min_a", ct.selected_tec_current_min_a.map(|v| v.to_string()).unwrap_or_default());
++            csv_field!("selected_tec_current_max_a", ct.selected_tec_current_max_a.map(|v| v.to_string()).unwrap_or_default());
++            csv_field!(
++                "selected_tec_current_last_a",
++                ct.selected_tec_current_last_a.map(|v| v.to_string()).unwrap_or_default()
++            );
++            csv_field!("telemetry_watchdog_triggered", ct.telemetry_watchdog_triggered);
++            csv_field!("communication_loss_observed", ct.communication_loss_observed);
++            csv_field!("operator_abort_observed", ct.operator_abort_observed);
++            csv_field!("both_targets_shutdown_confirmed", ct.both_targets_shutdown_confirmed);
++            csv_field!("selected_pump_shutdown_observed", ct.selected_pump_shutdown_observed);
++            csv_field!("selected_tec_shutdown_observed", ct.selected_tec_shutdown_observed);
++        }
 +        Ok(())
 +    }
 +
@@ -10415,28 +11199,48 @@ index 0000000..b46765b
 +            log::info!("  Selected side:                    {}", ct.selected_side);
 +            log::info!("  Requested delta:                  -{:.2}C", ct.requested_delta_c);
 +            log::info!(
-+                "  Duration: requested={}s actual={:.1}s",
-+                ct.requested_duration_seconds, ct.actual_duration_seconds
++                "  Duration: requested={}s actual={:.1}s extended_confirmation={}",
++                ct.requested_duration_seconds, ct.actual_active_duration_seconds, ct.extended_test_confirmation_received
 +            );
 +            log::info!(
 +                "  Baseline (L/R/heatsink):          {:?}/{:?}/{:?}",
 +                ct.baseline_left_c, ct.baseline_right_c, ct.baseline_heatsink_c
 +            );
-+            log::info!("  Minimum (L/R):                    {:?}/{:?}", ct.minimum_left_c, ct.minimum_right_c);
++            log::info!(
++                "  Minimum (L/R) / maximum heatsink:  {:?}/{:?} / {:?}",
++                ct.minimum_left_c, ct.minimum_right_c, ct.maximum_heatsink_c
++            );
 +            log::info!(
 +                "  Final (L/R/heatsink):             {:?}/{:?}/{:?}",
 +                ct.final_left_c, ct.final_right_c, ct.final_heatsink_c
 +            );
 +            log::info!(
 +                "  Change (selected/opposite/heatsink): {:?}/{:?}/{:?}",
-+                ct.selected_side_change_c, ct.opposite_side_change_c, ct.heatsink_change_c
++                ct.selected_side_temperature_change_c, ct.opposite_side_temperature_change_c, ct.heatsink_temperature_change_c
 +            );
-+            log::info!("  Target reached:                   {}", ct.target_reached);
 +            log::info!(
-+                "  TEC activity (selected)/pump activity (L/R): {}/{}/{}",
-+                ct.selected_tec_activity_observed, ct.left_pump_activity_observed, ct.right_pump_activity_observed
++                "  Target reached:                   {} (time to target: {:?}s)",
++                ct.target_reached, ct.time_to_target_seconds
 +            );
-+            log::info!("  Shutdown verified:                {}", ct.shutdown_verified);
++            log::info!(
++                "  TEC activity (selected)/safety passed/pump activity (selected/L/R): {}/{}/{}/{}/{}",
++                ct.selected_tec_activity_observed, ct.selected_tec_safety_passed, ct.selected_pump_activity_observed,
++                ct.left_pump_activity_observed, ct.right_pump_activity_observed
++            );
++            log::info!(
++                "  TEC current A (first/min/max/last, n={}): {:?}/{:?}/{:?}/{:?}",
++                ct.selected_tec_current_samples, ct.selected_tec_current_first_a, ct.selected_tec_current_min_a,
++                ct.selected_tec_current_max_a, ct.selected_tec_current_last_a
++            );
++            log::info!(
++                "  Watchdog triggered/communication loss/operator abort: {}/{}/{}",
++                ct.telemetry_watchdog_triggered, ct.communication_loss_observed, ct.operator_abort_observed
++            );
++            log::info!(
++                "  Shutdown verified: {} (both targets confirmed: {}, pump: {}, TEC: {})",
++                ct.shutdown_verified, ct.both_targets_shutdown_confirmed, ct.selected_pump_shutdown_observed,
++                ct.selected_tec_shutdown_observed
++            );
 +            log::info!("  Emergency reset asserted:         {}", ct.emergency_reset_asserted);
 +            log::info!("  Reservoir status:                 {}", ct.reservoir_status);
 +            log::info!("  Startup mode:                     {}", ct.startup_mode);
