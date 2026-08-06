@@ -1,16 +1,58 @@
 opensleep-diagnostic — build report
 ====================================
 
-Patch revision: 12 (reworks frozen-cool-test onto the narrow startup model; fixes an unbounded-write hang)
-Supersedes revision 11 (fixed --release-frozen-only to configure the reset pin as an output before
-pulsing it), revision 10 (fixed --release-frozen-only to pulse the reset bit instead of one-shot
-clearing it), revision 9 (added --release-frozen-only: minimal Frozen release, no global reset),
-revision 8 (fixed Frozen/Sensor UART paths for this Hub variant), revision 7 (replaced
---preserve-boot-state with frozen-prime-opensleep-init), revision 6 (added --preserve-boot-state to
-frozen-prime-test, now removed), revision 5 (added frozen-prime-test), revision 4 (corrected
-active-test preflight/monitoring), revision 3 (staged, Frozen-only diagnostic redesign), revision 2
-(sensor-first post-reset bootloader retry-probe), and revision 1 (initial diagnostic-only fork).
-Same upstream base commit; only source.patch changed.
+Patch revision: 13 (decodes the 14-byte GetTemperature reply; fixes a premature 40s baseline cutoff)
+Supersedes revision 12 (reworked frozen-cool-test onto the narrow startup model; fixed an
+unbounded-write hang), revision 11 (fixed --release-frozen-only to configure the reset pin as an
+output before pulsing it), revision 10 (fixed --release-frozen-only to pulse the reset bit instead
+of one-shot clearing it), revision 9 (added --release-frozen-only: minimal Frozen release, no
+global reset), revision 8 (fixed Frozen/Sensor UART paths for this Hub variant), revision 7
+(replaced --preserve-boot-state with frozen-prime-opensleep-init), revision 6 (added
+--preserve-boot-state to frozen-prime-test, now removed), revision 5 (added frozen-prime-test),
+revision 4 (corrected active-test preflight/monitoring), revision 3 (staged, Frozen-only diagnostic
+redesign), revision 2 (sensor-first post-reset bootloader retry-probe), and revision 1 (initial
+diagnostic-only fork). Same upstream base commit; only source.patch changed.
+
+What changed in revision 13
+----------------------------
+A live run against MT8365 / Frozen firmware v1.4.235 reached application firmware correctly, but
+frozen-cool-test refused to enable cooling: baseline collection needs 5 valid samples, only 4
+unsolicited TemperatureUpdate pushes arrived before the previous 40s backstop cut collection off,
+and every solicited GetTemperature reply logged "wrong size: expected 27, got 14" -- this firmware
+sends a 14-byte reply, not the 27 bytes the unmodified upstream parser requires.
+
+  - New frozen_compat.rs: decode_get_temperature_14byte, a narrow, explicitly tag-validated decoder
+    for exactly this 14-byte shape (same field layout as parse_get_temperature's own documented
+    example, minus the 13 trailing padding bytes only the 27-byte firmware sends). CompatFrameScanner
+    re-runs PacketCodec::decode's own frame-boundary algorithm over raw bytes from io_logging's
+    existing RawIoCapture (below Framed in the I/O stack) -- the only way to recover this frame at
+    all, since the unmodified codec discards a checksum-valid frame's bytes on parse failure and
+    never returns them to a Framed::next() caller. 13 new tests, including the exact 3 payloads
+    captured from real hardware.
+  - frozen-cool-test's baseline loop now accepts three sample sources: the unsolicited
+    TemperatureUpdate push (unchanged), the original 27-byte GetTemperature reply (unchanged), and
+    this firmware's 14-byte reply (new). Deduplicated within each ~1s poll tick on an exact
+    (left, right, heatsink) match; per-sample validity now runs at collection time so
+    validate_baseline only rejects for "not enough valid samples" or "implausibly unstable", never
+    for an unrecognized protocol format.
+  - The 40s backstop is now BASELINE_MAX_WINDOW = 60s: collection continues until 5 valid samples
+    span at least 10s, or 60s elapses, whichever comes first.
+  - New compat_counters.rs replaces repeated full-buffer log dumps for two further real-hardware
+    quirks (a 9-byte heartbeat-opcode payload, and unrecognized opcodes 0x54/0x55) with suppression
+    in the existing env_logger format closure, matched by stable message prefix (the noisy
+    log::error! call lives inside the pinned upstream codec and cannot itself be modified). Real
+    counts come from CompatFrameScanner, reported in CoolTestResults.
+  - New CoolTestResults fields: baseline_samples_requested, baseline_synchronous_samples_decoded,
+    baseline_unsolicited_samples_decoded, baseline_duplicate_samples_discarded,
+    baseline_invalid_samples_discarded, baseline_collection_duration_seconds,
+    baseline_left/right/heatsink_range_c, and four compat_*_frames counters.
+  - All previously-working behavior verified unchanged by the existing test suite: shared narrow
+    Frozen reset, no ResetController, only expander bit 1 modified, reservoir confirmation, exactly
+    one cooling side enabled, 1-2C delta cap, three-times-repeated shutdown, SIGINT/SIGTERM
+    handling, no raw serial dumps by default.
+
+32 net new tests (218 total, up from 186): 13 in frozen_compat.rs, 5 in compat_counters.rs, 2 in
+io_logging.rs, and a net 12 in cool_test.rs. See TEST_RESULTS.md for the full writeup.
 
 What changed in revision 12
 ----------------------------

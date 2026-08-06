@@ -296,8 +296,12 @@ PROTOCOL_AUDIT.md.
   minimum wait: the test always stops early once the requested target temperature is reached, a
   safety condition triggers, communication with Frozen is lost, or the operator interrupts (see
   below).
-* The baseline is now collected over **at least 10 seconds** of stable samples (up from 5), from
-  multiple unsolicited `TemperatureUpdate` pushes — never a single reading.
+* The baseline is collected over **at least 10 seconds** of stable samples (at least 5), and
+  collection continues for up to **60 seconds** if that many valid samples haven't arrived yet —
+  never a single reading. Samples come from unsolicited `TemperatureUpdate` pushes and decoded
+  solicited `GetTemperature` replies (both the original 27-byte reply and, since revision 13, the
+  14-byte reply some Frozen firmware sends — see PROTOCOL_AUDIT.md); a reading duplicated across
+  two packet types in the same poll is only counted once.
 * The baseline water temperature must fall within **15.00C–35.00C**
   (`cool_test::MIN_WATER_CENTIDEG`/`MAX_WATER_CENTIDEG`) before the test proceeds. This range is a
   conservative, compile-time choice (not derived from a documented firmware spec — see

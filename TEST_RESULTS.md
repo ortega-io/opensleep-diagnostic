@@ -1,11 +1,84 @@
 # TEST_RESULTS.md — opensleep-diagnostic
 
-All 186 unit/integration tests in `src/bin/opensleep-diagnostic/` pass (up from 166; see the
+All 218 unit/integration tests in `src/bin/opensleep-diagnostic/` pass (up from 186; see the
 revision note directly below), plus the 51 pre-existing `opensleep` library tests (unmodified,
-reused as-is) and 0 doc-tests — 237 total, 0 failed. Verified inside the
+reused as-is) and 0 doc-tests — 269 total, 0 failed. Verified inside the
 `messense/rust-musl-cross:aarch64-musl` builder image via `cargo test --locked` under its built-in
 QEMU aarch64 runner (the same environment the release binary is built in) as part of the
-diagnostic-v12 release build -- see `build-report.txt`.
+diagnostic-v13 release build -- see `build-report.txt`.
+
+## Revision note: decode the 14-byte `GetTemperature` reply; fix a premature baseline cutoff
+
+A live run against MT8365 / Frozen firmware v1.4.235 reached application firmware correctly through
+the shared narrow reset path, but `frozen-cool-test` refused to enable cooling: baseline collection
+requires 5 valid samples, only 4 unsolicited `TemperatureUpdate` pushes arrived before the previous
+`BASELINE_MIN_WINDOW * 4` (40s) backstop cut collection off, and every solicited `GetTemperature`
+reply logged `Frozen/GetTemperature wrong size: expected 27, got 14` -- this firmware's reply is 14
+bytes, not the 27 the unmodified upstream parser requires.
+
+* **New `frozen_compat.rs`**: `decode_get_temperature_14byte` is a narrow, explicitly tag-validated
+  decoder for exactly this 14-byte shape (same field layout as `parse_get_temperature`'s own
+  documented example, minus the 13 trailing padding bytes only the 27-byte firmware sends -- never
+  infers a value from a fixed offset without checking its tag byte first, matching upstream's own
+  approach). `CompatFrameScanner` re-runs `PacketCodec::decode`'s own frame-boundary algorithm
+  (magic byte, length-prefixed payload, checksum -- reusing `opensleep::common::checksum::compute`,
+  not reimplementing it) over raw bytes from `io_logging::LoggingIo`'s existing `RawIoCapture`,
+  which sits below `Framed` in the I/O stack and sees every byte regardless of what the codec above
+  it does with them -- the only way to recover this frame at all, since `PacketCodec::decode`
+  always advances past a checksum-valid frame before attempting `FrozenPacket::parse`, and on a
+  parse failure only logs and continues without ever returning the bytes to a caller of
+  `Framed::next()`. 13 new tests, including the exact 3 payloads captured from real hardware,
+  cross-checked against the paired real `TemperatureUpdate` values where given, plus
+  malformed/reordered-tag/wrong-opcode/truncated-payload rejection and multi-frame/split-feed/
+  bad-checksum scanner cases.
+* **`frozen-cool-test`'s baseline loop now accepts three sample sources**: the unsolicited
+  `TemperatureUpdate` push (unchanged), the original 27-byte `GetTemperature` reply (unchanged,
+  still decoded by the unmodified upstream parser), and this firmware's 14-byte reply (new, via
+  `CompatFrameScanner`). Samples are deduplicated *within each ~1-second poll tick* on an exact
+  (left, right, heatsink) match -- a solicited reply and an unsolicited push reporting the same
+  underlying firmware reading in the same tick count once, but two genuinely separate ticks that
+  happen to read the same stable temperature (expected during a short, stable baseline window) are
+  never treated as duplicates of each other. Per-sample validity (sentinel/out-of-range rejection)
+  now runs at collection time, before a sample ever counts toward the minimum, so
+  `validate_baseline` itself only rejects for "not enough valid samples" or "implausibly unstable"
+  -- never merely because a protocol format wasn't recognized.
+* **The 40-second backstop is now 60 seconds** (`BASELINE_MAX_WINDOW`), and the stop condition is
+  exactly item 5 of the fix request: continue until 5 valid samples span at least 10 seconds, or 60
+  seconds elapse, whichever comes first. Reproduced directly as a pure-function unit test
+  (`baseline_should_continue_does_not_stop_at_forty_seconds_with_only_four_samples`) rather than a
+  real- or virtual-time async test, since the condition itself is what changed.
+* **New, concise compatibility counters** (`compat_counters.rs`) replace repeated full-buffer log
+  dumps for three other real-hardware quirks observed alongside the 14-byte reply: a 9-byte
+  heartbeat-opcode (`0x53`) payload (upstream expects 3), and unrecognized opcodes `0x54`/`0x55`.
+  Since the noisy `log::error!` call lives inside the pinned, unmodified `opensleep::common::codec`
+  and cannot itself be modified, suppression happens in the existing global `env_logger` format
+  closure (`buildinfo::init_logging`, already used by `log_tap` for a similarly-shaped purpose) by
+  matching the stable, compile-time-known prefix of each pattern's `PacketError` `Display` text --
+  enabled only for `frozen-cool-test`, so every other subcommand's log output is unchanged. The real
+  counts are tracked separately and authoritatively by `CompatFrameScanner` (from actual bytes, not
+  log text) and reported in `CoolTestResults`.
+* **New `CoolTestResults` fields**: `baseline_samples_requested`,
+  `baseline_synchronous_samples_decoded`, `baseline_unsolicited_samples_decoded`,
+  `baseline_duplicate_samples_discarded`, `baseline_invalid_samples_discarded`,
+  `baseline_collection_duration_seconds`, `baseline_left_range_c`/`baseline_right_range_c`/
+  `baseline_heatsink_range_c` (stability range per channel), and the four `compat_*_frames`
+  counters above.
+* **End-to-end proof, not just unit coverage of the building blocks**: a new test
+  (`baseline_recovers_entirely_from_14byte_get_temperature_replies_via_raw_capture`) runs a fake
+  device that answers every `GetTemperatures` request with only the raw 14-byte reply -- never an
+  unsolicited push -- through the full `run_core` preflight, and asserts baseline collection passes
+  using only samples recovered via `CompatFrameScanner`. Further new tests prove duplicate
+  same-tick readings don't inflate the sample count, and that cooling stays disabled when baseline
+  genuinely fails (implausibly unstable readings) end to end.
+* **Unchanged, verified by the existing (still-passing) test suite**: shared narrow Frozen reset, no
+  `ResetController`, only expander bit 1 modified, reservoir confirmation before active cooling,
+  exactly one cooling side enabled, the 1-2C delta cap, three-times-repeated both-side shutdown,
+  SIGINT/SIGTERM handling, and no raw serial dumps by default (`--raw-serial-log` still gates them).
+
+32 net new tests (218 total, up from 186): 13 in `frozen_compat.rs`, 5 in `compat_counters.rs`, 2 in
+`io_logging.rs` (the new `events_since`/`hex_to_bytes` capture-reading helpers), and a net 12 in
+`cool_test.rs` (14 added, 2 superseded -- the old `validate_baseline`-level sentinel/out-of-range
+tests moved to the new, earlier `is_valid_baseline_reading` check they now belong to).
 
 ## Revision note: rework `frozen-cool-test` onto the narrow startup model; fix an unbounded-write hang
 

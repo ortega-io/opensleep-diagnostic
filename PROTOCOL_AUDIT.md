@@ -36,7 +36,7 @@ always `0` for this reason and relies on the library's own `log::error!` output 
 This is documented, not silently swept under the rug: see `telemetry.rs`'s `PacketStats` doc
 comment and `signals.rs`'s `StopReason::DecodeFailure`/`FatalStatus` doc comments.
 
-### Real-hardware finding: the solicited `0xC1 GetTemperature` reply does not reliably decode
+### Real-hardware finding: the solicited `0xC1 GetTemperature` reply, and how it is now decoded
 
 A real `frozen-passive` run against this hardware revision captured evidence that Frozen's
 solicited reply to `GetTemperatures` (opcode `0xC1`) arrives as a **14-byte** frame, matching the
@@ -48,22 +48,54 @@ worked example already present as a source comment on `parse_get_temperature` it
 ```
 
 — but `validate_packet_size("Frozen/GetTemperature", &buf, 27)` in that same function requires
-exactly **27** bytes. Every real `0xC1` reply this diagnostic has observed therefore fails
-`validate_packet_size` inside the reused, unmodified parser, which (per the "known limitation"
-above) is swallowed internally and never surfaces as a usable packet to this binary at all — it is
-silently dropped by the codec, not merely logged oddly.
+exactly **27** bytes. Every real `0xC1` reply this diagnostic had observed as of revision 12
+therefore failed `validate_packet_size` inside the reused, unmodified parser, which (per the
+"known limitation" above) is swallowed internally and never surfaces as a usable packet to this
+binary at all through the normal `Framed`/`PacketCodec` API — it is silently dropped by the codec,
+not merely logged oddly.
 
-Because of this, `frozen-cool-test`'s baseline collection and active-phase safety monitoring **do
-not use the solicited `GetTemperature` reply for any decision**. Both rely exclusively on the
-**unsolicited `TemperatureUpdate` push** (raw opcode `0x41`, the same byte as the `GetTemperatures`
-command itself — Frozen appears to broadcast this on its own schedule, independent of being
-polled), which validates against a 9-byte size that has been observed to decode correctly and
-consistently on this hardware. `frozen-cool-test` still sends `GetTemperatures` once per ~1-second
-tick (`FrozenLink::send_only`, added specifically so a send is never paired with waiting for one
-specific reply) and still preserves/logs whatever `0xC1` frame, if any, happens to decode as raw
-evidence in the report — but nothing in the active loop or baseline validation requires it to
-succeed. `frozen-passive` is unaffected by this finding: it already stores both solicited and
-unsolicited samples and never required the solicited path to succeed for `overall_pass`.
+**Revision 13** closes this gap without modifying the pinned upstream parser. `frozen_compat.rs`
+adds a narrow, explicitly tag-validated decoder (`decode_get_temperature_14byte`) for exactly this
+14-byte shape — its field layout is identical to `parse_get_temperature`'s own documented layout
+above, just without the 13 trailing padding bytes the 27-byte (reference/devkit) firmware sends —
+plus a `CompatFrameScanner` that re-runs the same frame-boundary algorithm as `PacketCodec::decode`
+(magic byte, length-prefixed payload, checksum, reusing `opensleep::common::checksum::compute`)
+over the raw bytes `io_logging::LoggingIo`'s `RawIoCapture` already records below `Framed` in the
+I/O stack. That raw-byte tap is the only way to recover this frame at all: `PacketCodec::decode`
+always advances its buffer past a checksum-valid frame before attempting `FrozenPacket::parse`, and
+on a parse failure only logs and continues — it never returns the failed frame's bytes to a caller
+of `Framed::next()`.
+
+`frozen-cool-test`'s baseline collection now accepts valid temperatures from three sources: the
+**unsolicited `TemperatureUpdate` push** (unchanged from before — the same 9-byte-payload opcode
+`0x41` broadcast Frozen sends on its own schedule), the original 27-byte `GetTemperature` reply
+(unchanged, decoded by the unmodified upstream parser for firmware that still sends it), and this
+firmware's 14-byte `GetTemperature` reply (new, via `CompatFrameScanner`). Samples that represent
+the same underlying firmware reading arriving in the same ~1-second poll tick (e.g. a solicited
+reply and an unsolicited push reporting an identical left/right/heatsink triplet) are deduplicated
+before counting toward the minimum. Baseline collection continues until either
+`BASELINE_MIN_SAMPLES` (5) valid samples have been collected over at least `BASELINE_MIN_WINDOW`
+(10s), or `BASELINE_MAX_WINDOW` (60s) elapses — raised from the previous, tighter `BASELINE_MIN_WINDOW
+* 4` (40s) backstop once real-hardware evidence showed this firmware pushes unsolicited telemetry
+only about once every 10 seconds, so 5 samples can genuinely take 40-50s to arrive.
+
+Active-phase safety monitoring is unaffected by this change and still relies exclusively on the
+unsolicited `TemperatureUpdate` push, exactly as before — this fix is scoped to baseline collection
+only. `frozen-passive` is likewise unaffected: it already stores both solicited and unsolicited
+samples and never required the solicited path to succeed for `overall_pass`.
+
+Two further real-hardware protocol quirks, observed alongside the 14-byte `GetTemperature` reply,
+are now counted rather than repeatedly logged in full: a 9-byte payload under the heartbeat opcode
+(`0x53`, where the unmodified parser expects exactly 3 bytes), and unrecognized opcodes `0x54`/
+`0x55`. `compat_counters.rs` recognizes the stable, compile-time-known prefix of each of these
+patterns' `PacketError` `Display` text (as logged by the unmodified upstream codec's own
+`log::error!` call, which cannot itself be modified or silenced) and suppresses the full raw-buffer
+dump for each — the real counts are tracked separately and authoritatively by `CompatFrameScanner`,
+from the actual bytes, and reported in `CoolTestResults` (`compat_get_temperature_14byte_frames`,
+`compat_heartbeat_9byte_frames`, `compat_opcode_0x54_frames`, `compat_opcode_0x55_frames`). This
+suppression is enabled only for `frozen-cool-test`; every other subcommand's log output is
+unaffected. Raw packet buffers remain available for any frame, known or not, only with
+`--raw-serial-log` (unchanged from revision 12).
 
 ## Commands permitted per mode
 
@@ -73,7 +105,7 @@ unsolicited samples and never required the solicited path to succeed for `overal
 | `GetHardwareInfo` | `0x02` | `7E 01 02 EC DE` | yes | yes | yes | no |
 | `GetFirmware` | `0x04` | `7E 01 04 8C 18` | yes (best-effort, after firmware Ping) | yes | yes (best-effort) | no |
 | `JumpToFirmware` | `0x10` | `7E 01 10 DE AD` | yes, only if bootloader detected **and** `--allow-firmware-jump` | yes, same gate | yes, same gate | no |
-| `GetTemperatures` | `0x41` | `7E 01 41 ...` | yes, 1/s during the telemetry window | yes, ~1/s during baseline + active phases, sent fire-and-forget (see the 0xC1/0x41 finding above) | yes, ~1/s during baseline + active phases, same fire-and-forget pattern | no |
+| `GetTemperatures` | `0x41` | `7E 01 41 ...` | yes, 1/s during the telemetry window | yes, ~1/s during baseline + active phases, sent fire-and-forget (see the `0xC1`/`0x41` finding above -- the reply is now decoded during baseline, both the 27-byte and 14-byte shapes) | yes, ~1/s during baseline + active phases, same fire-and-forget pattern | no |
 | `SetTargetTemperature(enabled=false)` | `0x40` | see below | yes, both sides | yes, both sides (other side always disabled) | yes, both sides (explicitly disabled before Prime, and by every safe-stop) | yes, both sides (the only thing this subcommand sends) |
 | `SetTargetTemperature(enabled=true)` | `0x40` | see below | **never** | yes, **exactly** the one side selected at the CLI | **never** | **never** |
 | `Prime` | `0x52` | `7E 01 52 B6 2B` | **never reachable** | **never reachable** | yes, **at most once per run** | **never reachable** |
@@ -381,9 +413,9 @@ Source: `src/frozen/packet.rs` (`FrozenPacket`, `FrozenTarget`, `TemperatureUpda
 
 | Field | Packet | Unit (per source doc comment) | Meaning | Used for |
 |---|---|---|---|---|
-| `left_temp` | `GetTemperature` (solicited, opcode `0xC1`, raw evidence only — see above) / `TemperatureUpdate` (unsolicited, opcode `0x41`, the safety-relevant source) | centidegrees Celsius | left-side water temperature | `TemperatureUpdate` copy: baseline validation, active-phase range/trend checks, CSV `left_water_c`. `GetTemperature` copy: reported only, when it happens to decode |
+| `left_temp` | `GetTemperature` (solicited, opcode `0xC1`, 27-byte via the unmodified upstream parser or 14-byte via `frozen_compat.rs` -- see above) / `TemperatureUpdate` (unsolicited, opcode `0x41`, the sole active-phase safety-relevant source) | centidegrees Celsius | left-side water temperature | `TemperatureUpdate` copy: active-phase range/trend checks, CSV `left_water_c`, and (since revision 13) baseline validation alongside `GetTemperature`. `GetTemperature` copy: baseline validation (since revision 13, both byte shapes) plus reported as evidence; never used for active-phase decisions |
 | `right_temp` | same | centidegrees Celsius | right-side water temperature | same, other side |
-| `heatsink_temp` | same | centidegrees Celsius | heatsink temperature | `TemperatureUpdate` copy: active-phase ceiling check, CSV `heatsink_c`. `GetTemperature` copy: reported only |
+| `heatsink_temp` | same | centidegrees Celsius | heatsink temperature | `TemperatureUpdate` copy: active-phase ceiling check, CSV `heatsink_c`, and baseline validation. `GetTemperature` copy: baseline validation (since revision 13) plus reported as evidence |
 | `unknown_temp` | `GetTemperature` only | centidegrees Celsius (source: "unknown_temp ... centidegrees celcius") | undocumented 4th channel | reported raw+converted, not used for any safety decision (its meaning is not established) |
 | `error` (reported as `control_error_c`) | `TemperatureUpdate` only | source doc comment: "error in deg celcius" | **not** a fault/status flag by this evidence — see below | reported for display only; never gates pass/fail |
 | `count` | `TemperatureUpdate` only | wrapping counter | sequence counter | reported only |

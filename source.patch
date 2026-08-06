@@ -84,10 +84,10 @@ index 5907317..ee89097 100755
  bytes = "1.10.1"
 diff --git a/src/bin/opensleep-diagnostic/buildinfo.rs b/src/bin/opensleep-diagnostic/buildinfo.rs
 new file mode 100644
-index 0000000..261be8d
+index 0000000..be05be7
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/buildinfo.rs
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,54 @@
 +//! Build/source identifiers reported in every summary.
 +
 +pub const DIAGNOSTIC_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -127,6 +127,12 @@ index 0000000..261be8d
 +            let target = record.target();
 +            let message = record.args().to_string();
 +            crate::log_tap::observe(target, &message);
++            if crate::compat_counters::is_known_compat_noise(target, &message) {
++                // Known, now-handled-elsewhere protocol-compatibility noise (see that module's
++                // docs) -- suppressed instead of dumping the full raw buffer on every occurrence;
++                // `frozen_compat::CompatFrameScanner` tracks the real counts.
++                return Ok(());
++            }
 +            writeln!(
 +                buf,
 +                "[{} {:5} {target}] {message}",
@@ -443,6 +449,151 @@ index 0000000..236e5bb
 +    #[arg(long, default_value_t = false)]
 +    pub dry_run: bool,
 +}
+diff --git a/src/bin/opensleep-diagnostic/compat_counters.rs b/src/bin/opensleep-diagnostic/compat_counters.rs
+new file mode 100644
+index 0000000..1ffa228
+--- /dev/null
++++ b/src/bin/opensleep-diagnostic/compat_counters.rs
+@@ -0,0 +1,139 @@
++//! Global, opt-in suppression of specific, known-noisy log lines that `opensleep::common::codec`'s
++//! unmodified `PacketCodec::decode` emits via its own `log::error!("{e}")` call whenever a
++//! checksum-valid frame fails `FrozenPacket::parse` (e.g. the firmware-specific 14-byte
++//! `GetTemperature` reply this binary now decodes itself -- see `frozen_compat.rs`, or the 0x54/
++//! 0x55/9-byte-heartbeat frames this binary only counts). That call cannot be modified or
++//! suppressed at its call site (`opensleep::common::codec` is pinned, unmodified upstream source),
++//! so the only place left to intercept it is the process-wide `env_logger` format closure
++//! (`buildinfo::init_logging`) that already exists for `log_tap`'s own, similarly-shaped purpose.
++//!
++//! Matching is by *stable prefix* of the exact, compile-time-known `thiserror` `Display` strings
++//! from `opensleep::common::packet::PacketError` (`InvalidSize`/`Unexpected`), not by parsing the
++//! trailing `Buffer: ...` dump -- see each constant's doc comment for the derivation. `Bytes`'s own
++//! custom `Debug` impl (`bytes-1.10.1/src/fmt/debug.rs`) renders ASCII-printable bytes literally
++//! (not as `%02X` hex, despite the `{buf:02X?}` format spec in the error string -- that impl
++//! ignores formatter flags entirely), which is why the 0x54/0x55 opcode prefixes below end in the
++//! literal characters `T`/`U` rather than a hex byte.
++//!
++//! Same enable-once-per-process / near-zero-cost-when-disabled shape as `log_tap.rs`, gated on by
++//! `frozen-cool-test` only (see `enable`) -- every other subcommand's log lines are unaffected.
++//! The *counts* of how many times each pattern was actually seen are tracked separately and
++//! authoritatively by `frozen_compat::CompatFrameScanner`, which parses the real bytes rather than
++//! log-message text; this module's only job is stopping the noisy duplicate print.
++
++use std::sync::atomic::{AtomicBool, Ordering};
++
++static ENABLED: AtomicBool = AtomicBool::new(false);
++
++const CODEC_TARGET: &str = "opensleep::common::codec";
++
++/// `PacketError::InvalidSize{ packet_name: "Frozen/GetTemperature", expected: 27, actual: 14 }`'s
++/// `Display` prefix (`"{packet_name} wrong size: expected {expected}, got {actual}."`). Once this
++/// binary decodes the 14-byte reply itself (`frozen_compat::decode_get_temperature_14byte`), the
++/// condition this line reports is expected and handled, not an error.
++const GET_TEMPERATURE_14BYTE_PREFIX: &str = "Frozen/GetTemperature wrong size: expected 27, got 14.";
++/// `PacketError::InvalidSize{ packet_name: "Frozen/Heartbeat", expected: 3, actual: 9 }`'s prefix --
++/// real hardware has been observed sending a 9-byte payload under the heartbeat opcode.
++const HEARTBEAT_9BYTE_PREFIX: &str = "Frozen/Heartbeat wrong size: expected 3, got 9.";
++/// `PacketError::Unexpected{ subsystem_name: "Frozen", buf }`'s prefix, followed by `Bytes`'s debug
++/// rendering of a buffer starting with opcode `0x54` (ASCII `'T'`, printable, so it renders as the
++/// literal character, not an escape -- see module docs).
++const OPCODE_0X54_PREFIX: &str = "Frozen got unexpected packet: b\"T";
++/// Same, for opcode `0x55` (ASCII `'U'`).
++const OPCODE_0X55_PREFIX: &str = "Frozen got unexpected packet: b\"U";
++
++/// Turns suppression on for the rest of the process's life. Idempotent. Only `frozen-cool-test`
++/// calls this.
++pub fn enable() {
++    ENABLED.store(true, Ordering::SeqCst);
++}
++
++fn enabled() -> bool {
++    ENABLED.load(Ordering::Relaxed)
++}
++
++/// Called from the global log format closure for every emitted record, before it is printed.
++/// Returns `true` if this line is one of the known, now-handled-elsewhere compatibility patterns
++/// above -- in which case the closure must not print it (that full-buffer dump is exactly the
++/// noise item 8 of the fix this module was added for asks to eliminate). Always `false` unless
++/// [`enable`] was called.
++pub fn is_known_compat_noise(target: &str, message: &str) -> bool {
++    if !enabled() || target != CODEC_TARGET {
++        return false;
++    }
++    message.starts_with(GET_TEMPERATURE_14BYTE_PREFIX)
++        || message.starts_with(HEARTBEAT_9BYTE_PREFIX)
++        || message.starts_with(OPCODE_0X54_PREFIX)
++        || message.starts_with(OPCODE_0X55_PREFIX)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::sync::Mutex;
++
++    /// `enable` is a process-global, one-way flag (like `log_tap`'s) -- serialize this module's
++    /// own tests so the "disabled" test can't run after another test has already turned it on.
++    static TEST_LOCK: Mutex<()> = Mutex::new(());
++
++    #[test]
++    fn disabled_by_default_even_for_an_exact_match() {
++        let _guard = TEST_LOCK.lock().unwrap();
++        // This test only means something if nothing else in this process has called `enable()`
++        // yet; run it defensively regardless by checking a target that would otherwise match.
++        if enabled() {
++            return;
++        }
++        assert!(!is_known_compat_noise(
++            CODEC_TARGET,
++            "Frozen/GetTemperature wrong size: expected 27, got 14. Buffer: b\"...\""
++        ));
++    }
++
++    #[test]
++    fn matches_known_patterns_once_enabled() {
++        let _guard = TEST_LOCK.lock().unwrap();
++        enable();
++        assert!(is_known_compat_noise(
++            CODEC_TARGET,
++            "Frozen/GetTemperature wrong size: expected 27, got 14. Buffer: b\"\\x00\\x01\\n...\""
++        ));
++        assert!(is_known_compat_noise(
++            CODEC_TARGET,
++            "Frozen/Heartbeat wrong size: expected 3, got 9. Buffer: b\"...\""
++        ));
++        assert!(is_known_compat_noise(CODEC_TARGET, "Frozen got unexpected packet: b\"T\\x00\\x01\""));
++        assert!(is_known_compat_noise(CODEC_TARGET, "Frozen got unexpected packet: b\"U\\x00\\x01\""));
++    }
++
++    #[test]
++    fn does_not_match_an_unrelated_size_mismatch() {
++        let _guard = TEST_LOCK.lock().unwrap();
++        enable();
++        assert!(!is_known_compat_noise(
++            CODEC_TARGET,
++            "Frozen/GetTemperature wrong size: expected 27, got 13. Buffer: b\"...\""
++        ));
++        assert!(!is_known_compat_noise(
++            CODEC_TARGET,
++            "Frozen/Heartbeat wrong size: expected 3, got 4. Buffer: b\"...\""
++        ));
++    }
++
++    #[test]
++    fn does_not_match_a_different_unexpected_opcode() {
++        let _guard = TEST_LOCK.lock().unwrap();
++        enable();
++        assert!(!is_known_compat_noise(CODEC_TARGET, "Frozen got unexpected packet: b\"V\\x00\\x01\""));
++    }
++
++    #[test]
++    fn does_not_match_outside_the_codec_target() {
++        let _guard = TEST_LOCK.lock().unwrap();
++        enable();
++        assert!(!is_known_compat_noise(
++            "opensleep_diagnostic::some_other_module",
++            "Frozen/GetTemperature wrong size: expected 27, got 14. Buffer: b\"...\""
++        ));
++    }
++}
 diff --git a/src/bin/opensleep-diagnostic/confirm.rs b/src/bin/opensleep-diagnostic/confirm.rs
 new file mode 100644
 index 0000000..9c6296b
@@ -485,10 +636,10 @@ index 0000000..9c6296b
 +}
 diff --git a/src/bin/opensleep-diagnostic/cool_test.rs b/src/bin/opensleep-diagnostic/cool_test.rs
 new file mode 100644
-index 0000000..673e887
+index 0000000..b54e491
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/cool_test.rs
-@@ -0,0 +1,2111 @@
+@@ -0,0 +1,2591 @@
 +//! `frozen-cool-test`: the one subcommand that intentionally activates a cooling channel. Every
 +//! hard limit here (max delta, max duration, baseline range, heatsink ceiling) is a compile-time
 +//! constant; no CLI flag can raise any of them. See SAFETY.md for the operator-facing version of
@@ -530,7 +681,6 @@ index 0000000..673e887
 +
 +use opensleep::common::packet::BedSide;
 +use opensleep::frozen::FrozenPacket;
-+use opensleep::frozen::packet::TemperatureUpdate;
 +use tokio::io::{AsyncRead, AsyncWrite};
 +use tokio::sync::mpsc;
 +use tokio::time::Instant;
@@ -538,7 +688,9 @@ index 0000000..673e887
 +use crate::buildinfo::{DIAGNOSTIC_VERSION, kernel_release, source_commit};
 +use crate::cli::CoolTestArgs;
 +use crate::confirm::confirm_phrase;
++use crate::frozen_compat::CompatFrameScanner;
 +use crate::i2c::{I2cPort, MockI2c, RealI2c, probe_address};
++use crate::io_logging::RawIoCapture;
 +use crate::link::{FrozenLink, LinkError, PacketOutcome};
 +use crate::mock::mock_frozen_link_pair;
 +use crate::ownership;
@@ -548,7 +700,10 @@ index 0000000..673e887
 +};
 +use crate::safety::{AuditedTransport, FrozenAction, Mode};
 +use crate::signals::{StopReason, wait_for_termination_signal};
-+use crate::telemetry::{PacketStats, sample_from_get_temperature, sample_from_temperature_update};
++use crate::telemetry::{
++    PacketStats, SampleSource, TemperatureSample, sample_from_get_temperature, sample_from_get_temperature_compat14,
++    sample_from_temperature_update,
++};
 +
 +const COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 +
@@ -569,6 +724,13 @@ index 0000000..673e887
 +pub const BASELINE_MIN_SAMPLES: usize = 5;
 +/// At least 10 seconds of stable samples before enabling cooling.
 +pub const BASELINE_MIN_WINDOW: Duration = Duration::from_secs(10);
++/// Absolute ceiling on baseline collection: continues until `BASELINE_MIN_SAMPLES` valid samples
++/// have been collected over at least `BASELINE_MIN_WINDOW`, or this elapses, whichever comes
++/// first. Real hardware evidence: MT8365 / Frozen firmware v1.4.235 has been observed pushing
++/// unsolicited `TemperatureUpdate` only about once every 10 seconds, so reaching 5 samples can
++/// genuinely take 40-50s -- the previous `BASELINE_MIN_WINDOW * 4` (40s) backstop cut collection
++/// off before 5 samples could ever arrive on that firmware.
++pub const BASELINE_MAX_WINDOW: Duration = Duration::from_secs(60);
 +pub const BASELINE_MAX_SPREAD_CENTIDEG: i32 = 300;
 +/// No fresh, valid unsolicited `TemperatureUpdate` for longer than this aborts the active phase.
 +pub const STALE_TELEMETRY_LIMIT: Duration = Duration::from_secs(2);
@@ -605,6 +767,13 @@ index 0000000..673e887
 +const STARTUP_MODE_LABEL: &str = "narrow (i2c::pulse_frozen_reset_bit)";
 +
 +pub async fn run(args: &CoolTestArgs) -> (Report, u8) {
++    // Recognizes the same, stable set of known-firmware-compatibility log lines this run's own
++    // `frozen_compat::CompatFrameScanner` handles, and suppresses their noisy full-buffer dump --
++    // see `compat_counters.rs` module docs. Enabled unconditionally (including for --dry-run, so
++    // tests exercising the mock device see identical suppression behavior); a no-op until an
++    // actual matching log line is emitted.
++    crate::compat_counters::enable();
++
 +    if args.duration_seconds > HARD_MAX_DURATION_SECONDS {
 +        log::error!(
 +            "refusing to run: --duration-seconds {} exceeds the hard maximum of {} (no option can raise this)",
@@ -636,8 +805,9 @@ index 0000000..673e887
 +        log::warn!("--dry-run: no I2C or UART writes will be performed; using a mocked Frozen device");
 +        let mut i2c = MockI2c::always_succeed();
 +        let (client, task) = mock_frozen_link_pair();
-+        let mut link = FrozenLink::wrap_with_raw_log(client, "dry-run", args.raw_serial_log);
-+        let result = run_core(args, &mut i2c, &mut link, true, None).await;
++        let capture: RawIoCapture = Default::default();
++        let mut link = FrozenLink::wrap_capturing_with_raw_log(client, "dry-run", capture.clone(), args.raw_serial_log);
++        let result = run_core(args, &mut i2c, &mut link, true, None, Some(capture)).await;
 +        drop(link);
 +        task.abort();
 +        return result;
@@ -655,7 +825,12 @@ index 0000000..673e887
 +        }
 +    };
 +
-+    let mut link = match FrozenLink::<tokio_serial::SerialStream>::open_with_raw_log(&args.frozen_port, args.raw_serial_log) {
++    let capture: RawIoCapture = Default::default();
++    let mut link = match FrozenLink::<tokio_serial::SerialStream>::open_capturing_with_raw_log(
++        &args.frozen_port,
++        capture.clone(),
++        args.raw_serial_log,
++    ) {
 +        Ok(l) => l,
 +        Err(e) => {
 +            log::error!("failed to open Frozen UART {}: {e}", args.frozen_port);
@@ -663,7 +838,7 @@ index 0000000..673e887
 +        }
 +    };
 +
-+    run_core(args, &mut i2c, &mut link, false, None).await
++    run_core(args, &mut i2c, &mut link, false, None, Some(capture)).await
 +}
 +
 +fn refuse_if_owned(args: &CoolTestArgs) -> Option<(Report, u8)> {
@@ -936,6 +1111,11 @@ index 0000000..673e887
 +    link: &mut FrozenLink<T>,
 +    dry_run: bool,
 +    operator_abort_rx_override: Option<mpsc::UnboundedReceiver<String>>,
++    // Raw RX/TX bytes for the same link, captured below `Framed`/`PacketCodec` -- see
++    // `frozen_compat.rs` module docs. `None` in the many existing tests that only exercise the
++    // normal decode path (unaffected: they never look for the 14-byte compat reply); `Some` for
++    // every real run and for tests that specifically exercise `CompatFrameScanner` end to end.
++    capture: Option<RawIoCapture>,
 +) -> (Report, u8)
 +where
 +    T: AsyncRead + AsyncWrite + Unpin,
@@ -1017,16 +1197,36 @@ index 0000000..673e887
 +        );
 +    }
 +
-+    // Preflight: at least BASELINE_MIN_SAMPLES valid samples over at least BASELINE_MIN_WINDOW,
-+    // from unsolicited TemperatureUpdate pushes -- see module docs for why the solicited
-+    // GetTemperature reply is not relied on here.
++    // Preflight: at least BASELINE_MIN_SAMPLES valid samples over at least BASELINE_MIN_WINDOW, or
++    // BASELINE_MAX_WINDOW elapsed, whichever comes first. Accepts valid temperatures from both the
++    // unsolicited TemperatureUpdate push and decoded GetTemperature replies -- the original 27-byte
++    // reply via the unmodified upstream parser, and this firmware's 14-byte reply recovered by
++    // `frozen_compat::CompatFrameScanner` from raw captured bytes (see that module's docs for why a
++    // raw-byte tap is the only way to see it at all) -- deduplicated within each ~1s tick and
++    // filtered for per-sample validity before ever counting toward the minimum.
 +    let baseline_start = Instant::now();
-+    let mut baseline_updates: Vec<TemperatureUpdate> = Vec::new();
-+    while baseline_updates.len() < BASELINE_MIN_SAMPLES || baseline_start.elapsed() < BASELINE_MIN_WINDOW {
++    let mut baseline_samples: Vec<TemperatureSample> = Vec::new();
++    let mut baseline_synchronous_decoded: usize = 0;
++    let mut baseline_unsolicited_decoded: usize = 0;
++    let mut baseline_duplicates_discarded: usize = 0;
++    let mut baseline_invalid_discarded: usize = 0;
++    let mut compat_get_temperature_14byte_frames: u64 = 0;
++    let mut compat_heartbeat_9byte_frames: u64 = 0;
++    let mut compat_opcode_0x54_frames: u64 = 0;
++    let mut compat_opcode_0x55_frames: u64 = 0;
++    let mut compat_scanner = CompatFrameScanner::new();
++    // Skip preflight/disable-phase traffic already sitting in the capture -- only bytes that
++    // arrive from here on are relevant to baseline compat scanning.
++    let mut raw_scan_checkpoint: usize = capture.as_ref().and_then(|c| c.lock().ok()).map(|c| c.len()).unwrap_or(0);
++
++    while baseline_should_continue(baseline_samples.len(), baseline_start.elapsed()) {
 +        if let Err(e) = link.send_only(&mut audit, FrozenAction::get_temperatures()).await {
 +            log::error!("failed to send GetTemperatures during baseline collection: {e}");
 +            stats.record_timeout();
 +        }
++
++        let tick_start_index = baseline_samples.len();
++        let mut tick_candidates: Vec<TemperatureSample> = Vec::new();
 +
 +        let drain_deadline = Instant::now() + TICK_DRAIN_WINDOW;
 +        loop {
@@ -1040,19 +1240,14 @@ index 0000000..673e887
 +                    let elapsed_ms = baseline_start.elapsed().as_millis() as u64;
 +                    match pkt {
 +                        FrozenPacket::TemperatureUpdate(u) => {
-+                            samples.push(
-+                                (&sample_from_temperature_update(elapsed_ms, jiff::Timestamp::now().to_string(), &u))
-+                                    .into(),
-+                            );
-+                            baseline_updates.push(u);
++                            let sample = sample_from_temperature_update(elapsed_ms, jiff::Timestamp::now().to_string(), &u);
++                            samples.push((&sample).into());
++                            tick_candidates.push(sample);
 +                        }
-+                        // Raw evidence only, per module docs -- never required or used for
-+                        // baseline validation.
 +                        FrozenPacket::GetTemperature(g) => {
-+                            samples.push(
-+                                (&sample_from_get_temperature(elapsed_ms, jiff::Timestamp::now().to_string(), &g))
-+                                    .into(),
-+                            );
++                            let sample = sample_from_get_temperature(elapsed_ms, jiff::Timestamp::now().to_string(), &g);
++                            samples.push((&sample).into());
++                            tick_candidates.push(sample);
 +                        }
 +                        _ => {}
 +                    }
@@ -1066,12 +1261,71 @@ index 0000000..673e887
 +            }
 +        }
 +
-+        if baseline_start.elapsed() > BASELINE_MIN_WINDOW * 4 {
-+            break; // hard backstop against an unbounded preflight if telemetry never stabilizes
++        // Raw-capture-based recovery of the 14-byte GetTemperature shape the drain loop above can
++        // never see through the normal decode path (`PacketCodec::decode` discards it before it
++        // ever reaches `Framed::next()` -- see `frozen_compat.rs`), and, while scanning the same
++        // bytes, concise counters for the other known firmware-compatibility frame shapes (item 8).
++        if let Some(capture) = &capture {
++            let new_events = crate::io_logging::events_since(capture, &mut raw_scan_checkpoint);
++            for event in new_events.iter().filter(|e| e.direction == "rx") {
++                if let Some(bytes) = crate::io_logging::hex_to_bytes(&event.hex) {
++                    compat_scanner.feed(&bytes);
++                }
++            }
++            for frame in compat_scanner.drain_frames() {
++                match frame.opcode {
++                    crate::frozen_compat::GET_TEMPERATURE_OPCODE => {
++                        if let Some(g) = crate::frozen_compat::decode_get_temperature_14byte(&frame.payload) {
++                            compat_get_temperature_14byte_frames += 1;
++                            let elapsed_ms = baseline_start.elapsed().as_millis() as u64;
++                            let sample =
++                                sample_from_get_temperature_compat14(elapsed_ms, jiff::Timestamp::now().to_string(), &g);
++                            samples.push((&sample).into());
++                            tick_candidates.push(sample);
++                        }
++                    }
++                    crate::frozen_compat::HEARTBEAT_OPCODE
++                        if frame.payload.len() == crate::frozen_compat::HEARTBEAT_OBSERVED_COMPAT_SIZE =>
++                    {
++                        compat_heartbeat_9byte_frames += 1;
++                    }
++                    0x54 => compat_opcode_0x54_frames += 1,
++                    0x55 => compat_opcode_0x55_frames += 1,
++                    _ => {}
++                }
++            }
++        }
++
++        for candidate in tick_candidates {
++            if !is_valid_baseline_reading(side, &candidate) {
++                baseline_invalid_discarded += 1;
++                continue;
++            }
++            if is_duplicate_within_tick(&baseline_samples[tick_start_index..], &candidate) {
++                baseline_duplicates_discarded += 1;
++                continue;
++            }
++            match candidate.source {
++                SampleSource::Unsolicited => baseline_unsolicited_decoded += 1,
++                SampleSource::Solicited | SampleSource::SolicitedCompat14Byte => baseline_synchronous_decoded += 1,
++            }
++            baseline_samples.push(candidate);
 +        }
 +    }
 +
-+    let baseline = match validate_baseline(&baseline_updates, side) {
++    let baseline_collection_duration = baseline_start.elapsed();
++    ct.baseline_samples_requested = BASELINE_MIN_SAMPLES;
++    ct.baseline_synchronous_samples_decoded = baseline_synchronous_decoded;
++    ct.baseline_unsolicited_samples_decoded = baseline_unsolicited_decoded;
++    ct.baseline_duplicate_samples_discarded = baseline_duplicates_discarded;
++    ct.baseline_invalid_samples_discarded = baseline_invalid_discarded;
++    ct.baseline_collection_duration_seconds = baseline_collection_duration.as_secs_f64();
++    ct.compat_get_temperature_14byte_frames = compat_get_temperature_14byte_frames;
++    ct.compat_heartbeat_9byte_frames = compat_heartbeat_9byte_frames;
++    ct.compat_opcode_0x54_frames = compat_opcode_0x54_frames;
++    ct.compat_opcode_0x55_frames = compat_opcode_0x55_frames;
++
++    let baseline = match validate_baseline(&baseline_samples, side) {
 +        Some(b) => b,
 +        None => {
 +            log::error!("refusing to run active test: baseline temperature did not pass validation");
@@ -1086,11 +1340,14 @@ index 0000000..673e887
 +            );
 +        }
 +    };
-+    if let Some(last) = baseline_updates.last() {
-+        ct.baseline_left_c = Some(crate::telemetry::centideg_to_celsius(last.left_temp));
-+        ct.baseline_right_c = Some(crate::telemetry::centideg_to_celsius(last.right_temp));
-+        ct.baseline_heatsink_c = Some(crate::telemetry::centideg_to_celsius(last.heatsink_temp));
++    if let Some(last) = baseline_samples.last() {
++        ct.baseline_left_c = last.left_water_c;
++        ct.baseline_right_c = last.right_water_c;
++        ct.baseline_heatsink_c = last.heatsink_c;
 +    }
++    ct.baseline_left_range_c = baseline_range_c(&baseline_samples, |s| s.raw_left);
++    ct.baseline_right_range_c = baseline_range_c(&baseline_samples, |s| s.raw_right);
++    ct.baseline_heatsink_range_c = baseline_range_c(&baseline_samples, |s| s.raw_heatsink);
 +
 +    let delta_centideg = (args.delta_c * 100.0).round() as i32;
 +    let action = match FrozenAction::enable_cooling(side, baseline as u16, delta_centideg) {
@@ -1508,27 +1765,84 @@ index 0000000..673e887
 +    }
 +}
 +
-+fn validate_baseline(samples: &[TemperatureUpdate], side: BedSide) -> Option<i32> {
++/// Item 5's exact stop condition, pulled out as a pure function so it can be tested directly
++/// against synthetic elapsed durations rather than through a real or virtual-time async loop:
++/// continue collecting baseline samples until either `BASELINE_MIN_SAMPLES` valid samples have
++/// been collected over at least `BASELINE_MIN_WINDOW`, or `BASELINE_MAX_WINDOW` has elapsed,
++/// whichever comes first. In particular this must stay `true` at ~40s with only 4 samples (the
++/// real-hardware regression this fix addresses: MT8365 / Frozen firmware v1.4.235 pushes
++/// unsolicited telemetry only about once every 10 seconds, so 5 samples can take 40-50s to arrive,
++/// and the previous `BASELINE_MIN_WINDOW * 4` backstop cut collection off before that could happen).
++fn baseline_should_continue(samples_len: usize, elapsed: Duration) -> bool {
++    (samples_len < BASELINE_MIN_SAMPLES || elapsed < BASELINE_MIN_WINDOW) && elapsed < BASELINE_MAX_WINDOW
++}
++
++/// True iff `sample`'s selected-side water reading and heatsink reading are both present and
++/// plausible: neither a sentinel value (0 or 0xFFFF) nor outside `MIN_WATER_CENTIDEG..=
++/// MAX_WATER_CENTIDEG`. Runs identically regardless of `sample.source` -- a sample decoded via the
++/// 14-byte compat path is validated exactly like one from the normal 27-byte/unsolicited path, so
++/// baseline validation never rejects a reading merely because of which protocol format produced
++/// it, only for an actually invalid or missing value.
++fn is_valid_baseline_reading(side: BedSide, sample: &TemperatureSample) -> bool {
++    let side_raw = match side {
++        BedSide::Left => sample.raw_left,
++        BedSide::Right => sample.raw_right,
++    };
++    let (Some(side_raw), Some(heatsink_raw)) = (side_raw, sample.raw_heatsink) else {
++        return false;
++    };
++    for v in [side_raw as i32, heatsink_raw as i32] {
++        if v == 0 || v == 0xFFFF {
++            return false;
++        }
++        if !(MIN_WATER_CENTIDEG..=MAX_WATER_CENTIDEG).contains(&v) {
++            return false;
++        }
++    }
++    true
++}
++
++/// True iff `candidate` has the exact same (left, right, heatsink) raw reading as any sample
++/// already collected *within the current baseline tick* (`tick_samples`): a solicited reply and an
++/// unsolicited push landing in the same ~1s drain window because they carry the same underlying
++/// firmware sample. Deliberately scoped to one tick, not the whole baseline history -- two
++/// genuinely separate ticks that happen to read the same stable temperature (expected during a
++/// short, stable baseline window) are not duplicates of each other.
++fn is_duplicate_within_tick(tick_samples: &[TemperatureSample], candidate: &TemperatureSample) -> bool {
++    tick_samples
++        .iter()
++        .any(|s| s.raw_left == candidate.raw_left && s.raw_right == candidate.raw_right && s.raw_heatsink == candidate.raw_heatsink)
++}
++
++/// Max - min, in Celsius, of whichever raw centidegree field `select` reads off each sample --
++/// `None` if `samples` is empty. Used only for the "stability range per channel" report fields;
++/// `validate_baseline` does its own, separate spread check on the selected side alone.
++fn baseline_range_c(samples: &[TemperatureSample], select: impl Fn(&TemperatureSample) -> Option<u16>) -> Option<f64> {
++    let values: Vec<u16> = samples.iter().filter_map(select).collect();
++    let min = *values.iter().min()?;
++    let max = *values.iter().max()?;
++    Some(crate::telemetry::centideg_to_celsius(max) - crate::telemetry::centideg_to_celsius(min))
++}
++
++/// Aggregate baseline check, run only on samples that already passed [`is_valid_baseline_reading`]
++/// and per-tick deduplication -- so the only ways this can now fail are "not enough valid samples"
++/// (the collection loop's own minimum wasn't reached, e.g. the `BASELINE_MAX_WINDOW` backstop fired
++/// first) or "implausibly unstable" (spread across the selected side's readings too wide). Never
++/// rejects for a reason belonging to sample collection (invalid/missing/unsupported format) --
++/// those are filtered out before a sample ever reaches this function.
++fn validate_baseline(samples: &[TemperatureSample], side: BedSide) -> Option<i32> {
 +    if samples.len() < BASELINE_MIN_SAMPLES {
 +        log::error!("baseline validation failed: only {} samples (need >= {BASELINE_MIN_SAMPLES})", samples.len());
 +        return None;
 +    }
 +    let values: Vec<i32> = samples
 +        .iter()
-+        .map(|u| match side { BedSide::Left => u.left_temp, BedSide::Right => u.right_temp } as i32)
++        .map(|s| match side {
++            BedSide::Left => s.raw_left,
++            BedSide::Right => s.raw_right,
++        }
++        .expect("is_valid_baseline_reading already required this to be Some") as i32)
 +        .collect();
-+    let heatsinks: Vec<i32> = samples.iter().map(|u| u.heatsink_temp as i32).collect();
-+
-+    for &v in values.iter().chain(heatsinks.iter()) {
-+        if v == 0 || v == 0xFFFF {
-+            log::error!("baseline validation failed: sentinel temperature value {v}");
-+            return None;
-+        }
-+        if !(MIN_WATER_CENTIDEG..=MAX_WATER_CENTIDEG).contains(&v) {
-+            log::error!("baseline validation failed: value {v} outside {MIN_WATER_CENTIDEG}-{MAX_WATER_CENTIDEG}");
-+            return None;
-+        }
-+    }
 +
 +    let min = *values.iter().min().unwrap();
 +    let max = *values.iter().max().unwrap();
@@ -1750,6 +2064,7 @@ index 0000000..673e887
 +mod tests {
 +    use super::*;
 +    use crate::cli::Side;
++    use opensleep::frozen::packet::GetTemperature;
 +
 +    fn args(side: Side, dry_run: bool) -> CoolTestArgs {
 +        CoolTestArgs {
@@ -1773,8 +2088,15 @@ index 0000000..673e887
 +        }
 +    }
 +
-+    fn temp_update(left: u16, right: u16, heatsink: u16) -> TemperatureUpdate {
-+        TemperatureUpdate { left_temp: left, right_temp: right, heatsink_temp: heatsink, error: 9, count: 0 }
++    fn baseline_sample(left: u16, right: u16, heatsink: u16) -> TemperatureSample {
++        let u = opensleep::frozen::packet::TemperatureUpdate {
++            left_temp: left,
++            right_temp: right,
++            heatsink_temp: heatsink,
++            error: 9,
++            count: 0,
++        };
++        sample_from_temperature_update(0, String::new(), &u)
 +    }
 +
 +    #[tokio::test]
@@ -1862,26 +2184,91 @@ index 0000000..673e887
 +
 +    #[test]
 +    fn baseline_rejects_too_few_samples() {
-+        let one = vec![temp_update(2400, 2400, 2500)];
++        let one = vec![baseline_sample(2400, 2400, 2500)];
 +        assert!(validate_baseline(&one, BedSide::Left).is_none());
 +    }
 +
 +    #[test]
-+    fn baseline_rejects_sentinel_zero() {
-+        let samples = vec![temp_update(0, 2400, 2500); 5];
-+        assert!(validate_baseline(&samples, BedSide::Left).is_none());
-+    }
-+
-+    #[test]
-+    fn baseline_rejects_out_of_range() {
-+        let samples = vec![temp_update(5000, 2400, 2500); 5];
-+        assert!(validate_baseline(&samples, BedSide::Left).is_none());
-+    }
-+
-+    #[test]
 +    fn baseline_accepts_consistent_valid_samples() {
-+        let samples = vec![temp_update(2450, 2460, 2600); 5];
++        let samples = vec![baseline_sample(2450, 2460, 2600); 5];
 +        assert_eq!(validate_baseline(&samples, BedSide::Left), Some(2450));
++    }
++
++    #[test]
++    fn baseline_accepts_mixed_solicited_and_unsolicited_samples() {
++        // Item 11: five samples mixing sources (unsolicited push, normal 27-byte solicited reply,
++        // and the 14-byte compat reply) all pass baseline validation identically.
++        let g = GetTemperature { left_temp: 2450, right_temp: 2460, unknown_temp: 0, heatsink_temp: 2600 };
++        let samples = vec![
++            baseline_sample(2450, 2460, 2600),
++            baseline_sample(2450, 2460, 2600),
++            sample_from_get_temperature(0, String::new(), &g),
++            sample_from_get_temperature_compat14(0, String::new(), &g),
++            baseline_sample(2450, 2460, 2600),
++        ];
++        assert_eq!(validate_baseline(&samples, BedSide::Left), Some(2450));
++    }
++
++    #[test]
++    fn baseline_rejects_implausibly_unstable_readings() {
++        let mut samples = vec![baseline_sample(2450, 2460, 2600); 4];
++        samples.push(baseline_sample(2450 + BASELINE_MAX_SPREAD_CENTIDEG as u16 + 1, 2460, 2600));
++        assert!(validate_baseline(&samples, BedSide::Left).is_none());
++    }
++
++    #[test]
++    fn is_valid_baseline_reading_rejects_sentinel_zero() {
++        assert!(!is_valid_baseline_reading(BedSide::Left, &baseline_sample(0, 2400, 2500)));
++    }
++
++    #[test]
++    fn is_valid_baseline_reading_rejects_out_of_range() {
++        assert!(!is_valid_baseline_reading(BedSide::Left, &baseline_sample(5000, 2400, 2500)));
++    }
++
++    #[test]
++    fn is_valid_baseline_reading_rejects_out_of_range_heatsink_even_if_selected_side_is_fine() {
++        assert!(!is_valid_baseline_reading(BedSide::Left, &baseline_sample(2400, 2400, 0)));
++    }
++
++    #[test]
++    fn is_valid_baseline_reading_accepts_a_plausible_sample() {
++        assert!(is_valid_baseline_reading(BedSide::Left, &baseline_sample(2400, 2400, 2500)));
++        assert!(is_valid_baseline_reading(BedSide::Right, &baseline_sample(2400, 2400, 2500)));
++    }
++
++    #[test]
++    fn is_duplicate_within_tick_matches_only_an_identical_reading_in_the_same_tick() {
++        let existing = vec![baseline_sample(2450, 2460, 2600)];
++        assert!(is_duplicate_within_tick(&existing, &baseline_sample(2450, 2460, 2600)));
++        assert!(!is_duplicate_within_tick(&existing, &baseline_sample(2451, 2460, 2600)));
++        assert!(!is_duplicate_within_tick(&[], &baseline_sample(2450, 2460, 2600)));
++    }
++
++    #[test]
++    fn baseline_should_continue_does_not_stop_at_forty_seconds_with_only_four_samples() {
++        // Item 5's real-hardware regression, reproduced directly: the previous
++        // BASELINE_MIN_WINDOW * 4 (40s) backstop would have stopped here; the fix must not.
++        assert!(baseline_should_continue(4, Duration::from_secs(40)));
++        assert!(baseline_should_continue(4, Duration::from_secs(59)));
++    }
++
++    #[test]
++    fn baseline_should_continue_stops_once_five_samples_span_at_least_ten_seconds() {
++        assert!(!baseline_should_continue(5, Duration::from_secs(10)));
++        assert!(!baseline_should_continue(6, Duration::from_secs(45)));
++    }
++
++    #[test]
++    fn baseline_should_continue_keeps_going_past_five_samples_before_ten_seconds() {
++        // "at least 10 seconds" is required even if 5 samples arrived unusually fast.
++        assert!(baseline_should_continue(5, Duration::from_secs(3)));
++    }
++
++    #[test]
++    fn baseline_should_continue_stops_at_sixty_seconds_regardless_of_sample_count() {
++        assert!(!baseline_should_continue(0, Duration::from_secs(60)));
++        assert!(!baseline_should_continue(2, Duration::from_secs(61)));
 +    }
 +
 +    #[test]
@@ -2113,11 +2500,255 @@ index 0000000..673e887
 +
 +        let mut a = args(Side::Left, false);
 +        a.duration_seconds = 10; // long enough that only staleness (not duration) ends the run
-+        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None).await;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None).await;
 +
 +        assert_eq!(report.stop_reason, StopReason::TelemetryStale.to_string());
 +        let ct = report.cool_test_results.expect("cool_test_results must be set");
 +        assert!(ct.shutdown_verified);
++
++        drop(link);
++        device_task.abort();
++    }
++
++    /// A fake device that only ever answers a `GetTemperatures` request (opcode `0x41`) with the
++    /// raw, firmware-specific 14-byte `GetTemperature` reply -- never an unsolicited
++    /// `TemperatureUpdate` push. The normal `Framed`/`PacketCodec` decode path can never produce a
++    /// packet from these replies (wrong size for the unmodified upstream parser); only
++    /// `frozen_compat::CompatFrameScanner`, reading the same bytes from `RawIoCapture` below
++    /// `Framed`, can recover them. Reusing this device across ticks to satisfy `BASELINE_MIN_SAMPLES`
++    /// is therefore a direct, end-to-end proof that item 1/2's fix actually closes the real-hardware
++    /// gap this whole change was written for, not just that the standalone decoder works in isolation.
++    fn spawn_device_replying_only_with_14byte_get_temperature(mut device_side: tokio::io::DuplexStream) -> tokio::task::JoinHandle<()> {
++        use bytes::{Buf, BytesMut};
++        use tokio::io::{AsyncReadExt, AsyncWriteExt};
++        // Exact payload captured from MT8365 / Frozen firmware v1.4.235 real hardware.
++        const FIXTURE_1: [u8; 14] = [0xC1, 0x00, 0x01, 0x0A, 0x5A, 0x02, 0x0A, 0x3A, 0x03, 0x09, 0x92, 0x04, 0x09, 0xC4];
++        tokio::spawn(async move {
++            let mut acc = BytesMut::new();
++            let mut read_buf = [0u8; 256];
++            loop {
++                if acc.len() >= 2 {
++                    let len = acc[1] as usize;
++                    let total = 1 + 1 + len + 2;
++                    if acc.len() >= total {
++                        let opcode = acc[2];
++                        let payload = acc[2..2 + len].to_vec();
++                        acc.advance(total);
++                        let response = match opcode {
++                            0x01 => Some(opensleep::common::codec::command(vec![0x81, 0x00, 0b0100_0110])),
++                            0x41 => Some(opensleep::common::codec::command(FIXTURE_1.to_vec())),
++                            0x40 if payload.len() == 5 => Some(opensleep::common::codec::command(vec![
++                                0xC0, 0x00, payload[1], payload[2], payload[3], payload[4],
++                            ])),
++                            _ => None,
++                        };
++                        if let Some(resp) = response
++                            && device_side.write_all(&resp).await.is_err()
++                        {
++                            break;
++                        }
++                        continue;
++                    }
++                }
++                match device_side.read(&mut read_buf).await {
++                    Ok(0) | Err(_) => break,
++                    Ok(n) => acc.extend_from_slice(&read_buf[..n]),
++                }
++            }
++        })
++    }
++
++    #[tokio::test]
++    async fn baseline_recovers_entirely_from_14byte_get_temperature_replies_via_raw_capture() {
++        let (client, device) = tokio::io::duplex(8192);
++        let device_task = spawn_device_replying_only_with_14byte_get_temperature(device);
++        let capture: RawIoCapture = Default::default();
++        let mut link = FrozenLink::wrap_capturing(client, "test", capture.clone());
++        let mut i2c = MockI2c::always_succeed();
++
++        let a = args(Side::Left, false);
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, Some(capture)).await;
++
++        let ct = report.cool_test_results.expect("cool_test_results must be set");
++        assert_ne!(report.stop_reason, StopReason::PreflightRefused.to_string(), "baseline must pass using only the 14-byte replies");
++        assert!(ct.compat_get_temperature_14byte_frames >= BASELINE_MIN_SAMPLES as u64);
++        assert!(ct.baseline_synchronous_samples_decoded >= BASELINE_MIN_SAMPLES);
++        assert_eq!(ct.baseline_unsolicited_samples_decoded, 0, "this device never sends an unsolicited push");
++        assert!(ct.baseline_left_c.is_some());
++
++        drop(link);
++        device_task.abort();
++    }
++
++    fn get_temperature_27byte_frame(left: u16, right: u16, heatsink: u16) -> Vec<u8> {
++        let mut payload = vec![
++            0xC1,
++            0x00,
++            0x01,
++            (left >> 8) as u8,
++            left as u8,
++            0x02,
++            (right >> 8) as u8,
++            right as u8,
++            0x03,
++            0x00,
++            0x00,
++            0x04,
++            (heatsink >> 8) as u8,
++            heatsink as u8,
++        ];
++        payload.resize(27, 0);
++        payload
++    }
++
++    /// A fake device that, for every `GetTemperatures` request, sends *both* an unsolicited
++    /// `TemperatureUpdate` push and a normal 27-byte `GetTemperature` reply carrying the exact same
++    /// (left, right, heatsink) reading -- simulating a solicited reply landing in the same ~1s
++    /// drain window as an unrelated periodic push that happens to report the same underlying
++    /// firmware sample.
++    fn spawn_device_sending_duplicate_readings_each_tick(mut device_side: tokio::io::DuplexStream) -> tokio::task::JoinHandle<()> {
++        use bytes::{Buf, BytesMut};
++        use tokio::io::{AsyncReadExt, AsyncWriteExt};
++        tokio::spawn(async move {
++            let mut acc = BytesMut::new();
++            let mut read_buf = [0u8; 256];
++            loop {
++                if acc.len() >= 2 {
++                    let len = acc[1] as usize;
++                    let total = 1 + 1 + len + 2;
++                    if acc.len() >= total {
++                        let opcode = acc[2];
++                        let payload = acc[2..2 + len].to_vec();
++                        acc.advance(total);
++                        match opcode {
++                            0x01 => {
++                                let resp = opensleep::common::codec::command(vec![0x81, 0x00, 0b0100_0110]);
++                                if device_side.write_all(&resp).await.is_err() {
++                                    break;
++                                }
++                            }
++                            0x41 => {
++                                let push = opensleep::common::codec::command(vec![0x41, 0x09, 0x9A, 0x09, 0xA4, 0x0A, 0x28, 9, 0]);
++                                let reply = opensleep::common::codec::command(get_temperature_27byte_frame(0x099A, 0x09A4, 0x0A28));
++                                if device_side.write_all(&push).await.is_err() || device_side.write_all(&reply).await.is_err() {
++                                    break;
++                                }
++                            }
++                            0x40 if payload.len() == 5 => {
++                                let resp = opensleep::common::codec::command(vec![
++                                    0xC0, 0x00, payload[1], payload[2], payload[3], payload[4],
++                                ]);
++                                if device_side.write_all(&resp).await.is_err() {
++                                    break;
++                                }
++                            }
++                            _ => {}
++                        }
++                        continue;
++                    }
++                }
++                match device_side.read(&mut read_buf).await {
++                    Ok(0) | Err(_) => break,
++                    Ok(n) => acc.extend_from_slice(&read_buf[..n]),
++                }
++            }
++        })
++    }
++
++    #[tokio::test]
++    async fn duplicate_readings_within_a_tick_do_not_inflate_the_baseline_sample_count() {
++        let (client, device) = tokio::io::duplex(8192);
++        let device_task = spawn_device_sending_duplicate_readings_each_tick(device);
++        let mut link = FrozenLink::wrap(client, "test");
++        let mut i2c = MockI2c::always_succeed();
++
++        let a = args(Side::Left, false);
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None).await;
++
++        let ct = report.cool_test_results.expect("cool_test_results must be set");
++        assert_ne!(report.stop_reason, StopReason::PreflightRefused.to_string());
++        assert!(ct.baseline_duplicate_samples_discarded >= 1, "the paired push+reply each tick must be recognized as duplicates");
++        assert_eq!(ct.baseline_invalid_samples_discarded, 0);
++
++        drop(link);
++        device_task.abort();
++    }
++
++    /// A fake device that acks Ping/JumpToFirmware and every `0x40` (5-byte) command normally --
++    /// so preflight/disable and shutdown all succeed -- but for every `GetTemperatures` request
++    /// pushes an unsolicited `TemperatureUpdate` alternating the left reading between two values
++    /// far enough apart to individually pass [`is_valid_baseline_reading`] (both are well inside
++    /// `MIN_WATER_CENTIDEG..=MAX_WATER_CENTIDEG`) but whose spread exceeds
++    /// `BASELINE_MAX_SPREAD_CENTIDEG` -- so baseline collection reaches `BASELINE_MIN_SAMPLES`
++    /// quickly, but `validate_baseline`'s stability check genuinely fails. Proves item 6 end to
++    /// end: rejected for real instability, not for a missing/unsupported reading.
++    fn spawn_device_with_unstable_baseline_readings(mut device_side: tokio::io::DuplexStream) -> tokio::task::JoinHandle<()> {
++        use bytes::{Buf, BytesMut};
++        use tokio::io::{AsyncReadExt, AsyncWriteExt};
++        tokio::spawn(async move {
++            let mut acc = BytesMut::new();
++            let mut read_buf = [0u8; 256];
++            let mut toggle = false;
++            loop {
++                if acc.len() >= 2 {
++                    let len = acc[1] as usize;
++                    let total = 1 + 1 + len + 2;
++                    if acc.len() >= total {
++                        let opcode = acc[2];
++                        let payload = acc[2..2 + len].to_vec();
++                        acc.advance(total);
++                        let response = match opcode {
++                            0x01 => Some(opensleep::common::codec::command(vec![0x81, 0x00, 0b0100_0110])),
++                            0x41 => {
++                                toggle = !toggle;
++                                let left: u16 = if toggle { 1600 } else { 3400 };
++                                Some(opensleep::common::codec::command(vec![
++                                    0x41,
++                                    (left >> 8) as u8,
++                                    left as u8,
++                                    0x09,
++                                    0xA4,
++                                    0x0A,
++                                    0x28,
++                                    9,
++                                    0,
++                                ]))
++                            }
++                            0x40 if payload.len() == 5 => Some(opensleep::common::codec::command(vec![
++                                0xC0, 0x00, payload[1], payload[2], payload[3], payload[4],
++                            ])),
++                            _ => None,
++                        };
++                        if let Some(resp) = response
++                            && device_side.write_all(&resp).await.is_err()
++                        {
++                            break;
++                        }
++                        continue;
++                    }
++                }
++                match device_side.read(&mut read_buf).await {
++                    Ok(0) | Err(_) => break,
++                    Ok(n) => acc.extend_from_slice(&read_buf[..n]),
++                }
++            }
++        })
++    }
++
++    #[tokio::test]
++    async fn cooling_remains_disabled_when_baseline_validation_genuinely_fails() {
++        let (client, device) = tokio::io::duplex(8192);
++        let device_task = spawn_device_with_unstable_baseline_readings(device);
++        let mut link = FrozenLink::wrap(client, "test");
++        let mut i2c = MockI2c::always_succeed();
++
++        let a = args(Side::Left, false);
++        let (report, code) = run_core(&a, &mut i2c, &mut link, false, None, None).await;
++
++        assert_eq!(report.stop_reason, StopReason::PreflightRefused.to_string());
++        assert_eq!(report.enabled_target_command_count, 0, "cooling must never be enabled when baseline validation fails");
++        assert!(!report.overall_pass);
++        assert_eq!(code, 30);
 +
 +        drop(link);
 +        device_task.abort();
@@ -2194,7 +2825,7 @@ index 0000000..673e887
 +
 +        let mut a = args(Side::Left, false);
 +        a.duration_seconds = 10;
-+        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None).await;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None).await;
 +
 +        assert_eq!(report.stop_reason, StopReason::TargetDisabledUnexpectedly.to_string());
 +        let ct = report.cool_test_results.expect("cool_test_results must be set");
@@ -2274,7 +2905,7 @@ index 0000000..673e887
 +
 +        let mut a = args(Side::Left, false);
 +        a.duration_seconds = 10;
-+        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None).await;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None).await;
 +
 +        assert_eq!(report.stop_reason, StopReason::TecLocked.to_string());
 +
@@ -2293,7 +2924,7 @@ index 0000000..673e887
 +
 +        let mut a = args(Side::Left, false);
 +        a.duration_seconds = 2;
-+        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None).await;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None).await;
 +
 +        assert_eq!(report.stop_reason, StopReason::DurationExpired.to_string());
 +
@@ -2312,7 +2943,7 @@ index 0000000..673e887
 +
 +        let mut a = args(Side::Left, false);
 +        a.duration_seconds = 15;
-+        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None).await;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, None, None).await;
 +
 +        assert_eq!(report.stop_reason, StopReason::FirmwareFaultMessage.to_string());
 +
@@ -2334,7 +2965,7 @@ index 0000000..673e887
 +
 +        let mut a = args(Side::Left, false);
 +        a.duration_seconds = 10;
-+        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, Some(rx)).await;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, Some(rx), None).await;
 +
 +        assert_eq!(report.stop_reason, StopReason::OperatorAbort.to_string());
 +
@@ -2357,7 +2988,7 @@ index 0000000..673e887
 +        // Comfortably above STALE_TELEMETRY_LIMIT (2s) so ordinary scheduling jitter around the
 +        // per-tick drain window can't race the duration check against a false staleness abort.
 +        a.duration_seconds = 6;
-+        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, Some(rx)).await;
++        let (report, _code) = run_core(&a, &mut i2c, &mut link, false, Some(rx), None).await;
 +
 +        assert_eq!(report.stop_reason, StopReason::DurationExpired.to_string());
 +
@@ -2414,7 +3045,7 @@ index 0000000..673e887
 +        let (client, _unused_device_side) = tokio::io::duplex(64);
 +        let mut link = FrozenLink::wrap(client, "test");
 +        let a = args(Side::Left, false);
-+        let (report, code) = run_core(&a, &mut i2c, &mut link, false, None).await;
++        let (report, code) = run_core(&a, &mut i2c, &mut link, false, None, None).await;
 +        assert_eq!(code, 20);
 +        assert!(!report.overall_pass);
 +        assert_eq!(report.enabled_target_command_count, 0);
@@ -2427,7 +3058,7 @@ index 0000000..673e887
 +        let mut link = FrozenLink::wrap(client, "test");
 +        let mut a = args(Side::Left, false);
 +        a.assume_reservoir_phrase = Some("wrong".to_string());
-+        let (report, code) = run_core(&a, &mut i2c, &mut link, false, None).await;
++        let (report, code) = run_core(&a, &mut i2c, &mut link, false, None, None).await;
 +        assert_eq!(code, 30);
 +        assert_eq!(report.enabled_target_command_count, 0, "cooling must never be enabled without the reservoir confirmation");
 +        drop(link);
@@ -2739,6 +3370,289 @@ index 0000000..9b7fc97
 +        let mut audit = AuditedTransport::new(Mode::EmergencyStop);
 +        assert!(audit.check(&FrozenAction::safety_off(BedSide::Left)).is_ok());
 +        assert!(audit.check(&FrozenAction::ping()).is_err());
++    }
++}
+diff --git a/src/bin/opensleep-diagnostic/frozen_compat.rs b/src/bin/opensleep-diagnostic/frozen_compat.rs
+new file mode 100644
+index 0000000..1fce892
+--- /dev/null
++++ b/src/bin/opensleep-diagnostic/frozen_compat.rs
+@@ -0,0 +1,277 @@
++//! Narrow, evidence-driven decode of the 14-byte `Frozen/GetTemperature` (opcode `0xC1`) reply
++//! that MT8365 / Frozen firmware v1.4.235 has been observed sending on real hardware, which the
++//! pinned, unmodified `opensleep::frozen::packet::FrozenPacket::parse_get_temperature` rejects
++//! outright (`validate_packet_size(..., 27)`) before its own -- otherwise correct -- field/tag
++//! checks ever run. See PROTOCOL_AUDIT.md for the full account and the captured example payload.
++//!
++//! ## Why this can't just call the upstream parser with a relaxed size check
++//!
++//! `opensleep::common::codec::PacketCodec::decode` (reused unmodified everywhere else in this
++//! binary) always advances its internal buffer past a checksum-valid frame *before* attempting
++//! `FrozenPacket::parse`, and on a parse error only `log::error!`s and `continue`s -- it never
++//! returns the failed frame's bytes to the caller (confirmed by reading that function's source;
++//! `link.rs`'s `LinkError` doc comment notes the same). A 14-byte `0xC1` frame is therefore
++//! unrecoverable through the normal `Framed`/`FrozenLink::recv` API: this diagnostic cannot see it
++//! at all unless it reads the same raw bytes from underneath that codec.
++//!
++//! [`CompatFrameScanner`] does exactly that: it re-runs the same frame-boundary algorithm as
++//! `PacketCodec::decode` (magic byte search, length-prefixed payload, checksum validation --
++//! reusing `opensleep::common::checksum::compute` rather than reimplementing it) over a copy of
++//! the raw bytes captured by `io_logging::LoggingIo`'s `RawIoCapture`, which sits below `Framed` in
++//! the I/O stack and sees every byte regardless of what the codec above it does with them. Unlike
++//! `PacketCodec::decode`, it never discards a checksum-valid frame just because this binary doesn't
++//! know how to interpret it -- for every opcode except `0xC1` it simply reports the opcode and
++//! length back to the caller (used by `cool_test.rs` for the `0x54`/`0x55`/9-byte-heartbeat
++//! compatibility counters in item 8 of the fix this module was added for) and only attempts a real
++//! field decode for `0xC1`, and only when the payload is the known 14-byte shape.
++//!
++//! [`decode_get_temperature_14byte`] never touches the 27-byte case: firmware that sends the
++//! original, fully-padded 27-byte reply continues to be decoded exactly as before, by the
++//! unmodified upstream parser, through the normal `Framed`/`FrozenLink::recv` path.
++
++use bytes::{Buf, BytesMut};
++use opensleep::frozen::packet::GetTemperature;
++
++pub const GET_TEMPERATURE_OPCODE: u8 = 0xC1;
++/// Real hardware has been observed sending a 9-byte payload under this same opcode, where
++/// upstream's `parse_heartbeat` requires exactly 3 (opcode + 2 bytes); see `compat_counters.rs`.
++pub const HEARTBEAT_OPCODE: u8 = 0x53;
++pub const HEARTBEAT_OBSERVED_COMPAT_SIZE: usize = 9;
++pub const GET_TEMPERATURE_COMPAT_SIZE: usize = 14;
++
++/// Tag-validated decode of the 14-byte-payload `GetTemperature` reply. Byte layout is identical to
++/// `FrozenPacket::parse_get_temperature`'s own documented layout (that function's doc comment shows
++/// this exact same 14-byte example) -- the only difference is this firmware omits the 13 trailing
++/// padding bytes the reference/devkit firmware sends. Every tag byte is checked before any value is
++/// extracted (never inferred from fixed offsets alone), matching the upstream function's own
++/// approach: `payload[1]` is a reserved-zero marker, then four (tag, value) pairs at
++/// `payload[2],[3..5]` / `[5],[6..8]` / `[8],[9..11]` / `[11],[12..14]`.
++///
++/// ```text
++/// C1 00 01 0A 5A 02 0A 3A 03 09 92 04 09 C4
++/// 0  1  2  3  4  5  6  7  8  9  10 11 12 13
++/// ```
++pub fn decode_get_temperature_14byte(payload: &[u8]) -> Option<GetTemperature> {
++    if payload.len() != GET_TEMPERATURE_COMPAT_SIZE || payload[0] != GET_TEMPERATURE_OPCODE {
++        return None;
++    }
++    let indices_valid = payload[1] == 0 && payload[2] == 1 && payload[5] == 2 && payload[8] == 3 && payload[11] == 4;
++    if !indices_valid {
++        return None;
++    }
++    Some(GetTemperature {
++        left_temp: u16::from_be_bytes([payload[3], payload[4]]),
++        right_temp: u16::from_be_bytes([payload[6], payload[7]]),
++        unknown_temp: u16::from_be_bytes([payload[9], payload[10]]),
++        heatsink_temp: u16::from_be_bytes([payload[12], payload[13]]),
++    })
++}
++
++/// One checksum-valid frame the scanner found, before any per-opcode interpretation.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct RawFrame {
++    pub opcode: u8,
++    pub payload: Vec<u8>,
++}
++
++/// Re-runs `PacketCodec::decode`'s own frame-boundary algorithm (magic byte, length-prefixed
++/// payload, checksum) over raw bytes fed to it, without ever discarding a checksum-valid frame just
++/// because its payload doesn't match a known shape. See module docs for why this exists.
++#[derive(Debug, Default)]
++pub struct CompatFrameScanner {
++    buf: BytesMut,
++}
++
++impl CompatFrameScanner {
++    pub fn new() -> Self {
++        Self { buf: BytesMut::new() }
++    }
++
++    pub fn feed(&mut self, bytes: &[u8]) {
++        self.buf.extend_from_slice(bytes);
++    }
++
++    /// Drains every complete, checksum-valid frame currently buffered. Incomplete trailing bytes
++    /// are left in place for the next `feed`. Frames with a bad checksum are skipped one byte at a
++    /// time, exactly like `PacketCodec::decode`.
++    pub fn drain_frames(&mut self) -> Vec<RawFrame> {
++        let mut frames = Vec::new();
++        loop {
++            let start_pos = match self.buf.iter().position(|&b| b == opensleep::common::codec::START) {
++                Some(p) => p,
++                None => {
++                    self.buf.clear();
++                    break;
++                }
++            };
++            if start_pos > 0 {
++                self.buf.advance(start_pos);
++            }
++            if self.buf.len() < 2 {
++                break; // need more data
++            }
++            let len = self.buf[1] as usize;
++            let total = 1 + 1 + len + 2;
++            if self.buf.len() < total {
++                break; // need more data
++            }
++            let payload = &self.buf[2..2 + len];
++            if payload.is_empty() {
++                self.buf.advance(1);
++                continue;
++            }
++            let checksum_bytes = &self.buf[2 + len..2 + len + 2];
++            let actual = u16::from_be_bytes([checksum_bytes[0], checksum_bytes[1]]);
++            let expected = opensleep::common::checksum::compute(payload);
++            if actual != expected {
++                self.buf.advance(1);
++                continue;
++            }
++            self.buf.advance(2);
++            let payload = self.buf.split_to(len);
++            self.buf.advance(2);
++            let opcode = payload[0];
++            frames.push(RawFrame { opcode, payload: payload.to_vec() });
++        }
++        frames
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use hex_literal::hex;
++
++    // Exact payloads captured from MT8365 / Frozen firmware v1.4.235 real hardware.
++    const FIXTURE_1: [u8; 14] = hex!("C1 00 01 0A 5A 02 0A 3A 03 09 92 04 09 C4");
++    const FIXTURE_2: [u8; 14] = hex!("C1 00 01 0A 60 02 0A 41 03 09 92 04 09 C4");
++    const FIXTURE_3: [u8; 14] = hex!("C1 00 01 0A 66 02 0A 47 03 09 8B 04 09 C4");
++
++    #[test]
++    fn captured_fixture_1_decodes_and_matches_the_paired_unsolicited_update() {
++        let g = decode_get_temperature_14byte(&FIXTURE_1).expect("fixture 1 must decode");
++        // Cross-checked against the real, paired unsolicited TemperatureUpdate captured alongside
++        // this exact reply: left_temp: 2650, right_temp: 2618, heatsink_temp: 2500, error: 9.
++        assert_eq!(g.left_temp, 2650);
++        assert_eq!(g.right_temp, 2618);
++        assert_eq!(g.heatsink_temp, 2500);
++        assert_eq!(g.unknown_temp, 0x0992);
++    }
++
++    #[test]
++    fn captured_fixture_2_decodes() {
++        let g = decode_get_temperature_14byte(&FIXTURE_2).expect("fixture 2 must decode");
++        assert_eq!(g.left_temp, 0x0A60);
++        assert_eq!(g.right_temp, 0x0A41);
++        assert_eq!(g.heatsink_temp, 0x09C4);
++    }
++
++    #[test]
++    fn captured_fixture_3_decodes() {
++        let g = decode_get_temperature_14byte(&FIXTURE_3).expect("fixture 3 must decode");
++        assert_eq!(g.left_temp, 0x0A66);
++        assert_eq!(g.right_temp, 0x0A47);
++        assert_eq!(g.heatsink_temp, 0x09C4);
++    }
++
++    #[test]
++    fn legacy_27_byte_payload_is_never_touched_by_the_14_byte_decoder() {
++        // The original upstream doc-comment example, zero-padded out to 27 bytes -- this decoder
++        // must reject it (wrong length), leaving it entirely to the unmodified upstream parser.
++        let mut payload = hex!("C1 00 01 0A 15 02 0A 0F 03 07 F5 04 09 3A").to_vec();
++        payload.resize(27, 0);
++        assert_eq!(decode_get_temperature_14byte(&payload), None);
++    }
++
++    #[test]
++    fn wrong_opcode_is_rejected() {
++        let mut payload = FIXTURE_1;
++        payload[0] = 0x41;
++        assert_eq!(decode_get_temperature_14byte(&payload), None);
++    }
++
++    #[test]
++    fn reordered_tags_are_rejected() {
++        // Swap tag 1 and tag 2's marker bytes (positions 2 and 5) -- values would otherwise decode
++        // to plausible-looking numbers if offsets were trusted without checking the tags.
++        let mut payload = FIXTURE_1;
++        payload.swap(2, 5);
++        assert_eq!(decode_get_temperature_14byte(&payload), None);
++    }
++
++    #[test]
++    fn wrong_reserved_marker_is_rejected() {
++        let mut payload = FIXTURE_1;
++        payload[1] = 0x01; // should be 0
++        assert_eq!(decode_get_temperature_14byte(&payload), None);
++    }
++
++    #[test]
++    fn truncated_payload_is_rejected() {
++        assert_eq!(decode_get_temperature_14byte(&FIXTURE_1[..10]), None);
++    }
++
++    fn frame(payload: Vec<u8>) -> Vec<u8> {
++        opensleep::common::codec::command(payload)
++    }
++
++    #[test]
++    fn scanner_recovers_a_14_byte_get_temperature_frame_from_raw_bytes() {
++        let mut scanner = CompatFrameScanner::new();
++        scanner.feed(&frame(FIXTURE_1.to_vec()));
++        let frames = scanner.drain_frames();
++        assert_eq!(frames.len(), 1);
++        assert_eq!(frames[0].opcode, GET_TEMPERATURE_OPCODE);
++        let g = decode_get_temperature_14byte(&frames[0].payload).expect("must decode");
++        assert_eq!(g.left_temp, 2650);
++    }
++
++    #[test]
++    fn scanner_handles_bytes_arriving_split_across_multiple_feeds() {
++        let bytes = frame(FIXTURE_1.to_vec());
++        let (a, b) = bytes.split_at(3);
++        let mut scanner = CompatFrameScanner::new();
++        scanner.feed(a);
++        assert!(scanner.drain_frames().is_empty());
++        scanner.feed(b);
++        let frames = scanner.drain_frames();
++        assert_eq!(frames.len(), 1);
++    }
++
++    #[test]
++    fn scanner_reports_other_opcodes_without_interpreting_them() {
++        let mut scanner = CompatFrameScanner::new();
++        scanner.feed(&frame(vec![0x54, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]));
++        let frames = scanner.drain_frames();
++        assert_eq!(frames.len(), 1);
++        assert_eq!(frames[0].opcode, 0x54);
++        assert_eq!(frames[0].payload.len(), 9);
++    }
++
++    #[test]
++    fn scanner_skips_a_bad_checksum_and_still_finds_the_next_good_frame() {
++        let mut bytes = frame(FIXTURE_1.to_vec());
++        let bad_checksum_pos = bytes.len() - 1;
++        bytes[bad_checksum_pos] ^= 0xFF; // corrupt the frame's checksum
++        bytes.extend_from_slice(&frame(FIXTURE_2.to_vec()));
++
++        let mut scanner = CompatFrameScanner::new();
++        scanner.feed(&bytes);
++        let frames = scanner.drain_frames();
++        assert_eq!(frames.len(), 1);
++        let g = decode_get_temperature_14byte(&frames[0].payload).expect("must decode");
++        assert_eq!(g.left_temp, 0x0A60); // fixture 2, not fixture 1
++    }
++
++    #[test]
++    fn scanner_finds_multiple_frames_fed_at_once() {
++        let mut bytes = frame(FIXTURE_1.to_vec());
++        bytes.extend_from_slice(&frame(FIXTURE_2.to_vec()));
++        bytes.extend_from_slice(&frame(FIXTURE_3.to_vec()));
++
++        let mut scanner = CompatFrameScanner::new();
++        scanner.feed(&bytes);
++        let frames = scanner.drain_frames();
++        assert_eq!(frames.len(), 3);
 +    }
 +}
 diff --git a/src/bin/opensleep-diagnostic/frozen_ops.rs b/src/bin/opensleep-diagnostic/frozen_ops.rs
@@ -3935,10 +4849,10 @@ index 0000000..c9c0db5
 +}
 diff --git a/src/bin/opensleep-diagnostic/io_logging.rs b/src/bin/opensleep-diagnostic/io_logging.rs
 new file mode 100644
-index 0000000..98c8b76
+index 0000000..ba0a190
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/io_logging.rs
-@@ -0,0 +1,146 @@
+@@ -0,0 +1,192 @@
 +//! Transparent `AsyncRead + AsyncWrite` wrapper that logs every raw byte chunk that crosses it,
 +//! so raw TX/RX frames can be logged in hex without touching the shared `PacketCodec` (which is
 +//! also used, unmodified, by normal OpenSleep).
@@ -3995,6 +4909,27 @@ index 0000000..98c8b76
 +        self.raw_log_enabled = enabled;
 +        self
 +    }
++}
++
++/// Every event appended to `capture` since `*checkpoint`, which is then advanced to the capture's
++/// current length -- same checkpoint/since shape as `log_tap`'s, but scoped to one capture handle
++/// (a `FrozenLink`'s capture is per-instance, not process-global). Used by `cool_test.rs`'s
++/// baseline loop to feed only newly-arrived raw bytes to `frozen_compat::CompatFrameScanner` each
++/// tick, rather than rescanning everything captured since the link was opened.
++pub fn events_since(capture: &RawIoCapture, checkpoint: &mut usize) -> Vec<RawIoEvent> {
++    let Ok(log) = capture.lock() else { return Vec::new() };
++    let start = (*checkpoint).min(log.len());
++    let result = log[start..].to_vec();
++    *checkpoint = log.len();
++    result
++}
++
++/// Parses a space-separated uppercase-hex string (`RawIoEvent::hex`'s own format, produced by
++/// `record` below) back into bytes. `None` only if the text itself is malformed -- should never
++/// happen for a string this same module produced, but this is shared, `Mutex`-guarded state read
++/// from a different call site than the one that wrote it, so it is not simply unwrapped.
++pub fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
++    hex.split_whitespace().map(|tok| u8::from_str_radix(tok, 16).ok()).collect()
 +}
 +
 +fn record(capture: &Option<RawIoCapture>, direction: &'static str, data: &[u8]) {
@@ -4084,13 +5019,38 @@ index 0000000..98c8b76
 +        assert_eq!(capture.lock().unwrap().len(), 1);
 +        assert_eq!(capture.lock().unwrap()[0].hex, "AB CD");
 +    }
++
++    #[test]
++    fn hex_to_bytes_round_trips_records_own_format() {
++        assert_eq!(hex_to_bytes("AB CD 00 FF"), Some(vec![0xAB, 0xCD, 0x00, 0xFF]));
++        assert_eq!(hex_to_bytes(""), Some(vec![]));
++        assert_eq!(hex_to_bytes("ZZ"), None);
++    }
++
++    #[test]
++    fn events_since_only_returns_new_events_and_advances_the_checkpoint() {
++        let capture: RawIoCapture = Arc::new(Mutex::new(Vec::new()));
++        record(&Some(capture.clone()), "rx", &[0x01]);
++        let mut checkpoint = 0;
++        let first = events_since(&capture, &mut checkpoint);
++        assert_eq!(first.len(), 1);
++        assert_eq!(checkpoint, 1);
++
++        assert!(events_since(&capture, &mut checkpoint).is_empty());
++
++        record(&Some(capture.clone()), "rx", &[0x02]);
++        record(&Some(capture.clone()), "tx", &[0x03]);
++        let second = events_since(&capture, &mut checkpoint);
++        assert_eq!(second.len(), 2);
++        assert_eq!(checkpoint, 3);
++    }
 +}
 diff --git a/src/bin/opensleep-diagnostic/link.rs b/src/bin/opensleep-diagnostic/link.rs
 new file mode 100644
-index 0000000..d3d4683
+index 0000000..b78aeba
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/link.rs
-@@ -0,0 +1,345 @@
+@@ -0,0 +1,376 @@
 +//! Frozen UART transport: every send goes through [`AuditedTransport::check`] first, and the wire
 +//! framing itself is entirely `opensleep::common::codec::PacketCodec` / `FrozenPacket` -- nothing
 +//! here reimplements packet encoding or decoding. Generic over the underlying I/O so the exact
@@ -4169,6 +5129,18 @@ index 0000000..d3d4683
 +        log::info!("Frozen UART opened: {port} @ {BAUD} baud, 8N1, no flow control");
 +        Ok(Self::wrap_with_raw_log(raw, "Frozen", raw_log_enabled))
 +    }
++
++    /// Same as [`Self::open_with_raw_log`], but also retains every raw RX/TX byte chunk in
++    /// `capture` -- see [`Self::wrap_capturing_with_raw_log`].
++    pub fn open_capturing_with_raw_log(
++        port: &str,
++        capture: crate::io_logging::RawIoCapture,
++        raw_log_enabled: bool,
++    ) -> Result<Self, opensleep::common::serial::SerialError> {
++        let raw = create_port(port, BAUD)?;
++        log::info!("Frozen UART opened: {port} @ {BAUD} baud, 8N1, no flow control");
++        Ok(Self::wrap_capturing_with_raw_log(raw, "Frozen", capture, raw_log_enabled))
++    }
 +}
 +
 +impl<T: AsyncRead + AsyncWrite + Unpin> FrozenLink<T> {
@@ -4192,6 +5164,25 @@ index 0000000..d3d4683
 +    pub fn wrap_capturing(inner: T, label: &'static str, capture: crate::io_logging::RawIoCapture) -> Self {
 +        Self {
 +            framed: Framed::new(LoggingIo::with_capture(inner, label, capture), PacketCodec::new()),
++        }
++    }
++
++    /// Same as [`Self::wrap_capturing`], but also lets the caller opt into raw RX/TX debug log
++    /// lines (see `io_logging.rs` module docs) -- used by `frozen-cool-test`, which needs both:
++    /// capture to feed `frozen_compat::CompatFrameScanner`, and the existing `--raw-serial-log`
++    /// gate for the printed debug lines. The two are independent (`LoggingIo`'s own doc comment),
++    /// so this is just the one constructor that composes both builder calls.
++    pub fn wrap_capturing_with_raw_log(
++        inner: T,
++        label: &'static str,
++        capture: crate::io_logging::RawIoCapture,
++        raw_log_enabled: bool,
++    ) -> Self {
++        Self {
++            framed: Framed::new(
++                LoggingIo::with_capture(inner, label, capture).with_raw_log_enabled(raw_log_enabled),
++                PacketCodec::new(),
++            ),
 +        }
 +    }
 +
@@ -4623,10 +5614,10 @@ index 0000000..216770e
 +}
 diff --git a/src/bin/opensleep-diagnostic/main.rs b/src/bin/opensleep-diagnostic/main.rs
 new file mode 100644
-index 0000000..7152f44
+index 0000000..10b2951
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/main.rs
-@@ -0,0 +1,307 @@
+@@ -0,0 +1,309 @@
 +//! opensleep-diagnostic: a staged, Frozen-only hardware diagnostic for an Eight Sleep Pod 3 Hub.
 +//!
 +//! Five subcommands, each with its own fixed command whitelist (see `safety.rs`):
@@ -4652,9 +5643,11 @@ index 0000000..7152f44
 +
 +mod buildinfo;
 +mod cli;
++mod compat_counters;
 +mod confirm;
 +mod cool_test;
 +mod emergency_stop;
++mod frozen_compat;
 +mod frozen_ops;
 +mod frozen_startup;
 +mod i2c;
@@ -8689,10 +9682,10 @@ index 0000000..e668cde
 +}
 diff --git a/src/bin/opensleep-diagnostic/report.rs b/src/bin/opensleep-diagnostic/report.rs
 new file mode 100644
-index 0000000..77fff01
+index 0000000..b46765b
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/report.rs
-@@ -0,0 +1,747 @@
+@@ -0,0 +1,785 @@
 +//! Structured JSON/CSV/text reporting shared by all three subcommands. Machine evidence (audit
 +//! log, decoded telemetry) is always kept in separate fields from operator-entered observations,
 +//! per the safety model: a component may only be marked PASS from decoded evidence or an explicit
@@ -8797,6 +9790,7 @@ index 0000000..77fff01
 +            source: match s.source {
 +                SampleSource::Solicited => "solicited",
 +                SampleSource::Unsolicited => "unsolicited",
++                SampleSource::SolicitedCompat14Byte => "solicited_compat_14byte",
 +            },
 +            left_water_c: s.left_water_c,
 +            right_water_c: s.right_water_c,
@@ -9049,6 +10043,43 @@ index 0000000..77fff01
 +    pub baseline_left_c: Option<f64>,
 +    pub baseline_right_c: Option<f64>,
 +    pub baseline_heatsink_c: Option<f64>,
++    /// The configured minimum sample count (`cool_test::BASELINE_MIN_SAMPLES`) baseline collection
++    /// was run against -- reported explicitly so a JSON/CSV consumer doesn't need the binary's own
++    /// source to know what threshold `baseline_synchronous_samples_decoded +
++    /// baseline_unsolicited_samples_decoded` was measured against.
++    pub baseline_samples_requested: usize,
++    /// Valid, deduplicated baseline samples decoded from a solicited `GetTemperature` reply --
++    /// either the original 27-byte reply (unmodified upstream parser) or this firmware's 14-byte
++    /// reply (`frozen_compat::decode_get_temperature_14byte`). See `telemetry::SampleSource`.
++    pub baseline_synchronous_samples_decoded: usize,
++    /// Valid, deduplicated baseline samples decoded from an unsolicited `TemperatureUpdate` push.
++    pub baseline_unsolicited_samples_decoded: usize,
++    /// Samples discarded because they had the exact same (left, right, heatsink) reading as
++    /// another sample already collected in the same ~1s baseline tick -- see
++    /// `cool_test::is_duplicate_within_tick`.
++    pub baseline_duplicate_samples_discarded: usize,
++    /// Samples discarded because the selected-side or heatsink reading was a sentinel value or
++    /// outside the plausible water-temperature range -- see `cool_test::is_valid_baseline_reading`.
++    /// Never incremented merely because a reply's protocol format wasn't recognized: both the
++    /// 27-byte and 14-byte `GetTemperature` shapes are decoded before this check ever runs.
++    pub baseline_invalid_samples_discarded: usize,
++    pub baseline_collection_duration_seconds: f64,
++    /// Max - min, in Celsius, of the selected side's raw baseline readings.
++    pub baseline_left_range_c: Option<f64>,
++    /// Max - min, in Celsius, of the non-selected side's raw baseline readings.
++    pub baseline_right_range_c: Option<f64>,
++    /// Max - min, in Celsius, of the heatsink's raw baseline readings.
++    pub baseline_heatsink_range_c: Option<f64>,
++    /// Count of `GetTemperature` (opcode `0xC1`) replies recovered from raw captured bytes as the
++    /// firmware-specific 14-byte shape during baseline collection -- see `frozen_compat.rs`.
++    pub compat_get_temperature_14byte_frames: u64,
++    /// Count of heartbeat-opcode (`0x53`) frames observed with the firmware-specific 9-byte
++    /// payload (the original upstream parser expects exactly 3) during baseline collection.
++    pub compat_heartbeat_9byte_frames: u64,
++    /// Count of unrecognized opcode `0x54` frames observed during baseline collection.
++    pub compat_opcode_0x54_frames: u64,
++    /// Count of unrecognized opcode `0x55` frames observed during baseline collection.
++    pub compat_opcode_0x55_frames: u64,
 +    pub minimum_left_c: Option<f64>,
 +    pub minimum_right_c: Option<f64>,
 +    pub final_left_c: Option<f64>,
@@ -10508,10 +11539,10 @@ index 0000000..9e5db3b
 +}
 diff --git a/src/bin/opensleep-diagnostic/telemetry.rs b/src/bin/opensleep-diagnostic/telemetry.rs
 new file mode 100644
-index 0000000..ff1238e
+index 0000000..a9bac3e
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/telemetry.rs
-@@ -0,0 +1,160 @@
+@@ -0,0 +1,179 @@
 +//! Telemetry decoding and unit conversion for `FrozenPacket`.
 +//!
 +//! Unit evidence: `frozen/packet.rs` documents `FrozenTarget::temp`, `TemperatureUpdate`'s three
@@ -10553,11 +11584,20 @@ index 0000000..ff1238e
 +
 +#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 +pub enum SampleSource {
-+    /// Response to our own `GetTemperatures` command (opcode 0x41 -> reply 0xC1).
++    /// Response to our own `GetTemperatures` command (opcode 0x41 -> reply 0xC1), decoded by the
++    /// unmodified upstream `FrozenPacket::parse_get_temperature` (the original, fully-padded
++    /// 27-byte reply).
 +    Solicited,
 +    /// `FrozenPacket::TemperatureUpdate`, opcode 0x41 seen directly (not as a `+0x80` reply to
 +    /// anything we sent) -- Frozen pushing telemetry on its own schedule.
 +    Unsolicited,
++    /// Same command/reply pairing as [`Self::Solicited`], but decoded by this binary's own
++    /// `frozen_compat::decode_get_temperature_14byte` from raw captured bytes, because the reply
++    /// was the firmware-specific 14-byte shape the unmodified upstream parser rejects outright.
++    /// See `frozen_compat.rs` module docs for why this exists as a separate source rather than
++    /// being folded into `Solicited`: it went through a different, diagnostic-local decode path,
++    /// and that provenance is worth keeping visible in the report.
++    SolicitedCompat14Byte,
 +}
 +
 +pub fn sample_from_get_temperature(elapsed_ms: u64, timestamp: String, g: &GetTemperature) -> TemperatureSample {
@@ -10572,6 +11612,16 @@ index 0000000..ff1238e
 +        raw_left: Some(g.left_temp),
 +        raw_right: Some(g.right_temp),
 +        raw_heatsink: Some(g.heatsink_temp),
++    }
++}
++
++/// Same field mapping as [`sample_from_get_temperature`], but tagged [`SampleSource::SolicitedCompat14Byte`]
++/// for a reply decoded by `frozen_compat::decode_get_temperature_14byte` instead of the unmodified
++/// upstream parser -- see that variant's doc comment.
++pub fn sample_from_get_temperature_compat14(elapsed_ms: u64, timestamp: String, g: &GetTemperature) -> TemperatureSample {
++    TemperatureSample {
++        source: SampleSource::SolicitedCompat14Byte,
++        ..sample_from_get_temperature(elapsed_ms, timestamp, g)
 +    }
 +}
 +
