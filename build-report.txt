@@ -444,10 +444,14 @@ Tests:       cargo test --locked (run under the image's built-in QEMU test runne
 Test results (this build, inside the builder image)
 -----------------------------------------------------
 opensleep (lib) unit tests:               51 passed, 0 failed
-opensleep-diagnostic (bin) unit tests:    166 passed, 0 failed
+opensleep-diagnostic (bin) unit tests:    186 passed, 0 failed
 Doc-tests:                                 0 (none defined)
 
-This revision's build succeeded on the first attempt.
+This revision's build succeeded on the first attempt. The bin test suite took noticeably longer
+under the builder image's QEMU aarch64 runner than prior revisions (68.45s vs ~44s for revision 11)
+-- expected, since frozen-cool-test's own preflight now collects baseline samples over >=10 seconds
+per test (up from >=5s), and its test count grew accordingly; still comfortably within the build's
+normal time budget.
 
 See TEST_RESULTS.md for the full breakdown against the safety spec's checklists (30-item for the
 original redesign, 28-item for frozen-prime-test), plus the "New tests added" sections for each
@@ -459,20 +463,22 @@ file:      dist/opensleep-diagnostic-aarch64-static: ELF 64-bit LSB executable, 
            version 1 (SYSV), statically linked, stripped
 readelf -l: 6 program headers (LOAD x2, TLS, GNU_EH_FRAME, GNU_STACK, GNU_RELRO); no
            PT_INTERP segment -- confirms no dynamic program interpreter, i.e. truly static.
-sha256sum: 55537f0dd45a531b4651e5ec8bf0d07c7cd63bc5c5bcb04d52bb682ff21a5caf  opensleep-diagnostic-aarch64-static
-           (2,495,752 bytes)
+sha256sum: e33acc145a6aa8f7343742dc9208fa8875f3fab7bcfccbf066ee07a867fc607f  opensleep-diagnostic-aarch64-static
+           (2,561,320 bytes)
            Verified against the .sha256 file written by the same build: OK
 Smoke test: qemu-aarch64-static (user-mode emulation) was used to actually run the built ARM64
-           binary on the x86-64 build host: `--help` and `frozen-prime-opensleep-init --help`
-           (confirms `--release-frozen-only`'s help text correctly describes configuring register
-           0x06 before pulsing register 0x02); `frozen-prime-opensleep-init --release-frozen-only
-           --dry-run` with `--json-output` ran end to end against the mocked I2C expander and the
-           proactive mock Frozen device, through the full three-write pulse (register 0x02
-           asserted 0xFF, register 0x06 configured 0xFF -> 0xFD with `bit1_was_already_configured_
-           as_output: false`, register 0x02 released to 0xFD, every readback verified, pulse
-           duration ~102ms), the 2-second boot-message wait, Ping/Pong(true), `Prime`, and
-           `"[priming] done"`, with `exit_code: 0` and every `release_frozen_only_results` JSON
-           field checked by hand against expected values, including the new register-0x06 fields.
+           binary on the x86-64 build host: top-level `--help` and `frozen-cool-test --help`
+           (confirms `--duration-seconds` defaults to 120/caps at 300, and `--raw-serial-log` is
+           present); `frozen-cool-test --side left --dry-run --duration-seconds 3` ran end to end
+           against the mocked I2C expander and mock Frozen device, through the exact same
+           three-write narrow pulse `--release-frozen-only` uses (register 0x02 asserted 0xFF,
+           register 0x06 configured 0xFF -> 0xFD with "bit 1 ... previously configured as: input",
+           register 0x02 released to 0xFD, pulse duration ~103ms -- confirmed byte-for-byte
+           identical to `--release-frozen-only`'s own log output), producing a full
+           `cool_test_results` block (`Shutdown verified: true`, `Emergency reset asserted: false`
+           for the normal `DurationExpired` stop, confirming no I2C write occurred on a clean
+           finish) and a written JSON report. `--raw-serial-log` was verified directly: 0 raw
+           RX/TX log lines with the flag absent, 50 with it present, on otherwise-identical runs.
            No regressions observed in the other subcommands (unchanged by this revision).
 
            KNOWN COSMETIC GAP (carried over from revision 8, not a correctness issue): in plain
