@@ -393,13 +393,10 @@ Tests:       cargo test --locked (run under the image's built-in QEMU test runne
 Test results (this build, inside the builder image)
 -----------------------------------------------------
 opensleep (lib) unit tests:               51 passed, 0 failed
-opensleep-diagnostic (bin) unit tests:    162 passed, 0 failed
+opensleep-diagnostic (bin) unit tests:    166 passed, 0 failed
 Doc-tests:                                 0 (none defined)
 
-This revision required two build attempts: the first succeeded and passed all tests, but its
-smoke test surfaced stale --help text and doc comments left over from the release_frozen_reset_bit_only
--> pulse_frozen_reset_bit rename (cosmetic only, not a test failure); fixed and rebuilt. The numbers
-below are from the second, corrected build.
+This revision's build succeeded on the first attempt.
 
 See TEST_RESULTS.md for the full breakdown against the safety spec's checklists (30-item for the
 original redesign, 28-item for frozen-prime-test), plus the "New tests added" sections for each
@@ -411,23 +408,21 @@ file:      dist/opensleep-diagnostic-aarch64-static: ELF 64-bit LSB executable, 
            version 1 (SYSV), statically linked, stripped
 readelf -l: 6 program headers (LOAD x2, TLS, GNU_EH_FRAME, GNU_STACK, GNU_RELRO); no
            PT_INTERP segment -- confirms no dynamic program interpreter, i.e. truly static.
-sha256sum: 53b171764b2ed3e88a2566fcbded725199959b30b9137694aaf22708236c397c  opensleep-diagnostic-aarch64-static
+sha256sum: 55537f0dd45a531b4651e5ec8bf0d07c7cd63bc5c5bcb04d52bb682ff21a5caf  opensleep-diagnostic-aarch64-static
            (2,495,752 bytes)
            Verified against the .sha256 file written by the same build: OK
 Smoke test: qemu-aarch64-static (user-mode emulation) was used to actually run the built ARM64
            binary on the x86-64 build host: `--help` and `frozen-prime-opensleep-init --help`
-           (confirms `--release-frozen-only` is present and its help text correctly describes the
-           pulse, not the old one-shot clear); `frozen-prime-opensleep-init --release-frozen-only
+           (confirms `--release-frozen-only`'s help text correctly describes configuring register
+           0x06 before pulsing register 0x02); `frozen-prime-opensleep-init --release-frozen-only
            --dry-run` with `--json-output` ran end to end against the mocked I2C expander and the
-           proactive mock Frozen device, through the full pulse (`0xFF -> assert 0xFF -> release
-           0xFD`, both readbacks verified, pulse duration ~102ms), the 2-second boot-message wait,
-           Ping/Pong(true), `Prime`, and `"[priming] done"`, with `exit_code: 0` and every
-           `release_frozen_only_results` JSON field checked by hand against expected values
-           (including the new `asserted_*`/`released_*`/`pulse_duration_ms`/`reservoir_status`
-           fields); the reservoir-phrase-mismatch refusal path was also exercised and correctly
-           returned `exit_code: 30`, `prime_sent: false`, and `reservoir_status: "failed by
-           operator observation"` in the printed summary. No regressions observed in the other
-           subcommands (unchanged by this revision).
+           proactive mock Frozen device, through the full three-write pulse (register 0x02
+           asserted 0xFF, register 0x06 configured 0xFF -> 0xFD with `bit1_was_already_configured_
+           as_output: false`, register 0x02 released to 0xFD, every readback verified, pulse
+           duration ~102ms), the 2-second boot-message wait, Ping/Pong(true), `Prime`, and
+           `"[priming] done"`, with `exit_code: 0` and every `release_frozen_only_results` JSON
+           field checked by hand against expected values, including the new register-0x06 fields.
+           No regressions observed in the other subcommands (unchanged by this revision).
 
            KNOWN COSMETIC GAP (carried over from revision 8, not a correctness issue): in plain
            `frozen-prime-opensleep-init --dry-run`'s JSON output (without `--release-frozen-only`),
