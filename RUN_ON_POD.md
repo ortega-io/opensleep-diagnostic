@@ -299,10 +299,14 @@ Add `--release-frozen-only` to `frozen-prime-opensleep-init` when you specifical
 Frozen from reset **without** running the full upstream I2C reset sequence and **without** the
 earlier `--preserve-boot-state` flag (removed; this flag replaces it). Real hardware evidence: the
 full reset does release Frozen, but it also reconfigures I2C expander registers `0x06`/`0x07` and
-leaves the reservoir-fill indicator off and unresponsive afterward. This mode instead flips only
-bit 1 of register `0x02` (`released = original & !0x02`), verifies the readback, and never touches
-`0x06`/`0x07` at all. **Read the `--release-frozen-only` section of SAFETY.md before using this —
-it is a third, narrower safety model, not a relaxed one.**
+leaves the reservoir-fill indicator off and unresponsive afterward. This mode instead **pulses**
+only bit 1 of register `0x02` — writes `asserted = original | 0x02`, verifies the readback, waits
+100ms, then writes `released = asserted & !0x02` and verifies that readback too — and never touches
+`0x06`/`0x07` at all. The pulse matters: a one-shot clear (no preceding assert) was tried first and
+failed on real hardware, because register `0x02` was already reading `0xFD` (bit 1 already low), so
+clearing it again was a no-op with no edge and Frozen never responded. **Read the
+`--release-frozen-only` section of SAFETY.md before using this — it is a third, narrower safety
+model, not a relaxed one.**
 
 ```sh
 /persistent/tools/opensleep-diagnostic frozen-prime-opensleep-init \
@@ -316,21 +320,26 @@ it is a third, narrower safety model, not a relaxed one.**
     --verbose
 ```
 
-You'll be prompted for the same two typed phrases as plain `frozen-prime-opensleep-init`, and then
-— immediately before `Prime` is sent, once Frozen has reached application firmware and startup
-messages have been observed — a **third** phrase:
+You'll be prompted for the same two typed phrases as plain `frozen-prime-opensleep-init`. After the
+I2C pulse, this mode waits up to 2 seconds for boot messages, then Pings repeatedly for up to 10
+more seconds; if Frozen never answers, the run aborts without ever sending `Prime`. Once Frozen has
+reached application firmware, and immediately before `Prime` is sent, you'll be asked for a
+**third** phrase:
 
 ```
 Type RESERVOIR INDICATOR IS STILL WORKING to continue:
 ```
 
 Only type this if the reservoir-fill indicator is genuinely still responding after Frozen was
-released. This mode's own report includes a
-`reservoir_sensor_operational_after_release` field recording what was actually observed.
+released. This mode's own report includes a `reservoir_status` field recording the outcome
+explicitly: `confirmed` (you typed the exact phrase), `failed_by_operator_observation` (you were
+asked and did not), or `unverified` (the run aborted before ever asking — never reported as a false
+negative just because the confirmation was never reached).
 
-* On normal completion (`"done"` or `"done because empty"`), this mode performs **no I2C write at
-  all** on exit — it does not restore register `0x02` and does not run any reset. Frozen is left
-  released and running. If priming does not visibly stop, reboot the Hub or disconnect Hub power.
+* On normal completion, `"done because empty"`, or a preflight failure once Frozen has answered,
+  this mode performs **no I2C write at all** on exit — it does not restore register `0x02` and does
+  not run any reset. Frozen is left released and running. If priming does not visibly stop, reboot
+  the Hub or disconnect Hub power.
 * The only exception is a genuine firmware-reported pump fault, which re-asserts bit 1 of register
   `0x02` only (never the full four-register reset, never `0x06`/`0x07`).
 * Unlike plain `frozen-prime-opensleep-init --dry-run` above, `--release-frozen-only --dry-run`
@@ -347,13 +356,16 @@ released. This mode's own report includes a
 * The printed/JSON summary reports its own result block instead of `opensleep_init_results`:
 
   ```
-  Register 0x02: original=0b11111111 released=0b11111101 changed_mask=0b00000010 readback=0b11111101
-  Readback matches / only bit 1 changed: true/true
+  Register 0x02 original:          0b11111111
+  Asserted: target=0b11111111 readback=0b11111111 matches=true
+  Released: target=0b11111101 readback=0b11111101 matches=true
+  Only bit 1 changed (both halves): true
+  Pulse duration:                  100 ms
   Frozen UART opened:              true/false
   Frozen reached firmware:         true/false
   [capwater] unavailable observed: true/false
   [flowrate] unavailable observed: true/false
-  Reservoir sensor operational after release: true/false
+  Reservoir status:                confirmed / failed_by_operator_observation / unverified
   Prime outcome:                   success / incomplete (done because empty) / not observed within window / not sent
   Prime sent:                      true/false
   Normal done observed:            true/false

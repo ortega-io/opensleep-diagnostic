@@ -118,38 +118,51 @@ Frozen doesn't answer `Ping`; running the full reset sequence *does* release Fro
 `Ping` afterward), but it also turns the reservoir indicator off and leaves it unresponsive —
 firmware then reports `[fdc1004] failed to write config` and `[capwater] sensor unavailable`. The
 full reset sequence writes four I2C registers on the `0x20` expander (`0x06`, `0x07`, then `0x02`
-twice); tracing which single write actually releases Frozen showed it is the *last* one, which
-changes register `0x02` from `0xFF` to `0xFD` — clearing bit 1 and nothing else. Registers `0x06`
-and `0x07` (port direction/config) are never involved in releasing Frozen at all; changing them is
-suspected to be what disturbs the reservoir indicator.
+twice); tracing which writes actually release Frozen showed it is the *last two* — `0x02` written
+first to `0xFF` (bit 1 high) and then to `0xFD` (bit 1 low) — a low→high→low **pulse**, not a
+one-shot clear. Registers `0x06` and `0x07` (port direction/config) are never involved in releasing
+Frozen at all; changing them is suspected to be what disturbs the reservoir indicator.
+
+**A one-shot clear is not sufficient.** An earlier revision of this mode only cleared bit 1
+(`released = original & !0x02`) without first asserting it. A live run found register `0x02`
+already reading `0xFD` (bit 1 already low) at that point, so the clear was a no-op with no edge on
+the pin, and Frozen never responded. Release is a *transition*, not a *level* — this mode always
+asserts before releasing, regardless of what bit 1 already reads as.
 
 **What this mode does, in order:**
 
 1. Opens `/dev/i2c-1` and reads the PCAL6416A (`0x20`) register `0x02` — never registers `0x06` or
    `0x07`, and never `opensleep::reset::ResetController`.
-2. Computes `released = original & !0x02` (clears bit 1, preserves every other bit exactly as
-   read) and writes it back, then reads register `0x02` again to verify. Original, released,
-   changed-bit mask, and the readback are all logged. **If the readback doesn't match what was
-   written, or if any bit other than bit 1 differs from the original, the run aborts before ever
-   touching the Frozen UART.**
-3. After a brief settle, opens Frozen on `/dev/ttyS1` at 38400 baud and sends `Ping`. `Pong(false)`
-   (bootloader) is followed by `JumpToFirmware` and re-Pinging until `Pong(true)`; `Pong(true)`
-   directly means firmware was already running. If Frozen never reaches firmware, the run aborts.
-4. Observes startup messages for a few seconds. **If `[capwater] sensor unavailable` is observed,
-   `Prime` is never sent** — same rule as the mode above, and the report's
-   `reservoir_sensor_operational_after_release` field records whether the indicator this mode
-   exists to protect actually stayed working.
+2. Computes `asserted = original | 0x02` and `released = asserted & !0x02` — both derived from what
+   was actually read, never a hardcoded constant — and verifies mathematically, before either write
+   is issued, that neither can change any bit other than bit 1 (this can never actually fail by
+   construction, but is asserted, not merely assumed).
+3. Writes `asserted` to register `0x02`, reads it back to verify, waits 100ms, then writes
+   `released` and reads it back to verify. Original, asserted, the asserted readback, released, the
+   released readback, both changed-bit masks, and the pulse duration are all logged. **If either
+   readback doesn't match what was written, or if any bit other than bit 1 ever changed, the run
+   aborts before ever touching the Frozen UART.**
+4. Waits up to 2 seconds, draining and logging any unsolicited boot messages Frozen sends, then
+   Pings repeatedly for up to 10 more seconds. `Pong(false)` (bootloader) is followed by
+   `JumpToFirmware`, then re-Pinging — tolerating any interleaved startup messages in between,
+   rather than failing on the first non-`Pong` packet — until `Pong(true)`; `Pong(true)` directly
+   means firmware was already running. **If Frozen never answers at all, the run aborts without
+   ever sending `Prime`** — this is not treated as a fault and does not trigger an emergency reset
+   (see below): Frozen is simply left released, in case it is merely slow to respond.
 5. Requires typing `RESERVOIR INDICATOR IS STILL WORKING` — a **third** confirmation phrase,
-   distinct from the two `frozen-prime-opensleep-init` already requires, asked immediately before
-   `Prime` (not at the start of the run) — before sending `Prime`.
+   distinct from the two `frozen-prime-opensleep-init` already requires — but only once Frozen has
+   reached application firmware, immediately before `Prime`. The report's `reservoir_status` field
+   records the outcome explicitly as one of `confirmed`, `failed_by_operator_observation` (the
+   phrase was asked and not matched), or `unverified` (the run aborted before ever asking) — it is
+   never reported as a false negative merely because the confirmation was never reached.
 6. Sends `Prime` exactly once, through this binary's own audited `FrozenLink`/`AuditedTransport`
    (`Mode::PrimeTest` — the same runtime mode `frozen-prime-test` uses, not the real upstream
    scheduler this file's `frozen-prime-opensleep-init` section above uses). Distinguishes
    `"[priming] done"` from `"[priming] done because empty"` exactly as every other priming mode
    does, over the firmware's up-to-600000ms observation window.
-7. **On normal completion (or "done because empty"), performs no I2C write at all** — it does not
-   restore register `0x02`, does not re-run any reset, and does not touch the port in any way.
-   Frozen is left released and running.
+7. **On normal completion, "done because empty", or a preflight failure once Frozen has answered,
+   performs no I2C write at all** — it does not restore register `0x02`, does not re-run any reset,
+   and does not touch the port in any way. Frozen is left released and running.
 8. **The only exception:** a genuine firmware-reported pump fault re-asserts *only* bit 1 of
    register `0x02` via another narrow read-modify-write (`asserted = current | 0x02`, preserving
    every other bit) — never the four-register full reset, and never registers `0x06`/`0x07`.
@@ -159,9 +172,9 @@ Because this mode uses this binary's own `AuditedTransport` (unlike the rest of
 still reachable at most once per run, enforced at the transport layer exactly as in
 `frozen-prime-test`. Everything else about the section above still applies unless contradicted
 here: the same five `--confirm-*` flags and the same two typed confirmation phrases are required
-first (this mode's own reservoir phrase is a fourth check, on top of those, not a replacement for
-them); the firmware priming window and the exact-match done/done-because-empty distinction are
-unchanged.
+first (this mode's own reservoir phrase is a fourth check, asked later and separately, not a
+replacement for them); the firmware priming window and the exact-match done/done-because-empty
+distinction are unchanged.
 
 `--dry-run --release-frozen-only` *can* run end to end against a mocked I2C expander and a mocked
 Frozen device (unlike plain `frozen-prime-opensleep-init --dry-run`, which only validates

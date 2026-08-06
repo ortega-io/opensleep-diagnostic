@@ -2336,10 +2336,10 @@ index 0000000..666ce19
 +}
 diff --git a/src/bin/opensleep-diagnostic/i2c.rs b/src/bin/opensleep-diagnostic/i2c.rs
 new file mode 100644
-index 0000000..ed91c2e
+index 0000000..e5ded03
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/i2c.rs
-@@ -0,0 +1,503 @@
+@@ -0,0 +1,617 @@
 +//! I2C access, generic over an [`I2cPort`] trait so the exact same probe/reset code runs against
 +//! the real `/dev/i2c-1` bus, a scripted mock in tests, and the always-succeeding mock used by
 +//! `--dry-run`.
@@ -2349,7 +2349,7 @@ index 0000000..ed91c2e
 +//! `opensleep::reset::ResetController::reset_subsystems`, gated behind an explicit reset request;
 +//! (b) the single fixed "assert reset" write (`reg 0x02 <- 0xFF`) used by safe-stop and
 +//! `emergency-stop`; and (c) the narrow, read-modify-write single-bit operations used by
-+//! `frozen-prime-opensleep-init --release-frozen-only` ([`release_frozen_reset_bit_only`]/
++//! `frozen-prime-opensleep-init --release-frozen-only` ([`pulse_frozen_reset_bit`]/
 +//! [`assert_frozen_reset_bit_only`]), which only ever touch bit 1 of register 0x02 and never write
 +//! 0x06/0x07 at all. No other register, on `0x20` or any other address, is ever written.
 +
@@ -2369,8 +2369,13 @@ index 0000000..ed91c2e
 +/// Bit 1 of register 0x02 -- the Frozen reset bit. Real hardware evidence: this is the one bit
 +/// that must change to release Frozen from reset; changing the other output/config registers as
 +/// well (as the full reset sequence above does) breaks the filled-reservoir indicator, which lives
-+/// on the same expander. See [`release_frozen_reset_bit_only`]'s doc comment.
++/// on the same expander. See [`pulse_frozen_reset_bit`]'s doc comment.
 +pub const FROZEN_RESET_BIT: u8 = 0b0000_0010;
++/// How long to hold bit 1 asserted (high) during [`pulse_frozen_reset_bit`] before releasing it
++/// again. Real hardware evidence: a read that merely clears bit 1 from whatever it already reads as
++/// (e.g. already `0xFD`, already released) produces no edge and Frozen never responds -- the known
++/// working sequence is a low->high->low pulse, not a one-shot clear.
++pub const PULSE_SETTLE: Duration = Duration::from_millis(100);
 +
 +/// Abstraction over a register-addressed I2C device, so the reset-expander logic can run
 +/// unmodified against real hardware, `MockI2c`, or (for `--dry-run`) `MockI2c` configured to
@@ -2642,6 +2647,15 @@ index 0000000..ed91c2e
 +    log::info!("original register 0x02: 0b{original:08b} (0x{original:02X})");
 +    log::info!("{target_label} register 0x02: 0b{target:08b} (0x{target:02X})");
 +    log::info!("changed-bit mask: 0b{changed_mask:08b} (0x{changed_mask:02X})");
++    // Verified mathematically, before any write is issued: `target` is computed as either
++    // `original | FROZEN_RESET_BIT` or `original & !FROZEN_RESET_BIT`, both of which can only ever
++    // differ from `original` in bit 1 -- this can never actually fail, but is asserted (not merely
++    // logged) as a structural proof of that claim rather than an assumption.
++    assert_eq!(
++        changed_mask & !FROZEN_RESET_BIT,
++        0,
++        "computed target for register 0x02 would change a bit other than bit 1 (original=0b{original:08b} target=0b{target:08b})"
++    );
 +    dev.write_reg(RESET_EXPANDER_ADDR, REG_OUTPUT_PORT_0, target)?;
 +    let readback = dev.read_reg(RESET_EXPANDER_ADDR, REG_OUTPUT_PORT_0)?;
 +    log::info!("readback result: 0b{readback:08b} (0x{readback:02X})");
@@ -2655,20 +2669,57 @@ index 0000000..ed91c2e
 +    })
 +}
 +
-+/// Releases Frozen from reset by clearing *only* bit 1 of register 0x02, preserving every other
-+/// bit exactly as read -- never the four-register full reset sequence ([`run_reset_sequence`])
-+/// used elsewhere in this binary, and never `opensleep::reset::ResetController`. Real hardware
-+/// evidence: the full reset also reconfigures the port-direction registers (0x06/0x07), which
-+/// leaves the filled-reservoir indicator off and unresponsive even though it does release Frozen
-+/// (`[fdc1004] failed to write config` / `[capwater] sensor unavailable` were observed
-+/// afterward). This function never touches 0x06/0x07 at all, and writes register 0x02 itself only
-+/// once, with a value computed from what was actually read (`released = original & !0x02`), not a
-+/// hardcoded constant -- so any bits already set for reasons unrelated to Frozen's reset are left
-+/// untouched. Callers must check the returned result's `readback_matches`/`only_bit1_changed`
-+/// before proceeding, and must not treat a successful I2C transaction alone as sufficient
-+/// confirmation.
-+pub async fn release_frozen_reset_bit_only<P: I2cPort>(dev: &mut P) -> Result<Reg02ReadModifyWriteResult, I2cIoError> {
-+    read_modify_write_reg02(dev, |original| original & !FROZEN_RESET_BIT, "released").await
++/// The result of [`pulse_frozen_reset_bit`]: both the assert and release halves of the pulse,
++/// verified independently, plus how long bit 1 was actually held asserted.
++#[derive(Debug, Clone, Copy, Default)]
++pub struct Reg02PulseResult {
++    pub assert_step: Reg02ReadModifyWriteResult,
++    pub release_step: Reg02ReadModifyWriteResult,
++    pub pulse_duration: Duration,
++}
++
++impl Reg02PulseResult {
++    /// `true` iff both halves of the pulse verified: each write's readback matched what was
++    /// written, and each write changed only bit 1.
++    pub fn fully_verified(&self) -> bool {
++        self.assert_step.readback_matches
++            && self.assert_step.only_bit1_changed
++            && self.release_step.readback_matches
++            && self.release_step.only_bit1_changed
++    }
++}
++
++/// Releases Frozen from reset with a low->high->low **pulse** of *only* bit 1 of register 0x02,
++/// preserving every other bit exactly as read at each step -- never the four-register full reset
++/// sequence ([`run_reset_sequence`]) used elsewhere in this binary, and never
++/// `opensleep::reset::ResetController`. Real hardware evidence: the full reset also reconfigures
++/// the port-direction registers (0x06/0x07), which leaves the filled-reservoir indicator off and
++/// unresponsive even though it does release Frozen (`[fdc1004] failed to write config` /
++/// `[capwater] sensor unavailable` were observed afterward). Separately, a live run that only
++/// *cleared* bit 1 (without first asserting it) found register 0x02 already read as `0xFD` --
++/// clearing an already-clear bit is a no-op with no edge, and Frozen did not respond, because
++/// release is a transition, not a level: the known-working sequence always asserts (`reg 0x02 |=
++/// 0x02`) before releasing (`reg 0x02 &= !0x02`), regardless of the bit's state when read. This
++/// function never touches 0x06/0x07 at all, and computes both the asserted and released values
++/// from what was actually read at each step (never a hardcoded constant), verifying the readback
++/// and re-checking that only bit 1 changed after every single write. Callers must check the
++/// returned result's [`Reg02PulseResult::fully_verified`] before proceeding, and must not treat a
++/// successful I2C transaction alone as sufficient confirmation.
++pub async fn pulse_frozen_reset_bit<P: I2cPort>(dev: &mut P) -> Result<Reg02PulseResult, I2cIoError> {
++    let assert_step = read_modify_write_reg02(dev, |original| original | FROZEN_RESET_BIT, "asserted").await?;
++    let pulse_start = Instant::now();
++    sleep(PULSE_SETTLE).await;
++    let pulse_duration = pulse_start.elapsed();
++    let release_step = read_modify_write_reg02(dev, |original| original & !FROZEN_RESET_BIT, "released").await?;
++    log::info!(
++        "pulse duration (asserted -> released): {pulse_duration:?} -- changed masks: assert=0b{:08b} release=0b{:08b}",
++        assert_step.changed_mask, release_step.changed_mask
++    );
++    Ok(Reg02PulseResult {
++        assert_step,
++        release_step,
++        pulse_duration,
++    })
 +}
 +
 +/// Emergency-only backstop for `--release-frozen-only`: re-asserts *only* bit 1 of register 0x02
@@ -2757,24 +2808,96 @@ index 0000000..ed91c2e
 +        mock
 +    }
 +
++    /// Item 14, case 1: register 0x02 already reads `0xFD` (Frozen already released, or a prior
++    /// clear-only attempt that produced no edge) -- the pulse must still assert to `0xFF` before
++    /// releasing back to `0xFD`, i.e. it must never skip the assert half just because bit 1 already
++    /// reads low.
 +    #[tokio::test]
-+    async fn release_frozen_reset_bit_only_clears_exactly_bit_1_and_nothing_else() {
-+        // Exercise every possible original register value: for every one, releasing must clear
-+        // bit 1 and leave every other bit exactly as it was.
++    async fn pulse_from_0xfd_asserts_to_0xff_then_releases_to_0xfd() {
++        let mut mock = mock_with_reg02(0xFD);
++        let r = pulse_frozen_reset_bit(&mut mock).await.unwrap();
++        assert_eq!(r.assert_step.original, 0xFD);
++        assert_eq!(r.assert_step.target, 0xFF);
++        assert_eq!(r.release_step.original, 0xFF);
++        assert_eq!(r.release_step.target, 0xFD);
++        assert!(r.fully_verified());
++        assert_eq!(mock.writes, vec![
++            (RESET_EXPANDER_ADDR, REG_OUTPUT_PORT_0, 0xFF),
++            (RESET_EXPANDER_ADDR, REG_OUTPUT_PORT_0, 0xFD),
++        ]);
++    }
++
++    /// Item 14, case 2: register 0x02 reads `0xFF` (Frozen held in reset, the normal post-boot
++    /// state) -- assert is a no-op write to the same value, then release clears bit 1 to `0xFD`.
++    #[tokio::test]
++    async fn pulse_from_0xff_asserts_stays_0xff_then_releases_to_0xfd() {
++        let mut mock = mock_with_reg02(0xFF);
++        let r = pulse_frozen_reset_bit(&mut mock).await.unwrap();
++        assert_eq!(r.assert_step.original, 0xFF);
++        assert_eq!(r.assert_step.target, 0xFF);
++        assert_eq!(r.release_step.original, 0xFF);
++        assert_eq!(r.release_step.target, 0xFD);
++        assert!(r.fully_verified());
++        assert_eq!(mock.writes, vec![
++            (RESET_EXPANDER_ADDR, REG_OUTPUT_PORT_0, 0xFF),
++            (RESET_EXPANDER_ADDR, REG_OUTPUT_PORT_0, 0xFD),
++        ]);
++    }
++
++    /// Item 14, case 3: for every possible original register value, both halves of the pulse must
++    /// preserve every bit except bit 1 -- the assert half always ends with bit 1 set, the release
++    /// half always ends with bit 1 clear, and neither half ever touches any other bit.
++    #[tokio::test]
++    async fn pulse_preserves_every_bit_except_bit_1_for_every_possible_original() {
 +        for original in 0u8..=255 {
 +            let mut mock = mock_with_reg02(original);
-+            let r = release_frozen_reset_bit_only(&mut mock).await.unwrap();
-+            assert_eq!(r.original, original);
-+            assert_eq!(r.target, original & !FROZEN_RESET_BIT, "original=0b{original:08b}");
-+            assert_eq!(r.changed_mask & !FROZEN_RESET_BIT, 0, "original=0b{original:08b}");
-+            assert!(r.only_bit1_changed, "original=0b{original:08b}");
-+            assert_eq!(r.readback, r.target);
-+            assert!(r.readback_matches);
-+            // Bit 1 must always end up cleared, regardless of what it was.
-+            assert_eq!(r.target & FROZEN_RESET_BIT, 0, "original=0b{original:08b}");
-+            // Every other bit must be unchanged.
-+            assert_eq!(r.target & !FROZEN_RESET_BIT, original & !FROZEN_RESET_BIT, "original=0b{original:08b}");
++            let r = pulse_frozen_reset_bit(&mut mock).await.unwrap();
++
++            assert_eq!(r.assert_step.original, original, "original=0b{original:08b}");
++            assert_eq!(r.assert_step.target & FROZEN_RESET_BIT, FROZEN_RESET_BIT, "original=0b{original:08b}");
++            assert_eq!(
++                r.assert_step.target & !FROZEN_RESET_BIT, original & !FROZEN_RESET_BIT,
++                "original=0b{original:08b}"
++            );
++            assert!(r.assert_step.only_bit1_changed, "original=0b{original:08b}");
++            assert!(r.assert_step.readback_matches, "original=0b{original:08b}");
++
++            let after_assert = original | FROZEN_RESET_BIT;
++            assert_eq!(r.release_step.original, after_assert, "original=0b{original:08b}");
++            assert_eq!(r.release_step.target & FROZEN_RESET_BIT, 0, "original=0b{original:08b}");
++            assert_eq!(
++                r.release_step.target & !FROZEN_RESET_BIT, after_assert & !FROZEN_RESET_BIT,
++                "original=0b{original:08b}"
++            );
++            assert!(r.release_step.only_bit1_changed, "original=0b{original:08b}");
++            assert!(r.release_step.readback_matches, "original=0b{original:08b}");
++
++            assert!(r.fully_verified(), "original=0b{original:08b}");
 +        }
++    }
++
++    /// Item 5/14: neither half of the pulse may ever write registers 0x06 or 0x07 -- checked
++    /// across the same full sweep as the bit-preservation test above.
++    #[tokio::test]
++    async fn pulse_never_writes_registers_0x06_or_0x07() {
++        for original in 0u8..=255 {
++            let mut mock = mock_with_reg02(original);
++            pulse_frozen_reset_bit(&mut mock).await.unwrap();
++            for (_, reg, _) in &mock.writes {
++                assert_ne!(*reg, REG_CONFIG_PORT_0, "must never write register 0x06 (original=0b{original:08b})");
++                assert_ne!(*reg, REG_CONFIG_PORT_1, "must never write register 0x07 (original=0b{original:08b})");
++            }
++            // Exactly two register-0x02 writes per pulse: the assert, then the release.
++            assert_eq!(mock.writes.len(), 2, "original=0b{original:08b}");
++            assert!(mock.writes.iter().all(|(_, reg, _)| *reg == REG_OUTPUT_PORT_0), "original=0b{original:08b}");
++        }
++    }
++
++    #[tokio::test]
++    async fn pulse_duration_reflects_the_settle_wait() {
++        let mut mock = mock_with_reg02(0xFF);
++        let r = pulse_frozen_reset_bit(&mut mock).await.unwrap();
++        assert!(r.pulse_duration >= PULSE_SETTLE, "pulse_duration={:?}", r.pulse_duration);
 +    }
 +
 +    #[tokio::test]
@@ -2791,18 +2914,6 @@ index 0000000..ed91c2e
 +    }
 +
 +    #[tokio::test]
-+    async fn release_frozen_reset_bit_only_never_writes_registers_0x06_or_0x07() {
-+        let mut mock = mock_with_reg02(0xFF);
-+        release_frozen_reset_bit_only(&mut mock).await.unwrap();
-+        for (_, reg, _) in &mock.writes {
-+            assert_ne!(*reg, REG_CONFIG_PORT_0, "must never write register 0x06");
-+            assert_ne!(*reg, REG_CONFIG_PORT_1, "must never write register 0x07");
-+        }
-+        // And writes register 0x02 exactly once.
-+        assert_eq!(mock.writes, vec![(RESET_EXPANDER_ADDR, REG_OUTPUT_PORT_0, 0xFF & !FROZEN_RESET_BIT)]);
-+    }
-+
-+    #[tokio::test]
 +    async fn assert_frozen_reset_bit_only_never_writes_registers_0x06_or_0x07() {
 +        let mut mock = mock_with_reg02(0xFD);
 +        assert_frozen_reset_bit_only(&mut mock).await.unwrap();
@@ -2814,9 +2925,8 @@ index 0000000..ed91c2e
 +    }
 +
 +    #[tokio::test]
-+    async fn release_frozen_reset_bit_only_detects_readback_mismatch() {
-+        let mut mock = mock_with_reg02(0xFF);
-+        mock.fail_all_writes = false;
++    async fn pulse_detects_readback_mismatch_on_the_release_half() {
++        let mock = mock_with_reg02(0xFF);
 +        // Simulate a write that silently doesn't stick by overriding reg_state right back after
 +        // the write happens: easiest way is a mock whose read_reg always returns a fixed stale
 +        // value regardless of writes. We approximate this with a thin wrapper mock below.
@@ -2838,9 +2948,13 @@ index 0000000..ed91c2e
 +                self.inner.write_reg(addr, reg, value)
 +            }
 +        }
++        // Stale at 0xFF: the assert half's readback (0xFF) matches; the release half's readback
++        // (also stuck at 0xFF) does not match the intended release target (0xFD).
 +        let mut stale = StaleReadback { inner: mock, stale_value: 0xFF };
-+        let r = release_frozen_reset_bit_only(&mut stale).await.unwrap();
-+        assert!(!r.readback_matches);
++        let r = pulse_frozen_reset_bit(&mut stale).await.unwrap();
++        assert!(r.assert_step.readback_matches);
++        assert!(!r.release_step.readback_matches);
++        assert!(!r.fully_verified());
 +    }
 +}
 diff --git a/src/bin/opensleep-diagnostic/io_logging.rs b/src/bin/opensleep-diagnostic/io_logging.rs
@@ -4589,10 +4703,10 @@ index 0000000..f4b95f7
 +}
 diff --git a/src/bin/opensleep-diagnostic/prime_opensleep_init.rs b/src/bin/opensleep-diagnostic/prime_opensleep_init.rs
 new file mode 100644
-index 0000000..ca7ae59
+index 0000000..ec57444
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/prime_opensleep_init.rs
-@@ -0,0 +1,1403 @@
+@@ -0,0 +1,1459 @@
 +//! `frozen-prime-opensleep-init`: fills an empty or partially-filled hydraulic loop by sending
 +//! `Prime` exactly once, through the real, unmodified upstream OpenSleep initialization and Frozen
 +//! manager code -- `opensleep::reset::ResetController::reset_subsystems`, `opensleep::led`,
@@ -4733,7 +4847,7 @@ index 0000000..ca7ae59
 +use crate::link::{FrozenLink, PacketOutcome};
 +use crate::log_tap;
 +use crate::ownership;
-+use crate::report::{Confirmations, OpenSleepInitResults, PrimeOutcome, ReleaseFrozenOnlyResults, Report};
++use crate::report::{Confirmations, OpenSleepInitResults, PrimeOutcome, ReleaseFrozenOnlyResults, ReservoirStatus, Report};
 +use crate::safety::{AuditedTransport, FrozenAction, Mode};
 +use crate::signals::{StopReason, wait_for_termination_signal};
 +
@@ -4777,22 +4891,22 @@ index 0000000..ca7ae59
 +/// Poll granularity while watching `log_tap` for a specific line to appear.
 +const LOG_POLL_INTERVAL: Duration = Duration::from_millis(50);
 +
-+/// `--release-frozen-only` mode: how long to wait after the I2C read-modify-write settles before
-+/// opening/pinging the Frozen UART (item 9) -- real hardware evidence has not required more than a
-+/// brief pause here, but some settle time after a register write is prudent before assuming the
-+/// bus and the freshly-released microcontroller are both ready.
-+const RELEASE_SETTLE: Duration = Duration::from_millis(200);
-+/// `--release-frozen-only` mode: per-command timeout for Ping/JumpToFirmware/Prime over its own
-+/// `FrozenLink`/`AuditedTransport` (this mode does not use the real `frozen::run` manager at all --
-+/// see module docs). Mirrors `prime_test::COMMAND_TIMEOUT`.
-+const RELEASE_ONLY_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
-+/// `--release-frozen-only` mode: how long to watch for startup messages (capwater/flowrate
-+/// availability) after Frozen reaches application firmware, before deciding whether to proceed to
-+/// the reservoir confirmation and Prime.
-+const RELEASE_ONLY_STARTUP_SETTLE: Duration = Duration::from_secs(3);
-+/// `--release-frozen-only` mode: granularity of the drain loop used both for startup-message
-+/// observation and for watching for priming completion.
++/// `--release-frozen-only` mode: after the I2C pulse (assert-then-release), how long to wait and
++/// drain unsolicited boot messages before Pinging at all. Real hardware evidence: Frozen emits
++/// interleaved startup chatter immediately after being released, so this window is drained (and
++/// logged) rather than skipped straight to Ping.
++const BOOT_MESSAGE_SETTLE: Duration = Duration::from_secs(2);
++/// `--release-frozen-only` mode: hard ceiling on repeatedly Pinging after the boot-message settle
++/// window, before concluding Frozen never responded at all and aborting without sending Prime.
++const PING_RETRY_WINDOW: Duration = Duration::from_secs(10);
++/// `--release-frozen-only` mode: how long to wait between repeated Ping attempts within
++/// `PING_RETRY_WINDOW`, and the granularity of the drain loop used both for the boot-message
++/// settle window and for watching for priming completion.
 +const RELEASE_ONLY_POLL_INTERVAL: Duration = Duration::from_millis(500);
++/// `--release-frozen-only` mode: per-command timeout for a single Ping/JumpToFirmware/Prime
++/// exchange over its own `FrozenLink`/`AuditedTransport` (this mode does not use the real
++/// `frozen::run` manager at all -- see module docs). Mirrors `prime_test::COMMAND_TIMEOUT`.
++const RELEASE_ONLY_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 +
 +/// Item 20's required confirmation phrase, distinct from `INTERACTIVE_PHRASE`/`FINAL_PHRASE`:
 +/// asked immediately before Prime, after Frozen has been released and its startup messages have
@@ -4962,46 +5076,97 @@ index 0000000..ca7ae59
 +{
 +    let mut results = ReleaseFrozenOnlyResults::default();
 +
-+    // Items 1-8: a narrow, read-modify-write release of only bit 1 of register 0x02 -- never
++    // Items 1-6: pulse only bit 1 of register 0x02 low->high->low (assert, then release) -- never
 +    // opensleep::reset::ResetController, never the four-register full reset sequence, never
-+    // registers 0x06/0x07. See `i2c::release_frozen_reset_bit_only`.
-+    let release = match crate::i2c::release_frozen_reset_bit_only(i2c).await {
-+        Ok(r) => r,
++    // registers 0x06/0x07. See `i2c::pulse_frozen_reset_bit`'s doc comment for why a pulse (not a
++    // one-shot clear) is required: a live run found register 0x02 already reading `0xFD`, so
++    // clearing bit 1 alone was a no-op with no edge, and Frozen never responded.
++    let pulse = match crate::i2c::pulse_frozen_reset_bit(i2c).await {
++        Ok(p) => p,
 +        Err(e) => {
-+            log::error!("failed to release Frozen from reset via I2C: {e}");
++            log::error!("failed to pulse Frozen reset bit via I2C: {e}");
 +            return (finish_release_only(args, results, StopReason::PreflightRefused, 20, dry_run), 20);
 +        }
 +    };
-+    results.original_register_0x02 = release.original;
-+    results.released_register_0x02 = release.target;
-+    results.changed_bit_mask = release.changed_mask;
-+    results.readback_register_0x02 = release.readback;
-+    results.readback_matches = release.readback_matches;
-+    results.only_bit1_changed = release.only_bit1_changed;
++    results.original_register_0x02 = pulse.assert_step.original;
++    results.asserted_register_0x02 = pulse.assert_step.target;
++    results.asserted_readback_register_0x02 = pulse.assert_step.readback;
++    results.asserted_readback_matches = pulse.assert_step.readback_matches;
++    results.released_register_0x02 = pulse.release_step.target;
++    results.released_readback_register_0x02 = pulse.release_step.readback;
++    results.released_readback_matches = pulse.release_step.readback_matches;
++    results.only_bit1_changed = pulse.assert_step.only_bit1_changed && pulse.release_step.only_bit1_changed;
++    results.pulse_duration_ms = pulse.pulse_duration.as_millis() as u64;
 +
-+    // Item 8: abort if the write did not verify -- either the readback disagrees with what was
-+    // written, or (should be impossible by construction, since the target is computed as
-+    // `original & !FROZEN_RESET_BIT`) a bit other than bit 1 differs from the original.
-+    if !release.readback_matches || !release.only_bit1_changed {
++    // Abort if either half of the pulse did not verify -- either a readback disagreed with what
++    // was written, or (should be impossible by construction) a bit other than bit 1 changed.
++    if !pulse.fully_verified() {
 +        log::error!(
-+            "aborting: register 0x02 read-modify-write did not verify (readback_matches={} only_bit1_changed={})",
-+            release.readback_matches, release.only_bit1_changed
++            "aborting: register 0x02 pulse did not verify (asserted_readback_matches={} \
++             asserted_only_bit1_changed={} released_readback_matches={} released_only_bit1_changed={})",
++            pulse.assert_step.readback_matches, pulse.assert_step.only_bit1_changed,
++            pulse.release_step.readback_matches, pulse.release_step.only_bit1_changed
 +        );
 +        return (finish_release_only(args, results, StopReason::PreflightRefused, 20, dry_run), 20);
 +    }
-+    log::info!("Frozen released from reset: register 0x02 bit 1 cleared, every other bit unchanged");
-+
-+    // Item 9: wait briefly, then open/ping Frozen. (The link is already open by the time this
-+    // function is called -- see `run_release_frozen_only` -- but no byte is sent to it before this
-+    // point, so no communication happens before the release above settles.)
-+    tokio::time::sleep(RELEASE_SETTLE).await;
++    log::info!(
++        "Frozen reset bit pulsed: asserted 0x{:02X} -> released 0x{:02X} in {:?}, every other bit unchanged",
++        pulse.assert_step.target, pulse.release_step.target, pulse.pulse_duration
++    );
 +    results.frozen_uart_opened = true;
 +
++    // Item 7: wait up to 2 seconds for boot messages, draining and logging anything Frozen sends
++    // unsolicited (informational only -- capwater/flowrate mentions here are logged but do not
++    // gate Prime; only the operator's own reservoir confirmation below does, per item 11).
 +    let mut audit = AuditedTransport::new(Mode::PrimeTest);
-+    let (ping_ok, mode) = crate::frozen_ops::ping(link, &mut audit, RELEASE_ONLY_COMMAND_TIMEOUT).await;
-+    // Item 10: Pong(false) -> JumpToFirmware; Pong(true) -> already in firmware. Item 11: wait for
-+    // Pong(true) (jump_to_firmware_and_wait re-Pings internally until it sees Pong(true) or times
-+    // out).
++    let mut capwater_unavailable = false;
++    let mut flowrate_unavailable = false;
++    let boot_deadline = Instant::now() + BOOT_MESSAGE_SETTLE;
++    loop {
++        let remaining = boot_deadline.saturating_duration_since(Instant::now());
++        if remaining.is_zero() {
++            break;
++        }
++        match link.recv(remaining).await {
++            Ok(PacketOutcome::Received(FrozenPacket::Message(m))) => {
++                log::info!("boot message: {m}");
++                if m == "FW: [capwater] sensor unavailable" {
++                    capwater_unavailable = true;
++                }
++                if m == "FW: [flowrate] sensor unavailable" {
++                    flowrate_unavailable = true;
++                }
++            }
++            Ok(PacketOutcome::Received(pkt)) => log::info!("boot packet: {pkt:?}"),
++            Ok(PacketOutcome::TimedOut) => {}
++            Ok(PacketOutcome::Closed) | Err(_) => break,
++        }
++    }
++    results.capwater_unavailable_observed = capwater_unavailable;
++    results.flowrate_unavailable_observed = flowrate_unavailable;
++
++    // Items 7-8: Ping repeatedly for up to 10 seconds until Frozen answers at all.
++    let ping_deadline = Instant::now() + PING_RETRY_WINDOW;
++    let mut mode = crate::frozen_ops::DeviceMode::Unknown;
++    let mut ping_ok = false;
++    loop {
++        let (ok, m) = crate::frozen_ops::ping(link, &mut audit, RELEASE_ONLY_COMMAND_TIMEOUT).await;
++        if ok {
++            ping_ok = true;
++            mode = m;
++            break;
++        }
++        if Instant::now() >= ping_deadline {
++            break;
++        }
++        tokio::time::sleep(RELEASE_ONLY_POLL_INTERVAL).await;
++    }
++
++    // Item 8: Pong(false) -> JumpToFirmware; Pong(true) -> already in firmware; no response within
++    // the window -> abort without sending Prime. Item 9: after JumpToFirmware,
++    // `jump_to_firmware_and_wait` allows sufficient time for interleaved startup messages by
++    // simply re-Pinging (tolerating anything else received in between) for up to its own 10-second
++    // hard timeout before requiring `Pong(true)`.
 +    let reached_firmware = match mode {
 +        crate::frozen_ops::DeviceMode::Firmware => true,
 +        crate::frozen_ops::DeviceMode::Bootloader => {
@@ -5011,62 +5176,34 @@ index 0000000..ca7ae59
 +    };
 +    results.frozen_reached_firmware = reached_firmware;
 +
-+    if !ping_ok && mode == crate::frozen_ops::DeviceMode::Unknown {
-+        log::error!("aborting: Frozen did not answer Ping after being released from reset");
++    if !ping_ok {
++        log::error!("aborting: Frozen did not respond to Ping within {PING_RETRY_WINDOW:?} of being released from reset; no Prime sent");
 +    }
-+    if !reached_firmware {
-+        log::error!("aborting: Frozen did not reach application firmware after being released from reset");
++    // Item 12: no automatic reset assert here -- a preflight failure before Frozen ever responds is
++    // not "after Frozen is responsive", and is not a pump fault, so item 13's emergency backstop
++    // does not apply.
++    if !ping_ok || !reached_firmware {
 +        return (finish_release_only(args, results, StopReason::PreflightRefused, 20, dry_run), 20);
 +    }
 +
-+    // Item 12: observe startup messages for capwater/flowrate availability before deciding whether
-+    // to proceed toward Prime.
-+    let settle_deadline = Instant::now() + RELEASE_ONLY_STARTUP_SETTLE;
-+    let mut capwater_unavailable = false;
-+    let mut flowrate_unavailable = false;
-+    loop {
-+        let remaining = settle_deadline.saturating_duration_since(Instant::now());
-+        if remaining.is_zero() {
-+            break;
-+        }
-+        match link.recv(remaining.min(RELEASE_ONLY_POLL_INTERVAL)).await {
-+            Ok(PacketOutcome::Received(FrozenPacket::Message(m))) => {
-+                if m == "FW: [capwater] sensor unavailable" {
-+                    capwater_unavailable = true;
-+                }
-+                if m == "FW: [flowrate] sensor unavailable" {
-+                    flowrate_unavailable = true;
-+                }
-+            }
-+            Ok(PacketOutcome::Received(_)) => {}
-+            Ok(PacketOutcome::TimedOut) => {}
-+            Ok(PacketOutcome::Closed) | Err(_) => break,
-+        }
-+    }
-+    results.capwater_unavailable_observed = capwater_unavailable;
-+    results.flowrate_unavailable_observed = flowrate_unavailable;
-+    // Item 19: the reservoir-fill indicator this mode exists to keep working is exactly the
-+    // capwater sensor -- see the real-hardware evidence in `i2c::release_frozen_reset_bit_only`'s
-+    // doc comment. "Stayed operational" is the inverse of it being reported unavailable.
-+    results.reservoir_sensor_operational_after_release = !capwater_unavailable;
-+    log::info!("[capwater] sensor unavailable observed: {capwater_unavailable}");
-+    log::info!("[flowrate] sensor unavailable observed: {flowrate_unavailable}");
-+    log::info!("reservoir sensor operational after release: {}", results.reservoir_sensor_operational_after_release);
-+
-+    // Item 13: only proceed to Prime if capwater remains available.
-+    if capwater_unavailable {
-+        log::error!("refusing to send Prime: [capwater] sensor unavailable after releasing Frozen from reset");
-+        return (finish_release_only(args, results, StopReason::PreflightRefused, 30, dry_run), 30);
-+    }
-+
-+    // Item 20: required interactive confirmation immediately before Prime.
++    // Item 10: the reservoir confirmation is required only now -- after Frozen has reached
++    // application firmware -- immediately before Prime. Item 11: its outcome is reported
++    // explicitly (never merely inferred from an automatic sensor check), and reaching this point at
++    // all means it is never left at its `Unverified` default.
 +    let reservoir_ok = confirm_phrase(
 +        args.assume_reservoir_phrase.clone(),
 +        RESERVOIR_PHRASE,
 +        &format!("Type {RESERVOIR_PHRASE} to continue: "),
 +    );
++    results.reservoir_status = if reservoir_ok {
++        ReservoirStatus::Confirmed
++    } else {
++        ReservoirStatus::FailedByOperatorObservation
++    };
 +    if !reservoir_ok {
 +        log::error!("refusing to send Prime: reservoir confirmation phrase was not matched exactly");
++        // Item 12: still no automatic reset assert -- Frozen is responsive here, but this is a
++        // confirmation refusal, not a pump fault or other emergency.
 +        return (finish_release_only(args, results, StopReason::PreflightRefused, 30, dry_run), 30);
 +    }
 +
@@ -5152,13 +5289,10 @@ index 0000000..ca7ae59
 +        eprintln!("If priming does not stop, reboot the Hub or disconnect Hub power.");
 +    }
 +
-+    let exit_code = if prime_outcome == PrimeOutcome::Success {
-+        0
-+    } else if matches!(stop_reason, StopReason::PreflightRefused) {
-+        30
-+    } else {
-+        1
-+    };
++    // `stop_reason` can only be `PrimingCompleted`/`DurationExpired`/`PumpFault`/
++    // `UartReadFailure`/`CtrlC`/`Sigterm`/`Sighup` at this point -- every `PreflightRefused` path
++    // above already returned its own exit code directly.
++    let exit_code = if prime_outcome == PrimeOutcome::Success { 0 } else { 1 };
 +    (finish_release_only(args, results, stop_reason, exit_code, dry_run), exit_code)
 +}
 +
@@ -5863,10 +5997,14 @@ index 0000000..ca7ae59
 +            assert_eq!(code, 0, "stop reason: {}", report.stop_reason);
 +            assert!(report.overall_pass);
 +            let rf = report.release_frozen_only_results.expect("release_frozen_only_results must be set");
++            // MockI2c::always_succeed() seeds register 0x02 at 0xFF (bit 1 already set).
 +            assert_eq!(rf.original_register_0x02, 0xFF);
++            assert_eq!(rf.asserted_register_0x02, 0xFF);
++            assert!(rf.asserted_readback_matches);
 +            assert_eq!(rf.released_register_0x02, 0xFF & !crate::i2c::FROZEN_RESET_BIT);
-+            assert!(rf.readback_matches);
++            assert!(rf.released_readback_matches);
 +            assert!(rf.only_bit1_changed);
++            assert_eq!(rf.reservoir_status, ReservoirStatus::Confirmed);
 +            assert!(rf.normal_done_observed);
 +            assert!(!rf.done_because_empty_observed);
 +            assert_eq!(rf.prime_outcome, PrimeOutcome::Success);
@@ -5880,14 +6018,15 @@ index 0000000..ca7ae59
 +            assert_eq!(code, 30);
 +            assert!(!report.overall_pass);
 +            let rf = report.release_frozen_only_results.expect("release_frozen_only_results must be set");
++            assert_eq!(rf.reservoir_status, ReservoirStatus::FailedByOperatorObservation);
 +            assert!(!rf.prime_sent, "Prime must never be sent without the exact reservoir confirmation phrase");
 +        }
 +
-+        /// Items 1-8: the release must touch only bit 1 of register 0x02, verify it, and never
-+        /// write registers 0x06/0x07 -- checked end to end (not just at the `i2c` module's own
-+        /// unit-test level) across a full successful run.
++        /// Items 1-6: the pulse must touch only bit 1 of register 0x02 (asserting then releasing),
++        /// verify each half, and never write registers 0x06/0x07 -- checked end to end (not just
++        /// at the `i2c` module's own unit-test level) across a full successful run.
 +        #[tokio::test]
-+        async fn full_run_never_writes_registers_0x06_or_0x07_and_changes_only_bit_1() {
++        async fn full_run_never_writes_registers_0x06_or_0x07_and_pulses_only_bit_1() {
 +            let mut i2c = MockI2c::always_succeed();
 +            let (client, task) = spawn_mock_frozen_device_release_only(false, false, false);
 +            let mut link = FrozenLink::wrap(client, "test");
@@ -5897,9 +6036,16 @@ index 0000000..ca7ae59
 +                assert_ne!(*reg, 0x06, "must never write register 0x06");
 +                assert_ne!(*reg, 0x07, "must never write register 0x07");
 +            }
-+            // Exactly one register-0x02 write for the whole run (the release itself) -- no restore
-+            // write on normal completion (item 17), and no emergency re-assert (no fault occurred).
-+            assert_eq!(i2c.writes, vec![(crate::i2c::RESET_EXPANDER_ADDR, 0x02, 0xFF & !crate::i2c::FROZEN_RESET_BIT)]);
++            // Exactly two register-0x02 writes for the whole run -- the pulse's assert then release
++            // -- no restore write on normal completion, and no emergency re-assert (no fault
++            // occurred).
++            assert_eq!(
++                i2c.writes,
++                vec![
++                    (crate::i2c::RESET_EXPANDER_ADDR, 0x02, 0xFF),
++                    (crate::i2c::RESET_EXPANDER_ADDR, 0x02, 0xFF & !crate::i2c::FROZEN_RESET_BIT),
++                ]
++            );
 +            drop(link);
 +            task.abort();
 +        }
@@ -5920,26 +6066,29 @@ index 0000000..ca7ae59
 +            task.abort();
 +        }
 +
-+        /// Item 13: capwater unavailable after release must refuse Prime entirely -- and item 19's
-+        /// reservoir-operational report must reflect that.
++        /// Item 14, case 1: starting from register 0x02 = 0xFD (the bug this fix addresses --
++        /// clearing an already-clear bit produces no edge and Frozen never responds) must still
++        /// pulse through 0xFF before releasing back to 0xFD, and Frozen must respond.
 +        #[tokio::test]
-+        async fn refuses_prime_when_capwater_is_unavailable_after_release() {
++        async fn pulses_correctly_even_when_register_already_reads_0xfd() {
 +            let mut i2c = MockI2c::always_succeed();
-+            let (client, task) = spawn_mock_frozen_device_release_only(false, true, false);
++            i2c.reg_state.insert((crate::i2c::RESET_EXPANDER_ADDR, 0x02), 0xFD);
++            let (client, task) = spawn_mock_frozen_device_release_only(false, false, false);
 +            let mut link = FrozenLink::wrap(client, "test");
 +            let (report, code) = run_release_frozen_only_core(&release_only_args(), &mut i2c, &mut link, true).await;
++            assert_eq!(code, 0, "stop reason: {}", report.stop_reason);
 +            let rf = report.release_frozen_only_results.expect("release_frozen_only_results must be set");
-+            assert!(rf.capwater_unavailable_observed);
-+            assert!(!rf.reservoir_sensor_operational_after_release);
-+            assert!(!rf.prime_sent, "Prime must never be sent while capwater is unavailable");
-+            assert_eq!(rf.prime_outcome, PrimeOutcome::NotSent);
-+            assert_eq!(code, 30);
++            assert_eq!(rf.original_register_0x02, 0xFD);
++            assert_eq!(rf.asserted_register_0x02, 0xFF);
++            assert_eq!(rf.released_register_0x02, 0xFD);
++            assert!(rf.only_bit1_changed);
++            assert!(rf.frozen_reached_firmware);
 +            drop(link);
 +            task.abort();
 +        }
 +
-+        /// Item 10/11: a Pong(false) (bootloader) response must be followed by JumpToFirmware and
-+        /// a wait for Pong(true) before anything else proceeds.
++        /// Item 8/9: a Pong(false) (bootloader) response must be followed by JumpToFirmware, with
++        /// sufficient time allowed for interleaved startup messages before requiring `Pong(true)`.
 +        #[tokio::test]
 +        async fn jumps_to_firmware_when_frozen_answers_from_the_bootloader() {
 +            let mut i2c = MockI2c::always_succeed();
@@ -5954,6 +6103,28 @@ index 0000000..ca7ae59
 +            task.abort();
 +        }
 +
++        /// Item 8: if Frozen never answers Ping at all (device task not even spawned here), this
++        /// mode must abort without ever sending Prime, and must not treat that as a reason to
++        /// assert reset (item 12: no automatic reset for a non-responsive Frozen, only for a
++        /// genuine pump fault).
++        #[tokio::test]
++        async fn aborts_without_prime_when_frozen_never_answers_ping() {
++            let mut i2c = MockI2c::always_succeed();
++            // A duplex pair whose device side is never driven -- every Ping attempt times out.
++            let (client, _unused_device_side) = tokio::io::duplex(64);
++            let mut link = FrozenLink::wrap(client, "test");
++            let (report, code) = run_release_frozen_only_core(&release_only_args(), &mut i2c, &mut link, true).await;
++            assert_eq!(code, 20);
++            assert!(!report.overall_pass);
++            let rf = report.release_frozen_only_results.expect("release_frozen_only_results must be set");
++            assert!(!rf.frozen_reached_firmware);
++            assert!(!rf.prime_sent, "Prime must never be sent when Frozen never answers Ping");
++            assert!(!rf.emergency_reset_asserted, "a non-responsive Frozen is not a pump fault/emergency");
++            assert_eq!(rf.reservoir_status, ReservoirStatus::Unverified, "must never ask a confirmation the run never reached");
++            // Only the pulse's two writes -- no third write asserting/restoring anything on abort.
++            assert_eq!(i2c.writes.len(), 2);
++        }
++
 +        /// Item 8: if the I2C read itself fails, this mode must abort before ever touching the
 +        /// Frozen UART.
 +        #[tokio::test]
@@ -5966,31 +6137,30 @@ index 0000000..ca7ae59
 +            assert_eq!(code, 20);
 +            assert!(!report.overall_pass);
 +            let rf = report.release_frozen_only_results.expect("release_frozen_only_results must be set");
-+            assert!(!rf.frozen_uart_opened, "must never open/ping Frozen when the I2C release itself failed");
++            assert!(!rf.frozen_uart_opened, "must never open/ping Frozen when the I2C pulse itself failed");
++            assert_eq!(rf.reservoir_status, ReservoirStatus::Unverified);
 +            assert!(i2c.writes.is_empty(), "must never write register 0x02 when the read that precedes it failed");
 +            drop(link);
 +            task.abort();
 +        }
 +
-+        /// Item 20: without the exact reservoir phrase, Prime must never be attempted even though
-+        /// Frozen was successfully released and reached firmware.
++        /// Item 10/11: without the exact reservoir phrase, Prime must never be attempted even
++        /// though Frozen was successfully released and reached firmware, and the reservoir status
++        /// must be reported as an explicit operator-observed failure, not merely `Unverified`.
 +        #[tokio::test]
 +        async fn reservoir_phrase_is_required_even_after_reaching_firmware() {
 +            let mut i2c = MockI2c::always_succeed();
 +            let (client, task) = spawn_mock_frozen_device_release_only(false, false, false);
 +            let mut link = FrozenLink::wrap(client, "test");
 +            let mut a = release_only_args();
-+            a.assume_reservoir_phrase = None; // stdin is not a TTY under `cargo test`, so this
-+            // would normally be treated as satisfied -- assert the exact phrase is still checked
-+            // when it IS supplied and wrong (see `dry_run_refuses_without_the_reservoir_phrase`
-+            // above for the CLI-level version of this same guarantee).
++            a.assume_reservoir_phrase = Some("definitely wrong".to_string());
 +            let (report, code) = run_release_frozen_only_core(&a, &mut i2c, &mut link, true).await;
-+            // Under `cargo test`, stdin is not a TTY, so `confirm_phrase` treats the confirmation
-+            // as satisfied when no `assume` value is supplied -- this run is expected to succeed;
-+            // this test exists to document that behavior explicitly, matching `confirm.rs`'s own
-+            // documented contract, not to claim the phrase is skippable on real hardware (where
-+            // stdin during an interactive run *is* a TTY).
-+            assert_eq!(code, 0, "stop reason: {}", report.stop_reason);
++            assert_eq!(code, 30);
++            let rf = report.release_frozen_only_results.expect("release_frozen_only_results must be set");
++            assert!(rf.frozen_reached_firmware);
++            assert_eq!(rf.reservoir_status, ReservoirStatus::FailedByOperatorObservation);
++            assert!(!rf.prime_sent);
++            assert!(!rf.emergency_reset_asserted, "a confirmation refusal is not a pump fault/emergency");
 +            drop(link);
 +            task.abort();
 +        }
@@ -7504,10 +7674,10 @@ index 0000000..99a38a0
 +}
 diff --git a/src/bin/opensleep-diagnostic/report.rs b/src/bin/opensleep-diagnostic/report.rs
 new file mode 100644
-index 0000000..5dcfdbe
+index 0000000..cee34df
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/report.rs
-@@ -0,0 +1,590 @@
+@@ -0,0 +1,632 @@
 +//! Structured JSON/CSV/text reporting shared by all three subcommands. Machine evidence (audit
 +//! log, decoded telemetry) is always kept in separate fields from operator-entered observations,
 +//! per the safety model: a component may only be marked PASS from decoded evidence or an explicit
@@ -7761,26 +7931,32 @@ index 0000000..5dcfdbe
 +pub struct ReleaseFrozenOnlyResults {
 +    /// I2C expander register 0x02 as read before this run changed anything.
 +    pub original_register_0x02: u8,
-+    /// I2C expander register 0x02 as written (`original & !0x02`).
++    /// Register 0x02 as written for the pulse's assert half (`original | 0x02`).
++    pub asserted_register_0x02: u8,
++    /// Register 0x02 as read back immediately after the assert write.
++    pub asserted_readback_register_0x02: u8,
++    /// `true` iff `asserted_readback_register_0x02 == asserted_register_0x02`.
++    pub asserted_readback_matches: bool,
++    /// Register 0x02 as written for the pulse's release half (`asserted & !0x02`).
 +    pub released_register_0x02: u8,
-+    /// `original_register_0x02 ^ released_register_0x02` -- must never have any bit set other than
-+    /// bit 1.
-+    pub changed_bit_mask: u8,
-+    /// Register 0x02 as read back immediately after the write.
-+    pub readback_register_0x02: u8,
-+    /// `true` iff `readback_register_0x02 == released_register_0x02`.
-+    pub readback_matches: bool,
-+    /// `true` iff `changed_bit_mask` is a subset of bit 1 -- i.e. no register bit other than
-+    /// Frozen's reset bit was touched.
++    /// Register 0x02 as read back immediately after the release write.
++    pub released_readback_register_0x02: u8,
++    /// `true` iff `released_readback_register_0x02 == released_register_0x02`.
++    pub released_readback_matches: bool,
++    /// `true` iff neither the assert nor the release write ever changed any bit other than bit 1.
 +    pub only_bit1_changed: bool,
++    /// How long bit 1 was held asserted between the two writes, in milliseconds.
++    pub pulse_duration_ms: u64,
 +    pub frozen_uart_opened: bool,
 +    pub frozen_reached_firmware: bool,
 +    pub capwater_unavailable_observed: bool,
 +    pub flowrate_unavailable_observed: bool,
-+    /// Whether the reservoir-fill indicator/sensor was still functioning after Frozen was
-+    /// released -- the entire point of this narrower mode, per real-hardware evidence that the
-+    /// full reset sequence leaves it off/unresponsive even though it does release Frozen.
-+    pub reservoir_sensor_operational_after_release: bool,
++    /// Whether the reservoir-fill indicator was confirmed still working, explicitly reported by
++    /// the operator rather than inferred from any automatic sensor check -- the entire point of
++    /// this narrower mode, per real-hardware evidence that the full reset sequence leaves it
++    /// off/unresponsive even though it does release Frozen. Stays `Unverified` (never a false
++    /// negative) if the run aborted before the confirmation was ever asked.
++    pub reservoir_status: ReservoirStatus,
 +    pub prime_outcome: PrimeOutcome,
 +    pub prime_sent: bool,
 +    pub normal_done_observed: bool,
@@ -7789,6 +7965,36 @@ index 0000000..5dcfdbe
 +    /// `i2c::assert_frozen_reset_bit_only` (bit-1-only read-modify-write), never the full
 +    /// `i2c::assert_reset` (hardcoded 0xFF) used by every other mode's emergency-stop.
 +    pub emergency_reset_asserted: bool,
++}
++
++/// Whether the reservoir-fill indicator was confirmed still working after `--release-frozen-only`
++/// released Frozen from reset -- reported explicitly by the operator (via the required
++/// `RESERVOIR INDICATOR IS STILL WORKING` confirmation), never inferred from an automatic sensor
++/// check. See [`ReleaseFrozenOnlyResults::reservoir_status`].
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
++#[serde(rename_all = "snake_case")]
++pub enum ReservoirStatus {
++    /// The run never reached the point of asking -- e.g. Frozen never responded, or the I2C pulse
++    /// itself failed to verify. Never reported merely because the run aborted; that would be a
++    /// false negative, not an honest "we never asked".
++    #[default]
++    Unverified,
++    /// The operator typed the exact confirmation phrase, declaring the indicator is still working.
++    Confirmed,
++    /// The operator was asked and did not type the exact confirmation phrase -- reported as a
++    /// distinct, explicit operator observation, not conflated with `Unverified`.
++    FailedByOperatorObservation,
++}
++
++impl std::fmt::Display for ReservoirStatus {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        let s = match self {
++            ReservoirStatus::Unverified => "unverified",
++            ReservoirStatus::Confirmed => "confirmed",
++            ReservoirStatus::FailedByOperatorObservation => "failed by operator observation",
++        };
++        write!(f, "{s}")
++    }
 +}
 +
 +/// One decoded firmware pump message (`FW: pump[<side>] ... @ <V>V <A>A`), kept separate from
@@ -8052,16 +8258,22 @@ index 0000000..5dcfdbe
 +        }
 +        if let Some(rf) = &self.release_frozen_only_results {
 +            log::info!("-- release-frozen-only results --");
++            log::info!("  Register 0x02 original:          0b{:08b}", rf.original_register_0x02);
 +            log::info!(
-+                "  Register 0x02: original=0b{:08b} released=0b{:08b} changed_mask=0b{:08b} readback=0b{:08b}",
-+                rf.original_register_0x02, rf.released_register_0x02, rf.changed_bit_mask, rf.readback_register_0x02
++                "  Asserted: target=0b{:08b} readback=0b{:08b} matches={}",
++                rf.asserted_register_0x02, rf.asserted_readback_register_0x02, rf.asserted_readback_matches
 +            );
-+            log::info!("  Readback matches / only bit 1 changed: {}/{}", rf.readback_matches, rf.only_bit1_changed);
++            log::info!(
++                "  Released: target=0b{:08b} readback=0b{:08b} matches={}",
++                rf.released_register_0x02, rf.released_readback_register_0x02, rf.released_readback_matches
++            );
++            log::info!("  Only bit 1 changed (both halves): {}", rf.only_bit1_changed);
++            log::info!("  Pulse duration:                  {} ms", rf.pulse_duration_ms);
 +            log::info!("  Frozen UART opened:              {}", rf.frozen_uart_opened);
 +            log::info!("  Frozen reached firmware:         {}", rf.frozen_reached_firmware);
 +            log::info!("  [capwater] unavailable observed: {}", rf.capwater_unavailable_observed);
 +            log::info!("  [flowrate] unavailable observed: {}", rf.flowrate_unavailable_observed);
-+            log::info!("  Reservoir sensor operational after release: {}", rf.reservoir_sensor_operational_after_release);
++            log::info!("  Reservoir status:                {}", rf.reservoir_status);
 +            log::info!("  Prime outcome:                   {}", rf.prime_outcome);
 +            log::info!("  Prime sent:                      {}", rf.prime_sent);
 +            log::info!("  Normal done observed:            {}", rf.normal_done_observed);

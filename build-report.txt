@@ -1,13 +1,57 @@
 opensleep-diagnostic — build report
 ====================================
 
-Patch revision: 9 (adds --release-frozen-only: minimal Frozen release, no global reset)
-Supersedes revision 8 (fixed Frozen/Sensor UART paths for this Hub variant), revision 7 (replaced
+Patch revision: 10 (fixes --release-frozen-only to pulse the reset bit instead of one-shot clearing it)
+Supersedes revision 9 (added --release-frozen-only: minimal Frozen release, no global reset),
+revision 8 (fixed Frozen/Sensor UART paths for this Hub variant), revision 7 (replaced
 --preserve-boot-state with frozen-prime-opensleep-init), revision 6 (added --preserve-boot-state to
 frozen-prime-test, now removed), revision 5 (added frozen-prime-test), revision 4 (corrected
 active-test preflight/monitoring), revision 3 (staged, Frozen-only diagnostic redesign), revision 2
 (sensor-first post-reset bootloader retry-probe), and revision 1 (initial diagnostic-only fork).
 Same upstream base commit; only source.patch changed.
+
+What changed in revision 10
+----------------------------
+A live run of `--release-frozen-only` (revision 9) found register 0x02 already reading `0xFD` (bit
+1 already low) at the point of release, so that revision's one-shot `released = original & !0x02`
+was a no-op -- no write ever changed the register, no edge appeared on the pin, and Frozen never
+responded. Release is a transition, not a level: the previously-confirmed working reset sequence's
+last two writes are `0x02 <- 0xFF` (assert) then `0x02 <- 0xFD` (release), a low->high->low pulse.
+
+  - New `i2c::pulse_frozen_reset_bit` replaces `i2c::release_frozen_reset_bit_only` (removed):
+    always asserts bit 1 first (`asserted = original | 0x02`), holds it 100ms
+    (`i2c::PULSE_SETTLE`), then releases it (`released = asserted & !0x02`) -- both values computed
+    from what was actually read at each step, never hardcoded -- verifying the readback and
+    re-checking only-bit-1-changed after each of the two writes independently. The shared
+    `read_modify_write_reg02` helper now also asserts (not merely logs) that the computed target
+    cannot change any bit other than bit 1 before either write is issued. Neither write ever
+    touches registers 0x06/0x07.
+  - The post-release Ping sequence was hardened on the same evidence: after the pulse, this mode
+    now waits up to 2 seconds for boot messages, then Pings repeatedly for up to 10 more seconds,
+    tolerating any interleaved startup messages instead of failing on the first non-Pong packet,
+    before concluding Frozen never responded and aborting without ever sending Prime. This is not
+    treated as a fault -- no automatic reset is asserted for a non-responsive Frozen, only for a
+    genuine firmware-reported pump fault (unchanged from revision 9).
+  - The `RESERVOIR INDICATOR IS STILL WORKING` confirmation is now asked only once Frozen has
+    actually reached application firmware, immediately before Prime. Its outcome is reported via a
+    new three-state `ReservoirStatus` (Confirmed / FailedByOperatorObservation / Unverified)
+    replacing the previous plain boolean, so a run that aborted before ever asking is never
+    conflated with one where the operator was asked and said no. The previous automatic
+    capwater-unavailable check that gated Prime in revision 9 was removed; capwater/flowrate
+    mentions observed during the boot-message wait are still logged and reported, but only the
+    operator's own confirmation gates Prime now.
+  - `report::ReleaseFrozenOnlyResults` gained `asserted_register_0x02`/`asserted_readback_register_0x02`/
+    `asserted_readback_matches`/`released_readback_register_0x02`/`released_readback_matches`/
+    `pulse_duration_ms`/`reservoir_status` and lost `changed_bit_mask`/`readback_register_0x02`/
+    `readback_matches`/`reservoir_sensor_operational_after_release`.
+  - 4 net new tests (162 total in this directory, up from 158): 3 net new in `i2c.rs` (5
+    `release_frozen_reset_bit_only_*` tests removed, 7 pulse tests added -- including both starting
+    cases requested (0xFD and 0xFF), an exhaustive 256-value sweep proving only bit 1 ever changes
+    across both halves of the pulse, and the same sweep proving 0x06/0x07 are never written), and 1
+    net new in `prime_opensleep_init.rs` (the now-obsolete capwater-gates-Prime test removed;
+    `pulses_correctly_even_when_register_already_reads_0xfd` and
+    `aborts_without_prime_when_frozen_never_answers_ping` added). See TEST_RESULTS.md for the full
+    writeup.
 
 What changed in revision 9
 ---------------------------

@@ -1,12 +1,62 @@
 # TEST_RESULTS.md — opensleep-diagnostic
 
-All 158 unit/integration tests in `src/bin/opensleep-diagnostic/` pass (up from 145; see the
+All 162 unit/integration tests in `src/bin/opensleep-diagnostic/` pass (up from 158; see the
 revision note directly below), plus the 51 pre-existing `opensleep` library tests (unmodified,
-reused as-is) and 0 doc-tests — 209 total, 0 failed. Verified inside the
+reused as-is) and 0 doc-tests — 213 total, 0 failed. Verified inside the
 `messense/rust-musl-cross:aarch64-musl` builder image via `cargo test --locked` under its built-in
 QEMU aarch64 runner (the same environment the release binary is built in) as part of the
-diagnostic-v9 release build -- see `build-report.txt`. This revision's build succeeded on the first
-attempt.
+diagnostic-v10 release build -- see `build-report.txt`.
+
+## Revision note: fix `--release-frozen-only` to pulse the reset bit instead of one-shot clearing it
+
+A live run of `--release-frozen-only` (shipped in revision 9) found register `0x02` already reading
+`0xFD` (bit 1 already low) at the point of release. That revision's `release = original & !0x02`
+was therefore a no-op — no write ever changed the register, no edge appeared on the pin, and Frozen
+never responded to `Ping`. Release is a *transition*, not a *level*: the real, previously-confirmed
+working reset sequence's last two writes are `0x02 <- 0xFF` (assert) then `0x02 <- 0xFD` (release),
+a low→high→low pulse, not a single clear.
+
+`i2c::pulse_frozen_reset_bit` replaces `i2c::release_frozen_reset_bit_only` (removed): it always
+asserts bit 1 first (`asserted = original | 0x02`), waits 100ms
+(`i2c::PULSE_SETTLE`), then releases it (`released = asserted & !0x02`) — both values computed from
+what was actually read at each step, never a hardcoded constant — verifying the readback and
+re-checking that only bit 1 changed after *each* of the two writes independently. Both writes'
+targets are verified mathematically (via an `assert_eq!`, not merely logged) before either write is
+issued, in `read_modify_write_reg02` (the shared helper both this function and
+`assert_frozen_reset_bit_only` build on). Neither write ever touches registers `0x06`/`0x07`.
+
+The Ping/JumpToFirmware sequence that follows was also hardened based on the same evidence: this
+mode now waits up to 2 seconds for boot messages after the pulse, then Pings repeatedly for up to
+10 more seconds (tolerating any interleaved startup messages instead of failing on the first
+non-`Pong` packet) before concluding Frozen never responded and aborting without ever sending
+`Prime`. The `RESERVOIR INDICATOR IS STILL WORKING` confirmation is now asked only once Frozen has
+actually reached application firmware, immediately before `Prime` — and its outcome is reported via
+a new three-state `ReservoirStatus` (`Confirmed`/`FailedByOperatorObservation`/`Unverified`)
+instead of a plain boolean, so a run that aborted before ever asking is never conflated with one
+where the operator was asked and said no.
+
+**4 net new tests (162 total, up from 158):**
+
+* `i2c.rs` (`i2c::tests`): `release_frozen_reset_bit_only_*` (5 tests) removed; replaced with 7
+  pulse tests -- `pulse_from_0xfd_asserts_to_0xff_then_releases_to_0xfd` and
+  `pulse_from_0xff_asserts_stays_0xff_then_releases_to_0xfd` (the two starting cases explicitly
+  requested), `pulse_preserves_every_bit_except_bit_1_for_every_possible_original` (sweeps all 256
+  possible original values for *both* halves of the pulse), `pulse_never_writes_registers_0x06_or_0x07`
+  (same sweep, asserting the write log contains only register-0x02 writes),
+  `pulse_duration_reflects_the_settle_wait`, and `pulse_detects_readback_mismatch_on_the_release_half`
+  (a stale-readback mock transport proving the mismatch-detection path is reachable, adapted from the
+  revision-9 test of the same shape).
+* `prime_opensleep_init.rs` (`prime_opensleep_init::tests::release_frozen_only`): the
+  capwater-gates-Prime test was removed (capwater no longer gates Prime -- see above); replaced with
+  `pulses_correctly_even_when_register_already_reads_0xfd` (an end-to-end complement to the `i2c.rs`
+  unit test, starting a full run from the exact register state that broke revision 9) and
+  `aborts_without_prime_when_frozen_never_answers_ping` (a duplex pair whose device side is never
+  driven, proving the 10-second no-response abort path and that it does not trigger the emergency
+  reset). All other release-only tests were updated for the new field names
+  (`asserted_register_0x02`/`released_register_0x02`/etc.) and the new `ReservoirStatus` enum.
+
+Smoke-tested against the real cross-compiled binary via qemu-aarch64-static -- see
+`build-report.txt` for the full account.
 
 ## Revision note: add `--release-frozen-only`, a minimal Frozen release with no global reset
 
