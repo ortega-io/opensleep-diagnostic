@@ -613,7 +613,7 @@ opensleep (lib) unit tests:               51 passed, 0 failed
 opensleep-diagnostic (bin) unit tests:    251 passed, 0 failed
 Doc-tests:                                 0 (none defined)
 
-This revision's build succeeded on the first attempt. The bin test suite finished in 97.37s under
+This revision's build succeeded on the first attempt. The bin test suite finished in 98.11s under
 the builder image's QEMU aarch64 runner (92.54s for revision 15) -- expected, given the new
 pre-enable-race regression test's own real-duration active phase and the 5 new independent-guard
 decision-logic tests; still comfortably within the build's normal time budget.
@@ -628,27 +628,31 @@ file:      dist/opensleep-diagnostic-aarch64-static: ELF 64-bit LSB executable, 
            version 1 (SYSV), statically linked, stripped
 readelf -l: 6 program headers (LOAD x2, TLS, GNU_EH_FRAME, GNU_STACK, GNU_RELRO); no
            PT_INTERP segment -- confirms no dynamic program interpreter, i.e. truly static.
-sha256sum: 820d7a4b32071fcf838d415b35817f9d1df679b3da9730d5d57bdf6986bfe54b  opensleep-diagnostic-aarch64-static
-           (2,626,856 bytes)
+sha256sum: 1347faaa336fb76a39f4bc9e88ee88280886536275795c1a0aa10baf49310f82  opensleep-diagnostic-aarch64-static
+           (2,692,456 bytes)
            Verified against the .sha256 file written by the same build: OK
 Smoke test: qemu-aarch64-static (user-mode emulation) was used to actually run the built ARM64
-           binary on the x86-64 build host: top-level `--help` and `frozen-cool-test --help`
-           (confirms `--duration-seconds` still defaults to 120/caps at 900 (15 minutes), the
-           extended-duration-confirmation note is present, and early-stop conditions are listed);
-           `frozen-cool-test --side left --dry-run --duration-seconds 15` ran end to end against
-           the mocked I2C expander and the shared mock Frozen device, which (as of this revision)
-           pushes the real captured TEC-current/"safe, unlocking" sequence once the side is
-           enabled -- the run completed the full 15s (`stop_reason: "configured duration
-           expired"`, `stop_reason_code: "requested_duration_expired"`), with
-           `selected_tec_safety_passed: true`, `selected_tec_unlocking_observed: true`,
-           `selected_tec_current_first_a`/`min_a`/`max_a`/`last_a` all `11.402626`, and
-           `telemetry_watchdog_triggered: false` -- confirming on the actual packaged ARM64 binary
-           (not only `cargo test`) that the positive TEC safety message no longer ends the run.
-           `--duration-seconds 900` was accepted (no refusal printed); `--duration-seconds 901` was
-           refused with "exceeds the hard maximum of 900". `--raw-serial-log` was verified directly:
-           0 raw RX/TX log lines with the flag absent, present with it enabled, on otherwise-
-           identical runs. No regressions observed in the other subcommands (unchanged by this
-           revision).
+           binary on the x86-64 build host. Top-level `--help` confirms the hidden
+           `internal-cool-test-guard` subcommand does not appear in the listed commands (`grep -c`
+           against the help text returns 0). `frozen-cool-test --side left --delta-c 2
+           --duration-seconds 15 --firmware-authoritative --dry-run` ran end to end against its own
+           dedicated mock device (`mock::spawn_mock_frozen_device_firmware_authoritative`), which
+           bundles pre-enable "pump[left] off @ 0.000000V" reports into the same write as the
+           enable acknowledgment -- the exact live-hardware race item 12 asked this build to be
+           verified against. The run completed the full 15s (`stop_reason: "configured duration
+           expired"`, `stop_reason_code: "requested_duration_expired"`, not
+           `pump_startup_failure`), with `control_authority: "firmware"`,
+           `target_enabled_at: 0.000680623`, and `pump_command_observed: true` (from the
+           `"[pump-left] slow=>"`/`"default=>"` dash-format command messages) all populated
+           correctly in the JSON output -- confirming on the actual packaged ARM64 binary, not only
+           `cargo test`, that stale pre-enable telemetry no longer ends a firmware-authoritative
+           run. `independent_guard_armed`/`independent_guard_disarmed` were both `false`, as
+           expected for `--dry-run` (no real hardware for the guard to protect). Separately,
+           `--duration-seconds 900 --firmware-authoritative` was accepted (only the
+           extended-duration reminder printed, no refusal) and `--duration-seconds 901` was refused
+           with "exceeds the hard maximum of 900", confirming the duration cap is unaffected by the
+           new mode. No regressions observed in the legacy (non-`--firmware-authoritative`) path or
+           the other subcommands, all unchanged by this revision.
 
            KNOWN COSMETIC GAP (carried over from revision 8, not a correctness issue): in plain
            `frozen-prime-opensleep-init --dry-run`'s JSON output (without `--release-frozen-only`),
