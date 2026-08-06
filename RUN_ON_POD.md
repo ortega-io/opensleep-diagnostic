@@ -37,8 +37,8 @@ verification, then move it into place):
 
 ```sh
 cd /tmp
-curl -L -O https://github.com/ortega-io/opensleep-diagnostic/releases/download/diagnostic-v16/opensleep-diagnostic-aarch64-static
-curl -L -O https://github.com/ortega-io/opensleep-diagnostic/releases/download/diagnostic-v16/opensleep-diagnostic-aarch64-static.sha256
+curl -L -O https://github.com/ortega-io/opensleep-diagnostic/releases/download/diagnostic-v17/opensleep-diagnostic-aarch64-static
+curl -L -O https://github.com/ortega-io/opensleep-diagnostic/releases/download/diagnostic-v17/opensleep-diagnostic-aarch64-static.sha256
 sha256sum -c opensleep-diagnostic-aarch64-static.sha256
 mv opensleep-diagnostic-aarch64-static /persistent/tools/opensleep-diagnostic
 ```
@@ -393,9 +393,7 @@ Only proceed here once you've confirmed water movement and a stable reservoir le
 
 `--delta-c 1.0` and `--duration-seconds 120` are both already the defaults; they're spelled out
 below for clarity. Only the selected side is ever enabled -- the other side is explicitly disabled
-before the test starts and stays that way for the whole run. A 120-second default is not a long
-minimum wait: the test always stops early once the requested target temperature is reached, a
-safety condition triggers, communication with Frozen is lost, or you interrupt it.
+before the test starts and stays that way for the whole run.
 
 **This mode now starts Frozen the same way `--release-frozen-only` does** (see that flag's own
 section above and SAFETY.md) -- a narrow, single-bit I2C pulse, never the full upstream reset --
@@ -403,11 +401,17 @@ and, on a normal stop, its own shutdown performs **no I2C write at all**, leavin
 and running (never the old always-assert-0x20-reset behavior). Read SAFETY.md's `frozen-cool-test`
 section before running this if you haven't already.
 
+There are no interactive typed confirmation phrases: the four `--confirm-*` flags below are the
+complete acknowledgement mechanism, and the command proceeds straight through to enabling cooling
+with no further prompts. `--non-interactive` documents this explicitly.
+
 ```sh
 /persistent/tools/opensleep-diagnostic frozen-cool-test \
     --side left \
     --delta-c 1.0 \
     --duration-seconds 120 \
+    --firmware-authoritative \
+    --non-interactive \
     --confirm-cover-hydraulics-connected \
     --confirm-water-loop-filled \
     --confirm-no-visible-leaks \
@@ -417,27 +421,22 @@ section before running this if you haven't already.
     --verbose
 ```
 
-You will be asked to type, exactly:
+`--firmware-authoritative` is recommended: once the target is confirmed enabled, Frozen firmware
+owns pump sequencing, TEC ramping, PID control, solenoid control, fan control, current safety,
+thermal regulation, and target maintenance, and this tool becomes an observer plus a bounded stop
+timer -- it will not disable cooling merely because its own inferred pump/TEC/temperature state is
+incomplete, delayed, reordered, or temporarily stale. Omit it to use the legacy active loop's
+narrower host-side heuristics instead (see SAFETY.md for exactly how the two differ).
 
-```
-I CONFIRM THE WATER LOOP IS CONNECTED AND FILLED
-```
+Two more flags are required only in the specific situations they apply to:
 
-The tool will then run preflight (release Frozen from reset, enter firmware, collect >= 5 baseline
-samples over >= 10 seconds, validate the baseline is within 15–35C and internally consistent),
-print the proposed target, and ask for a second exact phrase:
-
-```
-START LEFT COOLING TEST
-```
-
-...and, immediately before the cooling target is actually enabled, a **third** exact phrase:
-
-```
-Type RESERVOIR INDICATOR IS STILL WORKING to continue:
-```
-
-Only type this if the reservoir-fill indicator is genuinely still responding.
+* `--confirm-extended-test` -- required when `--duration-seconds` exceeds 300 (max 900, i.e. 15
+  minutes). Prints a reminder that you must remain present and continuously monitor for leaks, a
+  burning smell, abnormal pump noise, loss of circulation, or unexpected heating for the whole run.
+* `--confirm-large-temperature-delta` -- required when the requested (or, via `--target-c`,
+  computed) cooling delta exceeds 2.0C. There is no fixed maximum delta any more -- this flag is an
+  auditable acknowledgement, not a second cap. `--target-c <TARGET_C>` sets an absolute target
+  directly instead of a delta below baseline, and is mutually exclusive with `--delta-c`.
 
 During the active phase, watch/listen (without touching or metering the open board) for:
 
@@ -449,26 +448,29 @@ During the active phase, watch/listen (without touching or metering the open boa
 
 If you observe any of the last three, **type `ABORT` (or a word like `LEAK`) and press Enter**, or
 press **Ctrl+C** immediately, or run `emergency-stop` from your second session -- all three stop
-the test. Pressing Ctrl+C does **not** exit immediately: the process disables both sides over UART
-(three repeated attempts) before it exits, exactly like every other stop reason, and (unlike
-before) performs no I2C write at all for a clean interrupt. The tool itself also stops
-automatically on: reaching the requested target temperature (not a fault -- reported as
-`target_reached`), lost/stale telemetry (> 2s), a UART read/write failure, an implausible
-temperature jump, the heatsink or water-temperature limits being exceeded, the selected pump still
-reporting off/0V more than 3 seconds after being enabled, a firmware message reporting the selected
-TEC locked, Frozen disabling the selected side on its own, a firmware fault-keyword message after a
-brief startup grace period, or the (non-overridable, 300-second-max) duration expiring -- see
-SAFETY.md for the full list. Only a genuine fault among these, combined with UART-based shutdown
-confirmation failing, triggers the narrow emergency I2C reset; every other stop reason performs no
-I2C write.
+the test (typed ABORT still works even with `--non-interactive`, as long as stdin is actually a
+terminal; SIGINT/SIGTERM handling is always active regardless). Pressing Ctrl+C does **not** exit
+immediately: the process disables both sides over UART (three repeated attempts) before it exits,
+exactly like every other stop reason, and performs no I2C write at all for a clean interrupt.
+
+With `--firmware-authoritative`, the tool otherwise only stops automatically for: the requested
+duration expiring, an explicit TEC safety-lock message, an explicit recognized firmware
+safety-fault message, the enabled target being explicitly lost, a fatal UART error, an internal
+error, or ~30 seconds of total communication silence. Reaching the requested target is logged but
+does *not* stop the test -- Frozen keeps maintaining it for the rest of the requested duration.
+Without that flag, the legacy loop also stops on: reaching the requested target temperature (not a
+fault), the selected pump still reporting off/0V more than 3 seconds after being enabled, a
+firmware fault-keyword message after a brief startup grace period, and its own separate
+communication/temperature watchdogs -- see SAFETY.md for the complete comparison. Only a genuine
+fault among these, combined with UART-based shutdown confirmation failing, triggers the narrow
+emergency I2C reset; every other stop reason performs no I2C write.
 
 By default, raw hexadecimal RX/TX byte dumps are never printed (even with `--verbose`) -- add
 `--raw-serial-log` if you specifically need them; it works independently of `--verbose`.
 
-At the end, you'll be prompted for operator observations (pump heard/felt, fan seen/heard, airflow
-felt, leak observed, unusual smell/noise, free-text notes). These are stored in the JSON report as
-`operator_observations`, kept separate from the machine-decoded `telemetry_samples` and
-`outgoing_commands`.
+There is no post-run questionnaire: the JSON report always includes `"operator observation: not
+collected"` for anything this tool cannot verify electronically, rather than pausing for input.
+Attach a free-text note with `--operator-note "<text>"` if you want one recorded -- never required.
 
 Only test one side per invocation. Repeat with `--side right` as a separate run if desired.
 
@@ -501,17 +503,19 @@ opensleep-diagnostic frozen-prime-test --dry-run \
     --confirm-cover-hydraulics-connected --confirm-reservoir-filled \
     --confirm-cover-loop-needs-priming --confirm-no-visible-leaks --confirm-active-test \
     --json-output /tmp/dryrun-prime.json
-opensleep-diagnostic frozen-cool-test --side left --dry-run \
+opensleep-diagnostic frozen-cool-test --side left --dry-run --non-interactive \
+    --firmware-authoritative \
     --confirm-cover-hydraulics-connected --confirm-water-loop-filled \
     --confirm-no-visible-leaks --confirm-active-test \
     --json-output /tmp/dryrun-cool.json
 opensleep-diagnostic emergency-stop --dry-run
 ```
 
-`frozen-prime-test --dry-run` and `frozen-cool-test --dry-run` still require the interactive typed
-confirmations unless stdin is not a TTY (e.g. when piping input in a script or CI). Dry-run never
-silently switches to live mode — if it can't run against the mock, it refuses, the same as live
-mode would.
+`frozen-prime-test --dry-run` still requires its interactive typed confirmations unless stdin is
+not a TTY (e.g. when piping input in a script or CI). `frozen-cool-test --dry-run` has no
+interactive typed confirmations at all any more -- the four `--confirm-*` flags above are
+sufficient regardless of `--non-interactive`. Dry-run never silently switches to live mode — if it
+can't run against the mock, it refuses, the same as live mode would.
 
 ## What this tool will never do on the Pod
 
