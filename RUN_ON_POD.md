@@ -37,8 +37,8 @@ verification, then move it into place):
 
 ```sh
 cd /tmp
-curl -L -O https://github.com/ortega-io/opensleep-diagnostic/releases/download/diagnostic-v17/opensleep-diagnostic-aarch64-static
-curl -L -O https://github.com/ortega-io/opensleep-diagnostic/releases/download/diagnostic-v17/opensleep-diagnostic-aarch64-static.sha256
+curl -L -O https://github.com/ortega-io/opensleep-diagnostic/releases/download/diagnostic-v18/opensleep-diagnostic-aarch64-static
+curl -L -O https://github.com/ortega-io/opensleep-diagnostic/releases/download/diagnostic-v18/opensleep-diagnostic-aarch64-static.sha256
 sha256sum -c opensleep-diagnostic-aarch64-static.sha256
 mv opensleep-diagnostic-aarch64-static /persistent/tools/opensleep-diagnostic
 ```
@@ -428,15 +428,21 @@ timer -- it will not disable cooling merely because its own inferred pump/TEC/te
 incomplete, delayed, reordered, or temporarily stale. Omit it to use the legacy active loop's
 narrower host-side heuristics instead (see SAFETY.md for exactly how the two differ).
 
-Two more flags are required only in the specific situations they apply to:
+One more flag is required only in the specific situation it applies to:
 
-* `--confirm-extended-test` -- required when `--duration-seconds` exceeds 300 (max 900, i.e. 15
-  minutes). Prints a reminder that you must remain present and continuously monitor for leaks, a
-  burning smell, abnormal pump noise, loss of circulation, or unexpected heating for the whole run.
 * `--confirm-large-temperature-delta` -- required when the requested (or, via `--target-c`,
   computed) cooling delta exceeds 2.0C. There is no fixed maximum delta any more -- this flag is an
   auditable acknowledgement, not a second cap. `--target-c <TARGET_C>` sets an absolute target
   directly instead of a delta below baseline, and is mutually exclusive with `--delta-c`.
+
+There is no diagnostic-imposed maximum duration any more, and no separate confirmation flag for a
+long run (the former `--confirm-extended-test` flag was removed along with the 900-second ceiling
+it existed to gate). `--duration-seconds 3600` still works exactly as before; for a longer,
+human-readable duration use `--duration <DURATION>` instead (`30m`, `1h`, `4h`, `8h30m` -- mutually
+exclusive with `--duration-seconds`). A duration above 300 seconds prints a reminder, not a
+required flag, that you must remain present and continuously monitor for leaks, a burning smell,
+abnormal pump noise, loss of circulation, or unexpected heating for the whole run. Every active
+test still requires *some* finite duration -- there is no "run forever" mode.
 
 During the active phase, watch/listen (without touching or metering the open board) for:
 
@@ -472,7 +478,8 @@ There is no post-run questionnaire: the JSON report always includes `"operator o
 collected"` for anything this tool cannot verify electronically, rather than pausing for input.
 Attach a free-text note with `--operator-note "<text>"` if you want one recorded -- never required.
 
-Only test one side per invocation. Repeat with `--side right` as a separate run if desired.
+`--side left`/`--side right` tests exactly one side per invocation; repeat with the other side as a
+separate run if desired. `--side both` (see below) tests both simultaneously in one run instead.
 
 ### Reading the cooling result
 
@@ -485,12 +492,85 @@ Pump operation:                 PASS/FAIL/UNVERIFIED
 Fan operation:                  PASS/FAIL/UNVERIFIED
 TEC cooling operation:          PASS/FAIL/UNVERIFIED
 Telemetry remained valid:       PASS/FAIL
-Emergency shutdown:             PASS/FAIL
+Controlled shutdown:            PASS/FAIL
 Overall selected-side result:   PASS/FAIL/INCONCLUSIVE
 ```
 
+("Controlled shutdown" reads "Emergency shutdown" instead only on the rare run where the narrow
+emergency I2C reset genuinely fired, e.g. because UART-based shutdown confirmation itself failed.)
+
 See PROTOCOL_AUDIT.md for exactly what evidence can ever produce a PASS for each line — in
 particular, pump/fan/TEC are never marked PASS merely because the command was accepted.
+
+### Simultaneous dual-side operation: `--side both`
+
+`--side both` enables left and right for the same bounded test and disables them together at
+shutdown -- it **requires `--firmware-authoritative`** (the legacy loop's host-side heuristics are
+single-side only by design; see SAFETY.md). `--target-c` sends the exact same absolute target to
+both sides; `--delta-c` applies the same delta independently to each side's own measured baseline
+(the two resulting targets may differ slightly if the baselines do).
+
+```sh
+/persistent/tools/opensleep-diagnostic frozen-cool-test \
+    --side both \
+    --delta-c 1.0 \
+    --duration 4h \
+    --firmware-authoritative \
+    --non-interactive \
+    --confirm-cover-hydraulics-connected \
+    --confirm-water-loop-filled \
+    --confirm-no-visible-leaks \
+    --confirm-active-test \
+    --json-output /persistent/frozen-cool-both.json \
+    --csv-output /persistent/frozen-cool-both.csv \
+    --verbose
+```
+
+The active phase does not begin observing until *both* sides' enabled `TargetUpdate` is explicitly
+confirmed over UART. If only one side confirms, both are immediately disabled and the run never
+continues with one side active. A fault on either side (an explicit TEC safety-lock message, or the
+enabled target being explicitly lost) stops both sides together, never just the one that faulted.
+
+### Long, unattended, or session-independent runs
+
+Every run above prints a compact progress line about once a minute (elapsed/remaining time, each
+side's current temperature and target, pump/fan state) instead of repeating every unchanged reading
+at INFO level -- useful for tailing a multi-hour log. An `--firmware-authoritative` run is also
+protected by an independent shutdown guard process the whole time (see SAFETY.md): it holds its own
+copy of the requested deadline and disables the relevant side(s) even if the main process dies,
+hangs, or the terminal running it disconnects.
+
+**Stdin closing is not itself treated as an abort** -- only the literal typed `ABORT` command is,
+and only while stdin is actually a live terminal. Ctrl+C/SIGTERM still trigger the same controlled
+shutdown as any other stop reason regardless of whether stdin is a terminal. This binary does not
+auto-daemonize, so a run you want to survive your SSH session ending should be started under
+`systemd-run` or `nohup` rather than left attached to an interactive shell:
+
+```sh
+# systemd-run: supervised, journal-logged, survives the SSH session ending
+systemd-run --unit=frozen-cool-both --collect \
+    /persistent/tools/opensleep-diagnostic frozen-cool-test \
+    --side both --delta-c 1.0 --duration 4h --firmware-authoritative --non-interactive \
+    --confirm-cover-hydraulics-connected --confirm-water-loop-filled \
+    --confirm-no-visible-leaks --confirm-active-test \
+    --json-output /persistent/frozen-cool-both.json --verbose
+# journalctl -u frozen-cool-both -f       # tail the run
+# systemctl stop frozen-cool-both         # SIGTERM -> the same controlled shutdown as Ctrl+C
+
+# nohup: simpler, no systemd unit, also survives SIGHUP from the closing terminal
+nohup /persistent/tools/opensleep-diagnostic frozen-cool-test \
+    --side both --delta-c 1.0 --duration 4h --firmware-authoritative --non-interactive \
+    --confirm-cover-hydraulics-connected --confirm-water-loop-filled \
+    --confirm-no-visible-leaks --confirm-active-test \
+    --json-output /persistent/frozen-cool-both.json --verbose \
+    > /persistent/frozen-cool-both.log 2>&1 &
+disown
+# tail -f /persistent/frozen-cool-both.log
+# kill <pid>                              # SIGTERM -> the same controlled shutdown as Ctrl+C
+```
+
+Either way, `emergency-stop` from a second session remains available as a last resort regardless of
+how the run was started (see "Keep a second session open" in SAFETY.md).
 
 ## Dry-run mode (safe on any development machine, no hardware needed)
 
