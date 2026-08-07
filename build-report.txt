@@ -1,9 +1,11 @@
 opensleep-diagnostic — build report
 ====================================
 
-Patch revision: 17 (full firmware-authoritative cooling tests: no delta cap, no interactive
-confirmations, fixes a second false firmware-fault positive)
-Supersedes revision 16 (adds --firmware-authoritative, an optional narrower active-phase mode),
+Patch revision: 18 (remove the 900s duration ceiling, add --side both for simultaneous dual-side
+operation, harden the independent shutdown guard for hours-long runs)
+Supersedes revision 17 (full firmware-authoritative cooling tests: no delta cap, no interactive
+confirmations, fixes a second false firmware-fault positive), revision 16 (adds
+--firmware-authoritative, an optional narrower active-phase mode),
 revision 15 (fixes a watchdog-clock mismatch and a caller-side TEC control-flow bug),
 revision 14 (fixed a false TEC-lock abort; extended the active phase to 15 minutes),
 revision 13 (decoded the 14-byte GetTemperature reply; fixed a premature 40s baseline cutoff),
@@ -17,6 +19,58 @@ frozen-prime-test, now removed), revision 5 (added frozen-prime-test), revision 
 active-test preflight/monitoring), revision 3 (staged, Frozen-only diagnostic redesign), revision 2
 (sensor-first post-reset bootloader retry-probe), and revision 1 (initial diagnostic-only fork).
 Same upstream base commit; only source.patch changed.
+
+What changed in revision 18
+----------------------------
+A 900-second right-side --firmware-authoritative cooling test completed successfully (target
+reached and maintained, pump/fan/TEC evidence PASS, 0 of 1200 firmware-reported temperature reads
+failed, both targets confirmed disabled, verified shutdown, no emergency reset) -- conclusively
+demonstrating the former 900-second/15-minute duration ceiling was an artificial host-side test
+limitation, not a demonstrated Frozen firmware limitation.
+
+  - Removed the hard-coded 900s maximum duration entirely, across the CLI, safety checks,
+    reporting, and docs. Every active test still requires an explicit, finite duration (no "run
+    forever" mode), but there is no diagnostic-imposed maximum: a value is only rejected for being
+    zero, failing to parse, being unrepresentable as a std::time::Duration, or causing the
+    monotonic deadline computation to overflow (checked arithmetic throughout). New --duration
+    <DURATION> accepts human-readable values (30m, 1h, 4h, 8h30m) via the integer-backed humantime
+    crate (never floating-point hours), mutually exclusive with the pre-existing --duration-seconds
+    (kept for backward compatibility); neither given still defaults to 120s. --confirm-extended-test
+    was removed along with the ceiling it gated -- the four existing --confirm-* flags are
+    sufficient acknowledgement; a duration above 300s now only prints a reminder.
+  - Extended --side with a "both" value for simultaneous left+right operation in the same bounded
+    test, always requiring --firmware-authoritative (the legacy loop's per-tick host-side heuristics
+    are single-side only by design). Side::Both is never itself represented on the wire: Frozen
+    still receives one ordinary SetTargetTemperature for Left and one for Right, sent back-to-back
+    with no unrelated polling interleaved. --target-c with --side both sends the same absolute
+    target to both sides (each independently validated against its own baseline); --delta-c with
+    --side both applies the same delta independently to each side's own baseline (targets may
+    differ slightly). Active observation never begins until both sides' enabled TargetUpdate is
+    explicitly confirmed; a partial enable (only one side confirms) is its own terminal condition
+    (partial_dual_side_enable) that immediately disables both and never continues with one side
+    active. A fault on either side stops both sides together.
+  - Hardened the independent shutdown guard (the separate OS process backstopping the main process
+    crashing, hanging, or being killed) for runs that can now legitimately last hours. It previously
+    only detected the main process exiting (its stdin pipe closing); it now also requires a periodic
+    heartbeat byte from within the main process's own per-tick active loop (10s interval, 45s
+    timeout) -- a genuinely stuck loop, not just a dead process, now triggers the same immediate
+    controlled disable. The guard also runs in its own process group (immune to a SIGHUP delivered
+    to the parent's controlling terminal) and separately consumes SIGINT/SIGTERM/SIGHUP itself in a
+    loop that never exits on any of them.
+  - Fixed a target_reached: true / time_to_target_seconds: None reporting bug in
+    --firmware-authoritative mode: the boolean was set but the elapsed time was never actually
+    recorded. Now measured from each side's own enable confirmation to its own target being reached,
+    tracked independently per side so one side reaching target first can never overwrite the other's
+    value.
+  - Added the dual-side report fields (per-side baseline/target/confirmed/reached/time-to-target/
+    pump/TEC-current/shutdown-observed fields, independent_guard_activated, requested_side_mode),
+    populated for --side both runs and populated from the requested side alone for a one-side run.
+    "Emergency shutdown: PASS" in the printed report is now "Controlled shutdown: PASS" for
+    frozen-cool-test, unless the narrow emergency I2C reset genuinely fired.
+  - Added per-minute progress logging for both the one-side and --side both active phases, instead
+    of repeating every unchanged reading at INFO level.
+
+15 net new tests (274 total, up from 259). See TEST_RESULTS.md for the full writeup.
 
 What changed in revision 17
 ----------------------------
@@ -649,13 +703,14 @@ Tests:       cargo test --locked (run under the image's built-in QEMU test runne
 Test results (this build, inside the builder image)
 -----------------------------------------------------
 opensleep (lib) unit tests:               51 passed, 0 failed
-opensleep-diagnostic (bin) unit tests:    259 passed, 0 failed
+opensleep-diagnostic (bin) unit tests:    274 passed, 0 failed
 Doc-tests:                                 0 (none defined)
 
-This revision's build succeeded on the first attempt. The bin test suite finished in 101.76s under
-the builder image's QEMU aarch64 runner (98.11s for revision 16) -- expected, given the new
-end-to-end [temps]/fan regression test's own real-duration active phase; still comfortably within
-the build's normal time budget.
+This revision's build succeeded on the first attempt (a --no-cache rebuild was additionally run to
+confirm the test suite and release build both execute fresh, not from a stale cache, against the
+updated source.patch). The bin test suite finished in 117.02s under the builder image's QEMU
+aarch64 runner (101.76s for revision 17) -- expected, given the 15 net new dual-side/duration
+tests; still comfortably within the build's normal time budget.
 
 See TEST_RESULTS.md for the full breakdown against the safety spec's checklists (30-item for the
 original redesign, 28-item for frozen-prime-test), plus the "New tests added" sections for each
@@ -667,31 +722,29 @@ file:      dist/opensleep-diagnostic-aarch64-static: ELF 64-bit LSB executable, 
            version 1 (SYSV), statically linked, stripped
 readelf -l: 6 program headers (LOAD x2, TLS, GNU_EH_FRAME, GNU_STACK, GNU_RELRO); no
            PT_INTERP segment -- confirms no dynamic program interpreter, i.e. truly static.
-sha256sum: c775ffc6863bb3c706151b70cf2052e7bb69e6b83029dd19c0102d44744650ec  opensleep-diagnostic-aarch64-static
-           (2,692,520 bytes)
+sha256sum: 247d3663fd5f28d4d5de4caddc2ed09a78981b9ce7a6e54efee5c6b31ba689a6  opensleep-diagnostic-aarch64-static
+           (2,823,592 bytes)
            Verified against the .sha256 file written by the same build: OK
-Smoke test: qemu-aarch64-static (user-mode emulation) was used to actually run the built ARM64
-           binary on the x86-64 build host, exercising item 12's exact command:
-           `frozen-cool-test --side left --delta-c 5 --duration-seconds 900
-           --firmware-authoritative --non-interactive --confirm-cover-hydraulics-connected
-           --confirm-water-loop-filled --confirm-no-visible-leaks --confirm-active-test
-           --confirm-extended-test --confirm-large-temperature-delta --dry-run`. The command was
-           accepted and proceeded straight through startup, both-side disable, and baseline
-           collection into `--firmware-authoritative` observation with zero interactive prompts
-           (`grep -ic` for every removed phrase's prompt text, and for the questionnaire's own
-           prompt strings, against the full run log returns 0) before being killed by an external
-           timeout (duration 900s is real wall-clock time; the flag-acceptance and no-prompt
-           behavior is what this check verifies, not full completion). A second, `--duration-seconds
-           15` run of the same command completed normally: `requested_delta_c: 5.0` (accepted with
-           `--confirm-large-temperature-delta`, no refusal), `control_authority: "firmware"`, and
-           `operator_observations` showing `"not collected"` for `pump_heard_or_felt`/
-           `fan_seen_or_heard`/`airflow_felt` (no questionnaire prompt) all populated correctly in
-           the JSON output. Two negative checks confirmed directly: `--delta-c 5` without
-           `--confirm-large-temperature-delta` is refused ("exceeds 2.00C and requires
-           --confirm-large-temperature-delta"), and `--delta-c 1 --target-c 20` together are
-           refused ("mutually exclusive"). No regressions observed in the legacy
-           (non-`--firmware-authoritative`) path or the other subcommands, all unchanged by this
-           revision.
+           Identical checksum produced by both a cached and a --no-cache rebuild -- deterministic.
+Smoke test: qemu-aarch64-static (user-mode emulation, via the host's binfmt_misc registration) was
+           used to actually run the built ARM64 binary directly on the x86-64 build host, exercising
+           this revision's item 11 exactly:
+           (a) `frozen-cool-test --side both --delta-c 5 --duration 2s --firmware-authoritative
+           --non-interactive --confirm-cover-hydraulics-connected --confirm-water-loop-filled
+           --confirm-no-visible-leaks --confirm-active-test --confirm-large-temperature-delta
+           --dry-run` -- 2 enabled target commands sent (left then right), stop reason
+           requested_duration_expired, Controlled shutdown: PASS, overall_pass: true.
+           (b) same but `--target-c 20 --duration 2s` in place of `--delta-c 5` -- calculated left
+           and right targets both exactly 20.00C, 2 enabled target commands sent, overall_pass: true.
+           (c) backward-compatible `--side left --delta-c 5 --duration-seconds 2
+           --firmware-authoritative --non-interactive ...` (no --duration) -- 1 enabled target
+           command sent, overall_pass: true, confirming --duration-seconds alone (no --duration)
+           still works unchanged.
+           A `--duration 1h --duration-seconds 60` command was also confirmed refused instantly
+           ("--duration and --duration-seconds are mutually exclusive"), and `--side both` without
+           `--firmware-authoritative` was confirmed refused ("--side both requires
+           --firmware-authoritative"). No regressions observed in the legacy (non-`--side both`)
+           path or the other subcommands, all unchanged by this revision.
 
            KNOWN COSMETIC GAP (carried over from revision 8, not a correctness issue): in plain
            `frozen-prime-opensleep-init --dry-run`'s JSON output (without `--release-frozen-only`),
