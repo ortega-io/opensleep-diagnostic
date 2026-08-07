@@ -290,8 +290,21 @@ PROTOCOL_AUDIT.md.
 
 ## Active-test limits (hard-coded; no CLI flag can override them)
 
-* Exactly one side per invocation; cooling only (no heating) in this first build. The other side is
-  explicitly disabled before the test starts and stays that way for the whole run.
+* `--side left`/`--side right` enables exactly one side; cooling only (no heating). The other side
+  is explicitly disabled before the test starts and stays that way for the whole run. `--side both`
+  (revision 18+) enables both sides for the same bounded test and disables them together at
+  shutdown — it **requires `--firmware-authoritative`**, since the legacy active loop's per-tick
+  host-side heuristics (pump-startup confirmation, the communication/temperature watchdogs) are
+  single-side by design and do not generalize to two independently progressing sides. `--side both`
+  is never represented as a distinct value on the wire: Frozen still receives one ordinary
+  `SetTargetTemperature` for Left and one for Right, sent back-to-back with no unrelated polling
+  interleaved between the two writes, and the active phase does not begin observing until *both*
+  sides' enabled `TargetUpdate` is explicitly confirmed. If only one side confirms, this is treated
+  as its own terminal condition (`partial_dual_side_enable`): both sides are immediately disabled
+  and the run never continues with only one side active. For `--target-c` with `--side both`, the
+  exact same absolute target is sent to both sides (each still validated against its own measured
+  baseline); for `--delta-c` with `--side both`, the same delta is applied independently to each
+  side's own baseline, so the two resulting targets may differ slightly.
 * Default cooling delta: 1.0C below the measured baseline, used only when neither `--delta-c` nor
   `--target-c` is supplied — this default is not a maximum. **There is no fixed host-side maximum
   delta any more**: a live-hardware run conclusively demonstrated working cooling, circulation, fan
@@ -305,12 +318,27 @@ PROTOCOL_AUDIT.md.
   target directly instead of a delta below baseline; it is mutually exclusive with `--delta-c` and
   validated against the measured baseline once that's known.
 * Default active duration: **120 seconds** — long enough to establish meaningful water-temperature
-  movement through the filled cover loop. **Absolute maximum: 900 seconds (15 minutes)** —
-  `cool_test::run` refuses to start at all if `--duration-seconds` exceeds this. Requesting more
-  than 300 seconds requires the explicit `--confirm-extended-test` acknowledgement and prints a
-  reminder that the operator must remain present for the whole run and continuously monitor for
-  leaks, a burning smell, abnormal pump noise, loss of circulation, or unexpected heating. A long
-  duration is not a long minimum wait: in the legacy active loop, the test always stops early once
+  movement through the filled cover loop, used only when neither `--duration` nor
+  `--duration-seconds` is supplied. **There is no diagnostic-imposed maximum duration** (revision
+  18+ removed the former hard 900-second/15-minute ceiling): a 900-second live-hardware run
+  conclusively demonstrated working cooling, pump/fan/TEC operation, and verified shutdown at that
+  duration, making the old ceiling an artificial host-side limitation rather than a demonstrated
+  Frozen limitation. Every active test still requires an explicit, finite duration — there is no
+  "run forever" mode — accepted either as `--duration-seconds <N>` (an integer count of seconds,
+  kept for backward compatibility) or the human-readable `--duration <DURATION>` (e.g. `30m`, `1h`,
+  `4h`, `8h30m`; the two flags are mutually exclusive). `--duration` is parsed with the
+  integer-backed `humantime` crate — never through floating-point hours — and is only rejected for
+  being zero, failing to parse, being unrepresentable as a `std::time::Duration`, or causing the
+  monotonic deadline computation to overflow (checked arithmetic throughout, via
+  `Instant::checked_add`). Requesting more than 300 seconds prints a reminder (not a required
+  acknowledgement flag — the former `--confirm-extended-test` flag was removed along with the
+  ceiling it existed to gate, since the four required `--confirm-*` flags are already sufficient
+  acknowledgement) that the operator must remain present for the whole run and continuously monitor
+  for leaks, a burning smell, abnormal pump noise, loss of circulation, or unexpected heating. Every
+  active `--firmware-authoritative` run — one-side or `--side both` — is additionally protected by
+  an independent shutdown guard process (see below) that holds its own copy of the finite deadline
+  and disables the relevant side(s) even if the main process dies. A long duration is not a long
+  minimum wait: in the legacy active loop, the test always stops early once
   the requested target temperature is reached *and stays reached* for a short confirmation window
   (never on a single noisy sample, and the TEC is never kept enabled merely to consume the rest of
   the requested duration once that's confirmed); in `--firmware-authoritative` mode, target
@@ -513,6 +541,39 @@ latest duty/RPM, and max RPM directly.
 guaranteed shutdown sequence below — it changes what the active phase watches for and what it does
 about what it sees.
 
+### Revision 18: hours-long runs and simultaneous dual-side operation
+
+A 900-second right-side `--firmware-authoritative` run completed successfully (target reached and
+maintained, pump/fan/TEC evidence PASS, 0 of 1200 firmware-reported temperature reads failed,
+verified shutdown), demonstrating the former 900-second ceiling was an artificial host-side test
+limitation, not a demonstrated Frozen limitation. Revision 18 removed that ceiling (see "Active-test
+limits" above) and added `--side both` for simultaneous left+right operation, always gated on
+`--firmware-authoritative` for the reason given there. Three changes specific to this revision:
+
+* **Per-side terminal conditions.** A `--side both` run recognizes the same closed set of stop
+  conditions as a one-side run, doubled: `explicit_left_tec_unsafe_locking`/
+  `explicit_left_tec_locked` and their right-side counterparts, and `enabled_left_target_explicitly_lost`/
+  `enabled_right_target_explicitly_lost`. A fault on *either* side stops *both* — cooling is never
+  left running on one side while the other has been disabled for a fault. `partial_dual_side_enable`
+  (only one of the two requested sides confirmed enabled) is its own terminal condition: the active
+  phase never begins in that state, and both sides are immediately disabled, verified, and the
+  independent guard disarmed only after that verification.
+* **The independent shutdown guard now detects a hung — not just a dead — parent.** Previously it
+  only noticed the main process exiting (its stdin pipe closing). It now also requires a periodic
+  heartbeat byte from *within* the main process's own per-tick active loop (every 10s, timing out
+  after 45s of silence) — a genuinely stuck loop (not merely a slow one) stops heartbeating too, and
+  the guard treats heartbeat loss identically to parent death: an immediate, controlled disable of
+  every side that run may have activated. The guard is also now explicitly immune to a terminal
+  disconnecting: it runs in its own process group (so a SIGHUP delivered to the parent's controlling
+  terminal is never delivered to it) and additionally consumes SIGINT/SIGTERM/SIGHUP itself in a
+  loop that never exits on any of them — only its own disarm byte or firing ends it.
+* **Terminal/SSH disconnection is distinct from stdin closing.** SIGINT/SIGTERM initiate the same
+  controlled both-side shutdown as any other stop condition. Stdin closing (e.g. a redirected or
+  piped invocation) is not itself treated as an abort — only the literal typed `ABORT` command is,
+  and only while stdin is actually a live TTY. For a run expected to outlive the invoking terminal
+  session, use `systemd-run` or `nohup` (see RUN_ON_POD.md) rather than relying on the process
+  surviving an SSH disconnect on its own; this binary does not auto-daemonize.
+
 ## Automatic abort conditions during `frozen-prime-test`'s active phase
 
 The active phase aborts itself (and always runs safe-stop) on any of the following, in addition to
@@ -557,14 +618,16 @@ working cooling, circulation, fan control, TEC operation, temperature reduction,
 shutdown, and every phrase this mode previously asked for (`I CONFIRM THE WATER LOOP IS CONNECTED
 AND FILLED`, a second phrase naming the selected side, and a third reservoir-indicator phrase) has
 been removed. The command never pauses to wait for typed input; `--non-interactive` documents this
-explicitly and additionally guarantees no post-run questionnaire either (see below). Two more
-command-line flags are required only in the specific situations they apply to:
+explicitly and additionally guarantees no post-run questionnaire either (see below). One more
+command-line flag is required only in the specific situation it applies to:
 
-* `--confirm-extended-test` — required when `--duration-seconds` exceeds 300. Replaces the former
-  `RUN EXTENDED COOLING TEST FOR UP TO 15 MINUTES` phrase.
 * `--confirm-large-temperature-delta` — required when the requested (or, via `--target-c`,
   computed) cooling delta exceeds 2.0C. An auditable acknowledgement only, not a second maximum —
   see "Active-test limits" above.
+
+(Revision 18 removed the former `--confirm-extended-test` flag along with the duration ceiling it
+existed to gate — a duration above 300 seconds now only prints a reminder, not a required flag; see
+"Active-test limits" above.)
 
 A fully specified command with every flag it needs proceeds straight through to enabling cooling
 with no further prompts.

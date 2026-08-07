@@ -106,8 +106,8 @@ unaffected. Raw packet buffers remain available for any frame, known or not, onl
 | `GetFirmware` | `0x04` | `7E 01 04 8C 18` | yes (best-effort, after firmware Ping) | yes | yes (best-effort) | no |
 | `JumpToFirmware` | `0x10` | `7E 01 10 DE AD` | yes, only if bootloader detected **and** `--allow-firmware-jump` | yes, same gate | yes, same gate | no |
 | `GetTemperatures` | `0x41` | `7E 01 41 ...` | yes, 1/s during the telemetry window | yes, ~1/s during baseline + active phases, sent fire-and-forget (see the `0xC1`/`0x41` finding above -- the reply is now decoded during baseline, both the 27-byte and 14-byte shapes) | yes, ~1/s during baseline + active phases, same fire-and-forget pattern | no |
-| `SetTargetTemperature(enabled=false)` | `0x40` | see below | yes, both sides | yes, both sides (other side always disabled) | yes, both sides (explicitly disabled before Prime, and by every safe-stop) | yes, both sides (the only thing this subcommand sends) |
-| `SetTargetTemperature(enabled=true)` | `0x40` | see below | **never** | yes, **exactly** the one side selected at the CLI | **never** | **never** |
+| `SetTargetTemperature(enabled=false)` | `0x40` | see below | yes, both sides | yes, both sides (the non-selected side always disabled; for `--side both`, both sides disabled together at shutdown) | yes, both sides (explicitly disabled before Prime, and by every safe-stop) | yes, both sides (the only thing this subcommand sends) |
+| `SetTargetTemperature(enabled=true)` | `0x40` | see below | **never** | yes: exactly the one side selected at the CLI, or (revision 18+, `--side both`, requires `--firmware-authoritative`) **both** sides, sent as two ordinary single-side commands back-to-back -- `Side::Both` is never itself represented on the wire; `AuditedTransport`'s whitelist (`Mode::CoolTest { left_allowed, right_allowed }`) permits either or both depending on what was requested | **never** | **never** |
 | `Prime` | `0x52` | `7E 01 52 B6 2B` | **never reachable** | **never reachable** | yes, **at most once per run** | **never reachable** |
 | `Random(_)` | any | — | **never reachable**: no `FrozenAction::Random` exists | **never reachable** | **never reachable** | **never reachable** |
 
@@ -118,6 +118,17 @@ upstream's own `frozen::command::tests::test_temp` and `common::checksum::tests:
 reused unmodified by this fork. The `Prime` frame `7E 01 52 B6 2B` is likewise asserted
 byte-for-byte by upstream's own `frozen::command::tests::test_prime`, and cross-checked by this
 fork's own `prime_test::tests::prime_action_serializes_to_the_exact_source_evidenced_frame`.
+
+### The `temp` field's wire range is not its operating range
+
+`SetTargetTemperature`'s `temp` field is a `u16` centidegrees-Celsius value, so its full wire-format
+range is `0.00`–`655.35C`. That is a **wire-format range, not an operating range**: the documented
+Pod hardware operates `12.78C`–`43.33C` (`55F`–`110F`). This tool never describes `655.35C` as an
+operationally supported target, and `safety::FrozenAction::enable_cooling` independently refuses a
+resulting target outside a conservative `0`–`45C` absolute backstop regardless of what the u16 field
+could otherwise represent -- see SAFETY.md's "Active-test limits". Each calculated target
+(`--delta-c` or `--target-c`) is additionally required to fall below the side's own just-measured
+baseline before the enable command is ever constructed.
 
 ### Why `Random` is unreachable, and `Prime` is reachable in exactly one *audited* mode
 

@@ -1,11 +1,91 @@
 # TEST_RESULTS.md — opensleep-diagnostic
 
-All 259 unit/integration tests in `src/bin/opensleep-diagnostic/` pass (up from 251; see the
+All 274 unit/integration tests in `src/bin/opensleep-diagnostic/` pass (up from 259; see the
 revision note directly below), plus the 51 pre-existing `opensleep` library tests (unmodified,
-reused as-is) and 0 doc-tests — 310 total, 0 failed. Verified inside the
+reused as-is) and 0 doc-tests — 325 total, 0 failed. Verified inside the
 `messense/rust-musl-cross:aarch64-musl` builder image via `cargo test --locked` under its built-in
 QEMU aarch64 runner (the same environment the release binary is built in) as part of the
-diagnostic-v17 release build -- see `build-report.txt`.
+diagnostic-v18 release build -- see `build-report.txt`.
+
+## Revision note: remove the 900s duration ceiling, add `--side both` for simultaneous dual-side
+## operation, and harden the independent shutdown guard for hours-long runs
+
+A 900-second right-side `--firmware-authoritative` cooling test completed successfully (target
+reached and maintained, pump/fan/TEC evidence PASS, 0 of 1200 firmware-reported temperature reads
+failed, both targets confirmed disabled, verified shutdown, no emergency reset) -- conclusively
+demonstrating the former 900-second/15-minute duration ceiling was an artificial host-side test
+limitation, not a demonstrated Frozen firmware limitation. This revision:
+
+* **Removed the hard-coded 900s maximum duration entirely**, across the CLI, the safety checks, the
+  reporting, and the docs. Every active test still requires an explicit, finite duration -- there
+  is no "run forever" mode -- but there is no diagnostic-imposed maximum: a value is only rejected
+  for being zero, failing to parse, being unrepresentable as a `std::time::Duration`, or causing the
+  monotonic deadline computation to overflow (checked arithmetic throughout, via
+  `Instant::checked_add`). New `--duration <DURATION>` accepts human-readable values (`30m`, `1h`,
+  `4h`, `8h30m`) via the integer-backed `humantime` crate (never floating-point hours), mutually
+  exclusive with the pre-existing `--duration-seconds` (kept for backward compatibility). Neither
+  flag given still defaults to 120 seconds. The former `--confirm-extended-test` flag, and the
+  duration-based requirement for it, were removed along with the ceiling they existed to gate -- the
+  four existing required `--confirm-*` flags are sufficient acknowledgement; a duration above 300s
+  now only prints a reminder.
+* **Extended `--side` with a `both` value** for simultaneous left+right operation in the same
+  bounded test, always requiring `--firmware-authoritative` (the legacy active loop's per-tick
+  host-side heuristics are single-side only by design and do not generalize to two independently
+  progressing sides -- a deliberate scoping decision, not an oversight). `Side::Both` is never
+  itself represented on the wire: Frozen still receives one ordinary `SetTargetTemperature` for Left
+  and one for Right, sent back-to-back with no unrelated polling interleaved between the two writes.
+  `--target-c` with `--side both` sends the exact same absolute target to both sides (each still
+  independently validated against its own measured baseline); `--delta-c` with `--side both` applies
+  the same delta independently to each side's own baseline, so the two resulting targets may differ
+  slightly. The active phase does not begin observing until *both* sides' enabled `TargetUpdate` is
+  explicitly confirmed; if only one side confirms, this is its own terminal condition
+  (`partial_dual_side_enable`) -- both sides are immediately disabled, verified, and the run never
+  continues with only one side active. A fault on either side (an explicit TEC safety-lock message,
+  or that side's enabled target being explicitly lost) stops both sides together.
+* **Hardened the independent shutdown guard** (the separate OS process that backstops the main
+  process crashing, hanging, or being killed) for runs that can now legitimately last hours. It
+  previously only detected the main process *exiting* (its stdin pipe closing). It now additionally
+  requires a periodic heartbeat byte written from within the main process's own per-tick active loop
+  (every 10s, timing out after 45s of silence) -- a genuinely stuck loop, not just a dead process,
+  now triggers the same immediate controlled disable. The guard also runs in its own process group
+  (so a SIGHUP delivered to the parent's controlling terminal is never delivered to it) and
+  separately consumes SIGINT/SIGTERM/SIGHUP itself in a loop that never exits on any of them -- only
+  its own disarm byte or firing ends it, so a disconnecting SSH session can never silently disable
+  this safety net.
+* **Fixed a `target_reached: true` / `time_to_target_seconds: None` reporting bug** in
+  `--firmware-authoritative` mode: `record_fa_temperature_sample` set the boolean but never actually
+  recorded the elapsed time. Now measured from the side's own enable confirmation to its own target
+  being reached, tracked independently per side (`left_time_to_target_seconds`/
+  `right_time_to_target_seconds`) so one side reaching target first can never overwrite or block the
+  other's value -- regression-tested by
+  `firmware_authoritative_time_to_target_is_populated_when_target_is_reached`.
+* **Added the dual-side report fields** item 9 of this revision's spec calls for (`requested_side_mode`,
+  per-side baseline/target/confirmed/reached/time-to-target/pump/TEC-current/shutdown-observed
+  fields, `independent_guard_activated`) -- populated for `--side both` runs, and populated from
+  the requested side alone (the other side's fields left at their default) for a one-side run, per
+  the spec's explicit backward-compatibility instruction. "Emergency shutdown: PASS" in the printed
+  report is now "Controlled shutdown: PASS" for `frozen-cool-test`, unless the narrow emergency I2C
+  reset genuinely fired -- other subcommands' reports are unaffected.
+* **Per-minute progress logging** for both the one-side and `--side both` active phases, instead of
+  repeating every unchanged reading at INFO level -- useful for tailing a multi-hour log.
+
+New tests (15 total) cover: the 900s ceiling's removal and no replacement ceiling; `--duration`
+parsing 1h/4h/8h30m; zero and unrepresentable durations rejected; `--duration`/`--duration-seconds`
+mutual exclusivity; the 120s default when neither is given; `--side both` accepted only with
+`--firmware-authoritative`; both enable commands sent back-to-back, left before right; both targets
+confirmed before active observation begins; `--target-c --side both` producing the identical target
+for both sides; `--delta-c --side both` producing independently-computed (and, given the mock's
+differing left/right baselines, differing) targets; duration expiry cleanly disabling and confirming
+both sides with no emergency reset; and the `time_to_target_seconds` regression fix above. All 6
+`guard.rs` heartbeat/deadline/disarm/parent-death tests were also rewritten for the new 3-way
+heartbeat/deadline/disarm race, plus 2 new heartbeat-specific tests.
+
+Verified end-to-end on the actual packaged ARM64 binary (not just `cargo test`): all three CLI
+examples from this revision's spec (`--side both --delta-c` with `--duration`, `--side both
+--target-c` with `--duration`, and backward-compatible `--side left` with `--duration-seconds`) were
+run against `dist/opensleep-diagnostic-aarch64-static` under `--dry-run`, and each correctly sent
+the expected enable command(s), confirmed the expected target(s), and produced a clean, verified
+shutdown with `overall_pass: true`.
 
 ## Revision note: full firmware-authoritative cooling tests -- remove the 2.0C delta cap, all
 ## typed confirmations, the operator questionnaire, and fix a second false firmware-fault positive
