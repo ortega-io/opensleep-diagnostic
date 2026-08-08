@@ -37,8 +37,8 @@ verification, then move it into place):
 
 ```sh
 cd /tmp
-curl -L -O https://github.com/ortega-io/opensleep-diagnostic/releases/download/diagnostic-v19/opensleep-diagnostic-aarch64-static
-curl -L -O https://github.com/ortega-io/opensleep-diagnostic/releases/download/diagnostic-v19/opensleep-diagnostic-aarch64-static.sha256
+curl -L -O https://github.com/ortega-io/opensleep-diagnostic/releases/download/diagnostic-v20/opensleep-diagnostic-aarch64-static
+curl -L -O https://github.com/ortega-io/opensleep-diagnostic/releases/download/diagnostic-v20/opensleep-diagnostic-aarch64-static.sha256
 sha256sum -c opensleep-diagnostic-aarch64-static.sha256
 mv opensleep-diagnostic-aarch64-static /persistent/tools/opensleep-diagnostic
 ```
@@ -626,8 +626,53 @@ and binary. Safe to run at any time, including with Frozen actively running a te
 session — it reads the same I2C bus but never contends for a write.
 
 **If Sensor stays silent:** `overall_result: "uart_silent"` is expected, informative output, not a
-crash or a claim of hardware failure — see SAFETY.md's `sensor-probe` section for why this version
-deliberately stops there instead of guessing at a reset/enable line for the Sensor MCU.
+crash or a claim of hardware failure — see SAFETY.md's `sensor-probe` section for why plain
+discovery deliberately stops there instead of guessing at a reset/enable line for the Sensor MCU.
+
+### EXPERIMENTAL: testing the suspected Sensor enable line (port-0 bit 0)
+
+If plain discovery above stays silent, `--enable-suspected-sensor-line` tests one specific,
+narrowly-scoped hypothesis: that bit 0 of the PCAL6416A's port-0 registers is a Sensor enable/
+reset-release/power-enable line (real hardware evidence: it's the one bit that differs between
+upstream OpenSleep's own reset sequence and this fork's proven narrow Frozen-only initialization,
+and upstream never drives it low). It configures that bit as an output, driven HIGH, and nothing
+else — never a pulse, never LOW, never bit 1 (Frozen's own reset bit), never register `0x07`. Read
+SAFETY.md's "revision 20" section before running this.
+
+**Narrowest form — enable the line, send zero Sensor UART commands, just listen:**
+
+```sh
+opensleep-diagnostic sensor-probe --passive --enable-suspected-sensor-line \
+    --listen-seconds 30 --json-output /tmp/sensor-line-passive.json --verbose
+```
+
+Watch for `overall_result: "spontaneous_sensor_traffic_after_line_enable"` and a small
+`first_rx_after_enable_ms`/`first_decoded_packet_after_enable_ms` in the report — the strongest
+possible evidence of a causal link, since this binary never sent the Sensor MCU a single byte.
+
+**Full discovery after enabling the line** (mirrors upstream's own bootloader-first ordering,
+`38400` before `115200`, unlike plain `--discover` above):
+
+```sh
+opensleep-diagnostic sensor-probe --discover --enable-suspected-sensor-line --query-info \
+    --json-output /tmp/sensor-line-discover.json
+```
+
+**State is preserved on exit, not automatically reverted** — if bit 0 really is a Sensor enable
+line, reverting it immediately would make the experiment impossible to interpret. To explicitly
+restore bit 0 to whatever it read before this same invocation changed it (add to either command
+above, in the same invocation — it cannot be used on its own in a later run):
+
+```sh
+opensleep-diagnostic sensor-probe --discover --enable-suspected-sensor-line \
+    --restore-suspected-sensor-line --json-output /tmp/sensor-line-discover.json
+```
+
+Check `reg_0x02_original`/`reg_0x02_final` and `reg_0x06_original`/`reg_0x06_final` in the JSON
+output to confirm exactly what changed and (if `--restore-suspected-sensor-line` was used) that it
+changed back. `overall_result: "expander_verification_failed"` means the expander itself didn't
+behave as expected (a readback mismatch, or a bit other than bit 0 changed) — Sensor UART probing
+is skipped entirely in that case, and no further action was taken.
 
 ## Dry-run mode (safe on any development machine, no hardware needed)
 
@@ -647,6 +692,8 @@ opensleep-diagnostic frozen-cool-test --side left --dry-run --non-interactive \
     --json-output /tmp/dryrun-cool.json
 opensleep-diagnostic emergency-stop --dry-run
 opensleep-diagnostic sensor-probe --discover --query-info --dry-run --json-output /tmp/dryrun-sensor.json
+opensleep-diagnostic sensor-probe --discover --enable-suspected-sensor-line --restore-suspected-sensor-line \
+    --dry-run --json-output /tmp/dryrun-sensor-line.json
 ```
 
 `frozen-prime-test --dry-run` still requires its interactive typed confirmations unless stdin is
