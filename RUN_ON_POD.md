@@ -37,8 +37,8 @@ verification, then move it into place):
 
 ```sh
 cd /tmp
-curl -L -O https://github.com/ortega-io/opensleep-diagnostic/releases/download/diagnostic-v20/opensleep-diagnostic-aarch64-static
-curl -L -O https://github.com/ortega-io/opensleep-diagnostic/releases/download/diagnostic-v20/opensleep-diagnostic-aarch64-static.sha256
+curl -L -O https://github.com/ortega-io/opensleep-diagnostic/releases/download/diagnostic-v21/opensleep-diagnostic-aarch64-static
+curl -L -O https://github.com/ortega-io/opensleep-diagnostic/releases/download/diagnostic-v21/opensleep-diagnostic-aarch64-static.sha256
 sha256sum -c opensleep-diagnostic-aarch64-static.sha256
 mv opensleep-diagnostic-aarch64-static /persistent/tools/opensleep-diagnostic
 ```
@@ -674,6 +674,30 @@ changed back. `overall_result: "expander_verification_failed"` means the expande
 behave as expected (a readback mismatch, or a bit other than bit 0 changed) — Sensor UART probing
 is skipped entirely in that case, and no further action was taken.
 
+### EXPERIMENTAL: combined narrow subsystem init (port-0 bits 0 and 1)
+
+If bit-0-only above left Sensor silent, `--combined-narrow-subsystem-init` additionally configures
+bit 1 (Frozen's own, already-proven reset line) as an output and pulses it exactly as already
+proven for Frozen, while bit 0 stays asserted HIGH — reproducing only the port-0 portion of
+upstream's own startup sequence, never touching register `0x07` (this Hub's own `0x77`) or any
+other register. Opt-in; cannot be combined with `--enable-suspected-sensor-line`,
+`--restore-suspected-sensor-line`, or `--audit-expander`. Read SAFETY.md's "revision 21" section
+before running this.
+
+```sh
+opensleep-diagnostic sensor-probe --combined-narrow-subsystem-init --query-info \
+    --json-output /tmp/sensor-combined-init.json --verbose
+```
+
+This performs the three-write expander sequence (verified before proceeding), then verifies Frozen
+is reachable with a single Ping (no temperature target, no Prime, no pump or cooling — verification
+only), then probes Sensor using upstream's own bootloader-first discovery ordering. Check
+`frozen_reached_firmware`, `sensor_bootloader_confirmed`/`sensor_firmware_confirmed`, and
+`combined_reg07_preserved` in the JSON output. State is **not** automatically reverted on exit —
+there is no `--restore` option for this mode in this version. `overall_result:
+"sensor_still_silent_after_combined_init"` or `"frozen_alive_sensor_silent"` are expected,
+informative outcomes, not proof of a Sensor hardware failure.
+
 ## Dry-run mode (safe on any development machine, no hardware needed)
 
 Every subcommand accepts `--dry-run`, which performs no I2C or UART writes at all and instead runs
@@ -694,6 +718,8 @@ opensleep-diagnostic emergency-stop --dry-run
 opensleep-diagnostic sensor-probe --discover --query-info --dry-run --json-output /tmp/dryrun-sensor.json
 opensleep-diagnostic sensor-probe --discover --enable-suspected-sensor-line --restore-suspected-sensor-line \
     --dry-run --json-output /tmp/dryrun-sensor-line.json
+opensleep-diagnostic sensor-probe --combined-narrow-subsystem-init --query-info --dry-run \
+    --json-output /tmp/dryrun-sensor-combined.json
 ```
 
 `frozen-prime-test --dry-run` still requires its interactive typed confirmations unless stdin is
@@ -707,8 +733,10 @@ can't run against the mock, it refuses, the same as live mode would.
 See SAFETY.md and PROTOCOL_AUDIT.md for the full accounting. In short: no subcommand ever loads
 your saved `config.ron`, runs the Home Assistant integration, starts a profile or temperature
 schedule outside its own bounded active phase, opens the Sensor subsystem's UART (except
-`sensor-probe` itself, whose own guarantees are described in step 8 above and in SAFETY.md), or
-sends `Prime` outside
+`sensor-probe` itself, whose own guarantees are described in step 8 above and in SAFETY.md), opens
+Frozen's UART from `sensor-probe` (except `--combined-narrow-subsystem-init`'s own Ping-only
+verification step, which never sets a target, primes, or starts a pump/cooling), or sends `Prime`
+outside
 `frozen-prime-test`/`frozen-prime-opensleep-init` (including its `--release-frozen-only` mode;
 always sent at most once per invocation, always
 manually confirmed, never scheduled or repeated automatically) or an arbitrary/undocumented
