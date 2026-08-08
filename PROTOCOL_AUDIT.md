@@ -769,6 +769,15 @@ These frames are asserted byte-for-byte by upstream's own
 `sensor::command::tests::test_sensor_commands`, reused unmodified by this fork; `sensor_link.rs`'s
 own tests round-trip `Ping`/`Pong` over the real wire framing again as a fork-level cross-check.
 
+**`--enable-suspected-sensor-line` changes the *ordering* of the table above, not its contents.**
+Combined with `--discover`, discovery mirrors upstream's own bootloader-first ordering
+(`line_enable_discover_probe`): bootloader baud (`38400`) is tried before firmware baud (`115200`)
+— the reverse of plain `--discover`'s firmware-first order — and firmware is always attempted next
+regardless of whether bootloader responded, rather than plain `--discover`'s early return once
+firmware is confirmed. Each stage additionally listens passively for 1 second before transmitting
+anything. No new command becomes reachable: the same closed `SensorProbeAction` enum and
+`ProbeMode::Discover` whitelist govern both orderings identically.
+
 **Why the actuator/config commands are unreachable, structurally, not by convention:** unlike
 `FrozenAction` (which represents every Frozen command including `Prime`, gated by a runtime
 whitelist), `sensor_safety::SensorProbeAction` is a closed four-variant enum
@@ -812,3 +821,53 @@ comment; cross-checked against `sensor::presence::PresenseManager::update_presen
 (`values[0..3]` feeds `left_present`, `values[3..6]` feeds `right_present`) — the same split
 `sensor-probe`'s per-side min/max/latest stats use. `PiezoData` already carries explicit
 `left_samples`/`right_samples` vectors from upstream's own decoder, so no inference is needed there.
+
+## `--enable-suspected-sensor-line`: PCAL6416A register-level audit
+
+The exact I2C bus/address is the same reset-expander this fork already writes for Frozen:
+`/dev/i2c-1`, address `0x20`, registers `0x02` (Output Port 0) and `0x06` (Configuration Port 0).
+This section documents every read/write this experimental flag performs, in order, and the
+evidence behind each invariant. See `i2c::configure_suspected_sensor_enable_high`/
+`i2c::restore_suspected_sensor_bit` for the implementation and `i2c::tests` for the byte-level
+proofs.
+
+| Step | Operation | Register | Evidence / invariant |
+|---|---|---|---|
+| 1 | Read | `0x02` | Establishes `original` before computing any target — never a hardcoded assumption. |
+| 2 | Compute | — | `target = original \| 0x01` (bit 0 only). Verified mathematically (`assert_eq!`) to differ from `original` in no bit outside `0x01` before any write is issued — the same structural-proof pattern `pulse_frozen_reset_bit` already uses for bit 1. |
+| 3 | Write | `0x02` | Always issued, even when `target == original` (bit 0 already high) — mirrors `pulse_frozen_reset_bit`'s "never skip a step" convention: a no-op write is still verified, not assumed safe. |
+| 4 | Read back | `0x02` | `readback_matches = (readback == target)` — must hold before proceeding. |
+| 5 | Read | `0x06` | Establishes `original` for the direction/config register. |
+| 6 | Compute | — | `target = original & !0x01` (clear bit 0 only — `0` = output on the PCAL6416A, matching `pulse_frozen_reset_bit`'s own bit-1 convention). |
+| 7 | Write | `0x06` | Configures bit 0 as an output; every other bit of `0x06` (including bit 1, Frozen's own direction bit) passes through unchanged. |
+| 8 | Read back | `0x06` | Same `readback_matches` requirement as step 4. |
+| 9 | Wait | — | `SUSPECTED_SENSOR_ENABLE_SETTLE` = 500ms, before any Sensor UART activity begins. |
+| 10 | (nothing else) | — | No register `0x07` access, no bit-1 access, no whole-register constant, anywhere in this sequence. |
+
+**Ordering evidence:** step 1–4 (the output latch, register `0x02`) always completes before step
+5–8 (the direction/config register, `0x06`) — the same ordering `pulse_frozen_reset_bit` uses and
+for the same documented reason: the instant the pin starts being driven (once `0x06` configures it
+as an output), it should already be latched to the intended level, not glitch on whatever `0x02`
+happened to read beforehand. `configure_suspected_sensor_enable_output_latch_set_before_direction_
+becomes_output` asserts the write order directly against a mock's own write log.
+
+**Why this is not upstream's `ResetController` and not `pulse_frozen_reset_bit`:** upstream's own
+reset sequence (`opensleep::reset::ResetController::reset_subsystems`, mirrored non-authoritatively
+by this fork's `i2c::run_reset_sequence`) writes whole-register constants (`0x06 <- 0xFC`,
+`0x02 <- 0xFF` then `0xFD`) unconditionally — exactly the kind of write real-hardware evidence
+proved breaks the reservoir/capwater indicator when applied outside Frozen's own narrow bit-1
+sequence (see SAFETY.md's "revision 9" history). `pulse_frozen_reset_bit` is narrow (bit 1 only) but
+is a **pulse**: assert HIGH, hold `PULSE_SETTLE`, then release back LOW.
+`configure_suspected_sensor_enable_high` is narrower still (bit 0 only) and is explicitly **not** a
+pulse — it drives HIGH and stops; nothing in this fork ever computes a LOW target for bit 0 outside
+`restore_suspected_sensor_bit` (used only when `--restore-suspected-sensor-line` is explicitly
+passed, and even then only to return bit 0 to *this invocation's own* captured original — never to
+a hardcoded value).
+
+**Restore is narrower than a full undo:** `restore_suspected_sensor_bit(dev, captured_0x02,
+captured_0x06)` re-reads the *current* value of each register at restore time and merges in only
+the captured bit-0 value — `(current & !0x01) | (captured & 0x01)` — rather than writing back the
+whole originally-captured byte. This means a change some other actor made to an unrelated bit
+between enable and restore (e.g. Frozen independently transitioning its own bit-1 reset state) is
+preserved, not clobbered. `restore_only_touches_bit_0_and_preserves_current_other_bits` proves this
+against a mock where bit 1 differs between the captured-original and restore-time reads.

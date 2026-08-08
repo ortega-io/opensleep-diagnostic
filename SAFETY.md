@@ -729,9 +729,11 @@ not Frozen's hydraulic controller) and decode whatever is already available. **T
 deliberately does not attempt presence calibration, piezo configuration, vibration actuation,
 alarms, or any expander reset pulsing.** See `sensor_probe.rs` module docs for the full design.
 
-* **Zero I2C writes in every mode.** `--passive`, `--ping`, and `--discover` never call
+* **Zero I2C writes in every mode by default.** `--passive`, `--ping`, and `--discover` never call
   `I2cPort::write_reg` at all; `--audit-expander` (combinable with any mode) only ever calls
-  `read_reg`. This is enforced structurally (no `write_reg` call exists anywhere in
+  `read_reg`. The one opt-in exception is `--enable-suspected-sensor-line` -- see its own
+  subsection below; every other flag combination is still enforced structurally (no other
+  `write_reg` call exists anywhere in
   `sensor_probe.rs`/`sensor_link.rs`/`sensor_safety.rs`/`sensor_report.rs`/`sensor_mock.rs`) and by
   the `expander_audit_never_writes_any_register` test.
 * **Zero UART writes in `--passive`** (the default mode): it only opens the Sensor UART at each
@@ -754,17 +756,99 @@ alarms, or any expander reset pulsing.** See `sensor_probe.rs` module docs for t
   which the Frozen investigation proved are sensitive (bit 1 of port 0 is Frozen's reset line, and
   whole-register writes on `0x06`/`0x07` previously broke the reservoir/capwater indicator), are
   never written by this command in this version.
-* **Port-0 bit 0's function is deliberately left unproven.** Upstream's `reset.rs` configures both
-  bits 0 and 1 of port 0 as outputs, but the confirmed-working transition (`0xFF -> 0xFD`) only
-  ever toggles bit 1, and hardware evidence from the Frozen investigation only proves what bit 1
-  controls. `sensor-probe` does not assume bit 0 is a Sensor reset/enable line, does not pulse it,
-  and does not call `opensleep::reset::ResetController` or the old four-register reset sequence. If
-  Sensor stays silent after UART discovery, this version stops and reports the evidence
+* **Port-0 bit 0's function was unproven as of revision 19 and remains unproven** -- revision 20
+  adds an explicit, opt-in experiment to test one specific hypothesis about it (see the next
+  subsection). Outside that experiment, `sensor-probe` still does not assume bit 0 is a Sensor
+  reset/enable line, still never pulses it, and still never calls
+  `opensleep::reset::ResetController` or the old four-register reset sequence. If Sensor stays
+  silent after ordinary UART discovery, this stops and reports the evidence
   (`overall_result: "uart_silent"`, explicitly documented as not proof of a hardware fault) rather
-  than guessing at a reset line. Identifying that line is a separate, future investigation.
+  than guessing at a reset line.
 * Never opens Frozen's UART (`frozen_port`) and never references Frozen's transport/command types
   -- checked by the `sensor_probe_never_touches_frozen` guardrail test in `main.rs`, and by the
-  report's own `frozen_uart_writes`/`frozen_port_never_opened` counters (always `0`/`true`).
+  report's own `frozen_uart_writes`/`frozen_uart_opens`/`frozen_port_never_opened` counters (always
+  `0`/`0`/`true`).
+
+### Revision 20: `--enable-suspected-sensor-line` -- an experimental, opt-in hypothesis test
+
+Real hardware evidence narrowed the candidate Sensor enable/reset-release/power-enable line to one
+specific bit. On this MT8365 Hub, `/proc/tty/driver/serial` shows `ttyS0`/`ttyS1`/`ttyS2` are all
+real, independently-addressed `ST16650V2` MMIO UARTs (`ttyS3` is a `serial8250` placeholder with no
+real MMIO/IRQ); `ttyS1` is Frozen's UART, experimentally proven; `ttyS2` is the only other real UART
+and the strongest remaining Sensor candidate. Every plain `sensor-probe` invocation (`--passive`,
+`--ping`, `--discover`, at both known baud rates) against `ttyS2` shows transmitted bytes but zero
+RX -- consistent with a powered-off or held-in-reset Sensor MCU, not with a wrong port. Separately,
+upstream OpenSleep's own reset sequence configures register `0x06` to `0xFC` (bits 0 and 1 both
+outputs) and keeps register `0x02` bit 0 HIGH throughout -- never pulsing it low -- while this
+fork's own proven narrow Frozen-only initialization leaves register `0x06` at `0xFD` (bit 0 still an
+input; only bit 1 configured as an output). **Only bit 0 differs between the two initialization
+paths, and upstream never drives it low.**
+
+`--enable-suspected-sensor-line` tests this specific, narrow hypothesis -- configure bit 0 as an
+output, driven HIGH, and nothing else -- without asserting it is correct:
+
+* **Opt-in only, never implied.** `--passive`, `--ping`, `--discover`, and `--query-info` never
+  imply it; every one of those modes keeps its exact revision-19 zero-I2C-write behavior unless this
+  flag is also passed. `determine_mode`'s mode selection is completely unchanged; this flag only
+  decorates whichever mode was already selected.
+* **Exactly two I2C writes, both narrow read-modify-writes, never a pulse:** register `0x02`'s
+  output latch is set to bit-0-HIGH first (a no-op write if it already reads HIGH -- still issued
+  and verified, never skipped, mirroring `pulse_frozen_reset_bit`'s own "never skip a step"
+  convention), *then* register `0x06`'s bit 0 is configured as an output. This ordering -- latch
+  level before direction change -- mirrors `pulse_frozen_reset_bit`'s own documented reasoning: the
+  pin drives the already-intended level the instant it starts being driven, rather than glitching on
+  whatever the latch happened to already read. Every value written is computed from what was
+  actually read at that step -- never a hardcoded whole-register constant like the historical
+  `0xFC`/`0xFF`/`0xFD`. A dedicated, independent helper
+  (`i2c::configure_suspected_sensor_enable_high`) implements this -- **not** a reuse of
+  `pulse_frozen_reset_bit` (bit 1's helper), specifically so this unproven, experimental code path
+  can never affect Frozen's own proven, hardware-validated bit-1 logic.
+* **Never LOW, never a pulse, never bit 1, never register `0x07`.** `SUSPECTED_SENSOR_ENABLE_BIT`
+  (bit 0) is structurally separate from `FROZEN_RESET_BIT` (bit 1); `configure_suspected_sensor_
+  enable_high` only ever computes `original | SUSPECTED_SENSOR_ENABLE_BIT` -- there is no code path
+  in it that can produce a LOW target for bit 0. Every write's changed-bit mask is verified (before
+  proceeding) to be a subset of `{0x00, 0x01}` -- if any other bit changed, or a readback doesn't
+  match what was written, **`sensor-probe` aborts before any Sensor UART probing at all** and
+  reports `overall_result: "expander_verification_failed"`.
+* **Prints a prominent warning before any write**: `"EXPERIMENTAL: configuring PCAL6416A port-0 bit
+  0 as output-high. No pulse will be generated and no other expander bit will be modified."` No
+  typed confirmation phrase is required -- the four `--confirm-*`-style interactive gates this
+  binary uses elsewhere are for Frozen's active, actuating tests; this is a read-then-narrow-write
+  I2C operation with an already-loud log warning, not a new confirmation pattern.
+* **Waits 500ms** after both writes before beginning Sensor UART discovery (`SUSPECTED_SENSOR_
+  ENABLE_SETTLE`), then mirrors upstream's own discovery ordering exactly: bootloader baud (38400)
+  first, listening passively for 1 second before ever transmitting, up to 3 Ping retries; then --
+  always, regardless of whether bootloader responded -- firmware baud (115200), same 1-second
+  pre-listen and retry budget. This is a *different* ordering from plain `--discover` (which tries
+  firmware first): deliberately mirroring upstream's own bootloader-first ordering specifically for
+  this experiment, without changing plain `--discover`'s own, already-shipped behavior at all.
+  Unsolicited packets (real Sensor firmware, and this binary's own mock, can push telemetry
+  interleaved with a solicited response) never consume the Ping retry budget -- the same
+  `send_and_wait_for` drain-until-match logic revision 19 already uses.
+* **`--passive --enable-suspected-sensor-line`** is the narrowest possible combination: enable the
+  line, then send *zero* further Sensor UART writes, just listen at both bauds for
+  `--listen-seconds`. The report's `first_rx_after_enable_ms`/`first_decoded_packet_after_enable_ms`
+  fields record the elapsed time from the enable sequence completing to the first raw byte/decoded
+  packet -- the strongest evidence this experiment can produce of a causal link between the bit-0
+  change and any Sensor activity, without this binary ever having sent that MCU a single byte.
+* **State is preserved, not blindly restored.** On normal exit, bit 0 is left exactly as the enable
+  sequence configured it -- if it really is a Sensor enable line, automatically reverting it would
+  immediately disable the Sensor MCU again and make the experiment impossible to interpret. A
+  separate, explicit `--restore-suspected-sensor-line` flag (requires
+  `--enable-suspected-sensor-line` in the same invocation -- there is no state to restore to
+  otherwise; this binary never persists state across separate invocations) restores *only* bit 0 of
+  registers `0x02`/`0x06` to the value *this same invocation* captured before enabling, preserving
+  every other bit as it exists at restore time (a fresh read, not a blind write-back of the whole
+  originally-captured byte). Never automatic.
+* **Still never touches Frozen.** `frozen_uart_opens`/`frozen_uart_writes` stay `0` in every code
+  path this flag can reach -- checked by the same `sensor_probe_never_touches_frozen` guardrail test
+  (which scans the same five `sensor-probe` source files, `i2c.rs`'s new additions included via its
+  own dedicated tests) plus a dedicated runtime test
+  (`enable_line_never_opens_frozen_uart`).
+* **Still cannot send any actuator/config command.** `--query-info` after a confirmed firmware Ping
+  still only ever permits `GetHardwareInfo`/`GetFirmwareHash`, gated by the same closed
+  `SensorProbeAction` enum revision 19 introduced -- this flag adds a new *I2C* capability, not a
+  new UART command vocabulary.
 
 ## What no subcommand ever does, including `frozen-prime-opensleep-init`
 

@@ -1,11 +1,53 @@
 # TEST_RESULTS.md — opensleep-diagnostic
 
-All 309 unit/integration tests in `src/bin/opensleep-diagnostic/` pass (up from 274; see the
+All 332 unit/integration tests in `src/bin/opensleep-diagnostic/` pass (up from 309; see the
 revision note directly below), plus the 51 pre-existing `opensleep` library tests (unmodified,
-reused as-is) and 0 doc-tests — 360 total, 0 failed. Verified inside the
+reused as-is) and 0 doc-tests — 383 total, 0 failed. Verified inside the
 `messense/rust-musl-cross:aarch64-musl` builder image via `cargo test --locked` under its built-in
 QEMU aarch64 runner (the same environment the release binary is built in) as part of the
-diagnostic-v19 release build -- see `build-report.txt`.
+diagnostic-v20 release build -- see `build-report.txt`.
+
+## Revision note: add `sensor-probe --enable-suspected-sensor-line`, an experimental, opt-in test
+## of the suspected Sensor enable line (PCAL6416A port-0 bit 0)
+
+Real hardware evidence narrowed the candidate Sensor enable/reset-release/power-enable line to one
+specific bit: `/proc/tty/driver/serial` confirms `ttyS2` is the only remaining real MMIO UART
+besides Frozen's `ttyS1`, plain `sensor-probe` against it shows transmitted bytes but zero RX at
+both known baud rates, and upstream OpenSleep's own reset sequence configures register `0x06` to
+`0xFC` (bits 0 and 1 both outputs) and keeps register `0x02` bit 0 HIGH throughout -- never pulsing
+it low -- while this fork's own proven narrow Frozen-only initialization leaves register `0x06` at
+`0xFD` (bit 0 still an input). **Only bit 0 differs between the two initialization paths, and
+upstream never drives it low.**
+
+`--enable-suspected-sensor-line` (opt-in; never implied by `--passive`/`--ping`/`--discover`/
+`--query-info`) tests this hypothesis in the narrowest possible way: a dedicated, independent
+helper (`i2c::configure_suspected_sensor_enable_high` -- deliberately **not** a reuse of
+`pulse_frozen_reset_bit`, bit 1's own helper) configures only bit 0 of registers `0x02`/`0x06` as
+an output, driven HIGH -- never a pulse, never LOW, never bit 1, never register `0x07`, never a
+whole-register constant. Every write's changed-bit mask is verified to be a subset of
+`{0x00, 0x01}` before proceeding; a mismatch aborts before any Sensor UART probing at all
+(`overall_result: "expander_verification_failed"`). Waits 500ms, then mirrors upstream's own
+bootloader-first discovery ordering (`--discover` combination) or, for `--passive`, sends zero
+further Sensor UART writes and just listens, recording the elapsed time from the enable sequence
+completing to the first raw byte/decoded packet -- the strongest possible evidence of a causal
+link. State is preserved on exit, not automatically reverted; a separate
+`--restore-suspected-sensor-line` flag (requires `--enable-suspected-sensor-line` in the same
+invocation) restores only bit 0, preserving every other bit as it exists at restore time. 23 new
+tests (309 -> 332), split across `i2c.rs` (bit-level proofs against `MockI2c`) and `sensor_probe.rs`
+(orchestration/report-level integration tests). Full details in SAFETY.md's "revision 20" section
+and PROTOCOL_AUDIT.md's new register-level audit table.
+
+Two bugs were caught and fixed during this work, both before reaching a released version:
+* A latent guardrail-test gap from revision 19 itself: `cli.rs`'s own top-level doc comment
+  (updated when `sensor-probe` was first added) contained the literal substring `` `sensor::run` ``
+  in its prose, which the `sensor_subsystem_is_never_referenced_outside_sensor_probe` guardrail
+  test's `needle_b` check (banning that literal everywhere except `main.rs`) correctly flagged once
+  re-run -- reworded without the literal substring, following the same self-reference-avoidance
+  pattern `main.rs`'s own guardrail-test prose already uses.
+* A test (`line_enable_discover_tries_bootloader_before_firmware`) initially used the default
+  `--observe-seconds` (60), incurring a real 60-second wait once firmware mode was confirmed --
+  fixed by setting `observe_seconds = 0` in the test's own args, cutting that single test from over
+  60s to well under 1s with no loss of coverage.
 
 ## Revision note: add `sensor-probe`, a read-only-for-I2C investigation of the Sensor subsystem
 ## over its own UART, independent of Frozen
