@@ -4,7 +4,7 @@ This tool is a diagnostic, not a service. Every subcommand runs once, in the for
 writes a summary, and exits. **Do not install it as a systemd unit.** Priming is always manually
 initiated, every time — this tool never schedules or repeats it automatically.
 
-Five subcommands:
+Eight subcommands:
 
 * `opensleep-diagnostic frozen-passive` — safe with the cover disconnected and no water.
 * `opensleep-diagnostic frozen-prime-test` — intentionally sends `Prime` once, to fill an empty or
@@ -21,6 +21,13 @@ Five subcommands:
   the same narrow way `--release-frozen-only` does, and performs no I2C write at all on a normal
   stop. **Read SAFETY.md before running this.**
 * `opensleep-diagnostic emergency-stop` — independent fast-path disable + reset-assert.
+* `opensleep-diagnostic frozen-hold-start` — sets a fixed absolute target on Frozen, confirms it,
+  and exits; Frozen firmware then owns thermal regulation indefinitely. Requires a connected,
+  already-filled hydraulic loop. **Read SAFETY.md before running this.**
+* `opensleep-diagnostic frozen-hold-stop` — explicitly stops persistent thermal control started by
+  `frozen-hold-start`.
+* `opensleep-diagnostic frozen-hold-status` — strictly non-controlling status check; safe to run at
+  any time, including while `frozen-hold-start`'s targets remain active.
 
 ## 1. Copy the binary to the Pod
 
@@ -37,8 +44,8 @@ verification, then move it into place):
 
 ```sh
 cd /tmp
-curl -L -O https://github.com/ortega-io/opensleep-diagnostic/releases/download/diagnostic-v21/opensleep-diagnostic-aarch64-static
-curl -L -O https://github.com/ortega-io/opensleep-diagnostic/releases/download/diagnostic-v21/opensleep-diagnostic-aarch64-static.sha256
+curl -L -O https://github.com/ortega-io/opensleep-diagnostic/releases/download/diagnostic-v22/opensleep-diagnostic-aarch64-static
+curl -L -O https://github.com/ortega-io/opensleep-diagnostic/releases/download/diagnostic-v22/opensleep-diagnostic-aarch64-static.sha256
 sha256sum -c opensleep-diagnostic-aarch64-static.sha256
 mv opensleep-diagnostic-aarch64-static /persistent/tools/opensleep-diagnostic
 ```
@@ -698,6 +705,65 @@ there is no `--restore` option for this mode in this version. `overall_result:
 "sensor_still_silent_after_combined_init"` or `"frozen_alive_sensor_silent"` are expected,
 informative outcomes, not proof of a Sensor hardware failure.
 
+## 9. Persistent, firmware-owned thermal control: `frozen-hold-start`/`frozen-hold-stop`/`frozen-hold-status`
+
+Every mode above is a bounded, host-observed session. `frozen-hold-start` is different: it sets a
+fixed absolute target on Frozen, confirms it, and **exits** — Frozen firmware then owns thermal
+regulation indefinitely, exactly like stock OpenSleep's own scheduled targets, just triggered
+manually instead of by a time-of-day profile. Read SAFETY.md's "revision 22" section before using
+this for the first time. Requires a filled, connected hydraulic loop, same as `frozen-cool-test`.
+
+```sh
+# Same absolute target on both sides:
+opensleep-diagnostic frozen-hold-start --target-c 24 --json-output /tmp/hold-start.json --verbose
+
+# Independent targets per side (both must be given together):
+opensleep-diagnostic frozen-hold-start --left-target-c 22 --right-target-c 26 \
+    --json-output /tmp/hold-start.json
+```
+
+This sends one absolute `SetTargetTemperature(enabled=true)` per side (no baseline measurement, no
+delta — the requested Celsius value converts directly to centidegrees, validated against the same
+0-45C backstop `--target-c` on `frozen-cool-test` already uses) and requires an exact matching
+`TargetUpdate` confirmation for each before printing:
+
+```
+Frozen thermal control enabled
+Left target:  24.00 C
+Right target: 24.00 C
+Targets confirmed by firmware
+Host control transaction complete
+Frozen now owns thermal regulation
+```
+
+**After both confirmations, this process sends nothing further and exits.** There is no duration,
+no observation window, no shutdown-on-exit, and no reset-on-exit — Frozen keeps running the target
+after this command has already ended, the same way it keeps running a stock scheduled target. If
+Left confirms but Right does not (or vice versa), the already-confirmed side is disabled again and
+the run reports failure; once *both* sides are confirmed, that rollback can no longer happen.
+`frozen-hold-start` never resets a Frozen that is already responsive — including one a previous
+`frozen-hold-start` already brought up — only a genuinely silent Frozen triggers the same narrow
+startup/reset mechanism `frozen-cool-test` uses.
+
+To stop persistent thermal control:
+
+```sh
+opensleep-diagnostic frozen-hold-stop --json-output /tmp/hold-stop.json
+```
+
+Disables both sides and requires confirmation of both before exiting successfully. Does not reset a
+responsive Frozen and does not assert the I2C reset as part of an ordinary stop.
+
+To check status without changing anything — safe to run at any time, including while
+`frozen-hold-start`'s targets remain active:
+
+```sh
+opensleep-diagnostic frozen-hold-status --json-output /tmp/hold-status.json
+```
+
+Sends only `Ping`/`GetTemperatures`; never `SetTargetTemperature` in either direction, never resets
+Frozen, never touches PCAL state.
+
 ## Dry-run mode (safe on any development machine, no hardware needed)
 
 Every subcommand accepts `--dry-run`, which performs no I2C or UART writes at all and instead runs
@@ -720,6 +786,9 @@ opensleep-diagnostic sensor-probe --discover --enable-suspected-sensor-line --re
     --dry-run --json-output /tmp/dryrun-sensor-line.json
 opensleep-diagnostic sensor-probe --combined-narrow-subsystem-init --query-info --dry-run \
     --json-output /tmp/dryrun-sensor-combined.json
+opensleep-diagnostic frozen-hold-start --target-c 24 --dry-run --json-output /tmp/dryrun-hold-start.json
+opensleep-diagnostic frozen-hold-stop --dry-run --json-output /tmp/dryrun-hold-stop.json
+opensleep-diagnostic frozen-hold-status --dry-run --json-output /tmp/dryrun-hold-status.json
 ```
 
 `frozen-prime-test --dry-run` still requires its interactive typed confirmations unless stdin is
@@ -740,7 +809,10 @@ outside
 `frozen-prime-test`/`frozen-prime-opensleep-init` (including its `--release-frozen-only` mode;
 always sent at most once per invocation, always
 manually confirmed, never scheduled or repeated automatically) or an arbitrary/undocumented
-command. Every subcommand except `frozen-prime-opensleep-init` also never connects to MQTT and
+command. `frozen-hold-start` is the one deliberate exception to "no absolute target" (see step 9
+above and SAFETY.md's "revision 22" section for its own closed constructor and validation), and
+sends zero further Frozen commands of any kind once both sides are confirmed. Every subcommand
+except `frozen-prime-opensleep-init` also never connects to MQTT and
 never writes to `0x53` beyond a nonfatal probe -- `frozen-prime-opensleep-init` is the one
 deliberate exception there (it constructs a real, never-connected MQTT client and writes to the LED
 controller through the real upstream code path; see its own section above and SAFETY.md). Every
