@@ -1,11 +1,66 @@
 # TEST_RESULTS.md — opensleep-diagnostic
 
-All 274 unit/integration tests in `src/bin/opensleep-diagnostic/` pass (up from 259; see the
+All 309 unit/integration tests in `src/bin/opensleep-diagnostic/` pass (up from 274; see the
 revision note directly below), plus the 51 pre-existing `opensleep` library tests (unmodified,
-reused as-is) and 0 doc-tests — 325 total, 0 failed. Verified inside the
+reused as-is) and 0 doc-tests — 360 total, 0 failed. Verified inside the
 `messense/rust-musl-cross:aarch64-musl` builder image via `cargo test --locked` under its built-in
 QEMU aarch64 runner (the same environment the release binary is built in) as part of the
-diagnostic-v18 release build -- see `build-report.txt`.
+diagnostic-v19 release build -- see `build-report.txt`.
+
+## Revision note: add `sensor-probe`, a read-only-for-I2C investigation of the Sensor subsystem
+## over its own UART, independent of Frozen
+
+Added a sixth subcommand, `sensor-probe`, establishing reliable UART communication with the Sensor
+MCU (presence/piezo/temperature board) and decoding whatever is already available -- deliberately
+not attempting presence calibration, piezo configuration, vibration actuation, alarms, or expander
+reset pulsing in this version. Five new files
+(`sensor_probe.rs`/`sensor_link.rs`/`sensor_safety.rs`/`sensor_report.rs`/`sensor_mock.rs`), none of
+which touch any existing Frozen file's logic; `main.rs` gained the new subcommand's dispatch plus
+three new/updated source-scanning guardrail tests, and `cli.rs` gained `SensorProbeArgs`. 35 new
+tests (274 -> 309):
+
+* **`--passive`** (default): zero UART writes, zero I2C writes. Opens `/dev/ttyS2` (override with
+  `--sensor-port`) at each known Sensor baud (115200 firmware, 38400 bootloader) in turn, listens
+  for `--listen-seconds` (default 20), and decodes through the real, unmodified
+  `opensleep::common::codec::PacketCodec<SensorPacket>` -- never aborting merely because a frame
+  doesn't decode (a bad checksum, an unrecognized opcode, or a firmware variant not yet understood).
+* **`--ping`**: may send `SensorCommand::Ping` (firmware baud first, up to 3 tries; only if silent,
+  bootloader baud, up to 3 more), and nothing else -- never `JumpToFirmware`, never any
+  mode-changing command. Still zero I2C writes.
+* **`--discover`**: implements upstream's own Ping / JumpToFirmware discovery sequence (firmware
+  Ping first; only if silent, bootloader Ping; only if bootloader responded, exactly one
+  `JumpToFirmware` followed by a re-ping at firmware baud), but never starts the normal Sensor
+  `CommandScheduler` and never sends any actuator/config command -- `sensor_safety::SensorProbeAction`
+  is a closed four-variant enum with no such variant to construct, backed by a source-scanning
+  guardrail test proving no other file references those `SensorCommand` variants either.
+  `--query-info` (usable only after a confirmed firmware-mode Ping) additionally permits exactly two
+  read-only queries already present in upstream `SensorCommand`: `GetHardwareInfo`/`GetFirmwareHash`
+  -- inspected against upstream's own decoders, not inferred from their names alone (`GetHeaterOffset`
+  is deliberately excluded: upstream never decodes a response for it and it is unexercised anywhere
+  in the pinned source). Once communication is established, listens for unsolicited traffic for
+  `--observe-seconds` (default 60), tallying every `SensorPacket` variant seen and computing
+  per-side capacitance/piezo min/max/latest values (left/right channel split cross-checked against
+  upstream's own `PresenseManager::update_presence` indexing).
+* **`--audit-expander`** (combinable with any mode): read-only PCAL6416A register dump (`0x00`-
+  `0x07`, hex and binary), reusing the existing `I2cPort::read_reg` -- this feature's own files
+  contain no `write_reg` call at all, so every register, registers `0x02`/`0x06`/`0x07` (the ones
+  the Frozen investigation proved sensitive) included, is structurally unwritable here, not merely
+  disallowed by convention.
+* **Port-0 bit 0's function is deliberately left unproven.** No reset/enable line pulsing of any
+  kind is implemented in this version; if Sensor stays silent after UART discovery, this stops and
+  reports the evidence (`overall_result: "uart_silent"`, explicitly documented as not a hardware
+  failure) rather than guessing. Identifying that line is a separate, future investigation.
+* A bug in an early draft was caught before it reached a released version: `try_ping`'s original
+  single-`next()`-per-attempt pairing could mistake an unsolicited telemetry packet (which real
+  Sensor firmware, and this binary's own mock, can push interleaved with a solicited response) for
+  the answer to a `Ping`, or burn through the whole retry budget consuming unrelated packets while
+  the real `Pong` sat unread. Fixed with `send_and_wait_for`, which drains and discards anything not
+  matching the awaited response type instead of treating it as a failed attempt -- caught by two
+  dry-run integration tests (`full_discover_dry_run_reaches_firmware_mode`,
+  `query_info_populates_hardware_and_firmware_info_in_dry_run`) that failed under the original
+  implementation and pass under the fix.
+* Verified against the actual packaged ARM64 binary (`dist/opensleep-diagnostic-aarch64-static`) via
+  `qemu-aarch64-static`, not only the development host -- see `build-report.txt`'s smoke-test section.
 
 ## Revision note: remove the 900s duration ceiling, add `--side both` for simultaneous dual-side
 ## operation, and harden the independent shutdown guard for hours-long runs

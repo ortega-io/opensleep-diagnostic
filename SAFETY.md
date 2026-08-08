@@ -1,11 +1,14 @@
 # SAFETY.md — opensleep-diagnostic
 
-`opensleep-diagnostic` is a staged, **Frozen-only** hardware diagnostic for an Eight Sleep Pod 3
-Hub. Four of its five subcommands are not a fork of normal `opensleep` and do not run its control
-loops, timers, MQTT client, profile scheduler, or Sensor/LED management. The fifth,
-`frozen-prime-opensleep-init`, is the one deliberate exception — see its own section below for
-exactly what that means and why. None of the five installs a systemd service or runs unattended —
-every invocation is a single foreground command that starts, does its work, and exits.
+`opensleep-diagnostic` is a staged hardware diagnostic for an Eight Sleep Pod 3 Hub, historically
+**Frozen-only** and now joined by one Sensor-only subcommand. Four of its five Frozen subcommands
+are not a fork of normal `opensleep` and do not run its control loops, timers, MQTT client, profile
+scheduler, or Sensor/LED management. The fifth, `frozen-prime-opensleep-init`, is the one
+deliberate exception — see its own section below for exactly what that means and why. The sixth
+subcommand, `sensor-probe`, is unrelated to Frozen entirely: it investigates the Sensor MCU over
+its own UART — see its own section below. None of the six installs a systemd service or runs
+unattended — every invocation is a single foreground command that starts, does its work, and
+exits.
 
 **Read this whole document before running `frozen-cool-test`, `frozen-prime-test`, or
 `frozen-prime-opensleep-init` on real hardware.**
@@ -287,6 +290,13 @@ enforced structurally in two independent layers (a closed `FrozenAction` enum, p
 whitelist gate with its own at-most-once check for `Prime`), not by
 convention — see `safety::tests` and
 PROTOCOL_AUDIT.md.
+
+`sensor-probe` is entirely separate from `AuditedTransport`/`FrozenAction` above -- it speaks a
+different protocol over a different UART, gated by its own closed `SensorProbeAction` enum and
+`sensor_safety::ProbeMode` whitelist (`--passive` permits nothing, `--ping` permits only `Ping`,
+`--discover` permits `Ping`/`JumpToFirmware` always and `GetHardwareInfo`/`GetFirmwareHash` only
+once firmware-mode communication is confirmed). See `sensor-probe`'s own section above and
+`sensor_safety.rs`.
 
 ## Active-test limits (hard-coded; no CLI flag can override them)
 
@@ -711,14 +721,62 @@ opensleep-diagnostic emergency-stop
 is unresponsive (it best-effort-disables both sides, then unconditionally asserts the I2C reset,
 which is the real backstop). It exits non-zero if the reset could not be confirmed.
 
+## `sensor-probe` — investigates the Sensor subsystem, independently of Frozen
+
+`sensor-probe` is a sixth subcommand with a narrower goal than the five Frozen-only modes above:
+establish reliable UART communication with the Sensor MCU (the presence/piezo/temperature board,
+not Frozen's hydraulic controller) and decode whatever is already available. **This first version
+deliberately does not attempt presence calibration, piezo configuration, vibration actuation,
+alarms, or any expander reset pulsing.** See `sensor_probe.rs` module docs for the full design.
+
+* **Zero I2C writes in every mode.** `--passive`, `--ping`, and `--discover` never call
+  `I2cPort::write_reg` at all; `--audit-expander` (combinable with any mode) only ever calls
+  `read_reg`. This is enforced structurally (no `write_reg` call exists anywhere in
+  `sensor_probe.rs`/`sensor_link.rs`/`sensor_safety.rs`/`sensor_report.rs`/`sensor_mock.rs`) and by
+  the `expander_audit_never_writes_any_register` test.
+* **Zero UART writes in `--passive`** (the default mode): it only opens the Sensor UART at each
+  known baud (115200 firmware, 38400 bootloader) in turn and listens, decoding through the real,
+  unmodified `opensleep::common::codec::PacketCodec<SensorPacket>`.
+* **`--ping`** may send `SensorCommand::Ping` (firmware baud first, then bootloader baud), and
+  nothing else -- never `JumpToFirmware`, never any command that changes Sensor's operating mode.
+* **`--discover`** implements upstream's own Ping / JumpToFirmware discovery sequence (firmware
+  Ping first; only if silent, bootloader Ping; only if bootloader responded, exactly one
+  `JumpToFirmware` followed by a re-ping at firmware baud), but **never starts the normal Sensor
+  `CommandScheduler`** and never sends `EnableVibration`, `SetAlarm`, `EnablePiezo`,
+  `SetPiezoGain`, `SetPiezoFreq`, `ProbeTemperature`, or any presence-calibration command --
+  `sensor_safety.rs`'s `SensorProbeAction` enum has no such variant, so those commands are not
+  merely disallowed by a runtime check, they are unrepresentable in this binary at all. A
+  `--query-info` flag, usable only after a confirmed firmware-mode Ping, additionally permits
+  exactly two read-only queries already present in upstream `SensorCommand`:
+  `GetHardwareInfo`/`GetFirmwareHash`.
+* **`--audit-expander`** reads the PCAL6416A registers (0x00-0x07) and reports them in hex and
+  binary, but never writes any of them -- in particular, registers `0x02`, `0x06`, and `0x07`,
+  which the Frozen investigation proved are sensitive (bit 1 of port 0 is Frozen's reset line, and
+  whole-register writes on `0x06`/`0x07` previously broke the reservoir/capwater indicator), are
+  never written by this command in this version.
+* **Port-0 bit 0's function is deliberately left unproven.** Upstream's `reset.rs` configures both
+  bits 0 and 1 of port 0 as outputs, but the confirmed-working transition (`0xFF -> 0xFD`) only
+  ever toggles bit 1, and hardware evidence from the Frozen investigation only proves what bit 1
+  controls. `sensor-probe` does not assume bit 0 is a Sensor reset/enable line, does not pulse it,
+  and does not call `opensleep::reset::ResetController` or the old four-register reset sequence. If
+  Sensor stays silent after UART discovery, this version stops and reports the evidence
+  (`overall_result: "uart_silent"`, explicitly documented as not proof of a hardware fault) rather
+  than guessing at a reset line. Identifying that line is a separate, future investigation.
+* Never opens Frozen's UART (`frozen_port`) and never references Frozen's transport/command types
+  -- checked by the `sensor_probe_never_touches_frozen` guardrail test in `main.rs`, and by the
+  report's own `frozen_uart_writes`/`frozen_port_never_opened` counters (always `0`/`true`).
+
 ## What no subcommand ever does, including `frozen-prime-opensleep-init`
 
-* **Never open the Sensor subsystem UART or reference it at all, in any mode.** Sensor is a
-  separate physical UART with no bearing on Frozen priming or on `capwater`/`flowrate` reporting
-  (both come from Frozen's own firmware messages) -- even `frozen-prime-opensleep-init`, which runs
-  the real Frozen manager, the real MQTT client construction, and the real LED controller, does not
-  start it. This is enforced by `guardrail_tests` in `main.rs` scanning the diagnostic's own
-  sources at test time: no file, `frozen-prime-opensleep-init` included, may reference it.
+* **Never open the Sensor subsystem UART or reference it at all, in any mode, except
+  `sensor-probe` itself.** Sensor is a separate physical UART with no bearing on Frozen priming or
+  on `capwater`/`flowrate` reporting (both come from Frozen's own firmware messages) -- even
+  `frozen-prime-opensleep-init`, which runs the real Frozen manager, the real MQTT client
+  construction, and the real LED controller, does not start it. `sensor-probe`'s own section above
+  describes exactly what it is permitted to do instead. This is enforced by `guardrail_tests` in
+  `main.rs` scanning the diagnostic's own sources at test time: no file outside `sensor-probe`'s
+  own five files may reference `opensleep::sensor`, and the full Sensor manager's `CommandScheduler`
+  run loop (`sensor::run`) is banned everywhere, `sensor-probe` included.
 * Never write to the `0x53` LED controller other than through the real, already-nonfatal upstream
   code path (`frozen-prime-opensleep-init`) or a read-only, nonfatal probe (every other mode).
 

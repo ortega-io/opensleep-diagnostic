@@ -164,10 +164,10 @@ index 0000000..be05be7
 +}
 diff --git a/src/bin/opensleep-diagnostic/cli.rs b/src/bin/opensleep-diagnostic/cli.rs
 new file mode 100644
-index 0000000..fba68ee
+index 0000000..f11ef9b
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/cli.rs
-@@ -0,0 +1,416 @@
+@@ -0,0 +1,505 @@
 +//! CLI surface. Every flag here maps to a fixed, validated field -- there is no flag that accepts
 +//! a raw opcode, a raw frame, or an arbitrary absolute temperature target. Side selection is a
 +//! closed `ValueEnum`; the cooling delta and duration are validated in `cool_test.rs` against
@@ -176,11 +176,15 @@ index 0000000..fba68ee
 +use clap::{Parser, Subcommand, ValueEnum};
 +use opensleep::common::packet::BedSide;
 +
-+/// Staged, Frozen-only hardware diagnostic for an Eight Sleep Pod 3 Hub. Every subcommand except
-+/// `frozen-prime-opensleep-init` never runs normal OpenSleep, MQTT, profiles, Sensor management,
-+/// LED management, or scheduled priming -- `frozen-prime-opensleep-init` is the one deliberate
-+/// exception: it reuses the real, unmodified upstream initialization/manager code (see that
-+/// module's docs) rather than the diagnostic's own reimplemented transport.
++/// Staged hardware diagnostic for an Eight Sleep Pod 3 Hub, historically Frozen-only and now also
++/// covering the Sensor subsystem via `sensor-probe`. Every subcommand except
++/// `frozen-prime-opensleep-init` and `sensor-probe` never runs normal OpenSleep, MQTT, profiles,
++/// Sensor management, LED management, or scheduled priming. `frozen-prime-opensleep-init` is one
++/// deliberate exception: it reuses the real, unmodified upstream initialization/manager code (see
++/// that module's docs) rather than the diagnostic's own reimplemented transport. `sensor-probe` is
++/// the other: it opens the Sensor UART directly (never `sensor::run`, the full manager/scheduler
++/// loop) -- see `sensor_probe.rs` module docs and SAFETY.md for exactly what it is and isn't
++/// permitted to do there.
 +#[derive(Parser, Debug)]
 +#[command(name = "opensleep-diagnostic", version, about, long_about = None)]
 +pub struct Cli {
@@ -207,6 +211,12 @@ index 0000000..fba68ee
 +    /// `frozen-prime-test`.
 +    #[command(name = "frozen-prime-opensleep-init")]
 +    FrozenPrimeOpenSleepInit(PrimeOpenSleepInitArgs),
++    /// Investigates the Eight Sleep Sensor subsystem (presence/piezo/temperature MCU) over its own
++    /// UART, independent of Frozen. Establishes communication only: no presence calibration, piezo
++    /// configuration, vibration actuation, alarms, or expander reset pulsing in this version. See
++    /// `sensor_probe` module docs and SAFETY.md.
++    #[command(name = "sensor-probe")]
++    SensorProbe(SensorProbeArgs),
 +    /// Internal only, never documented in RUN_ON_POD.md: `frozen-cool-test --firmware-authoritative`'s
 +    /// own independent shutdown guard, re-exec'd as a separate OS process (not merely a thread) so
 +    /// it survives the main observer process crashing outright -- see `guard.rs` module docs. Reads
@@ -542,6 +552,85 @@ index 0000000..fba68ee
 +    pub verbose: bool,
 +
 +    /// Perform no I2C or UART writes; print what would be sent instead
++    #[arg(long, default_value_t = false)]
++    pub dry_run: bool,
++}
++
++/// Args for `sensor-probe`. Every flag here maps to a fixed, validated field, exactly like the
++/// rest of this CLI surface: there is no flag that accepts a raw opcode or an arbitrary command.
++/// `--passive`/`--ping`/`--discover` are mutually exclusive stages of increasing (but still
++/// read-only-for-I2C, non-actuating) capability -- see `sensor_probe.rs` module docs.
++#[derive(clap::Args, Debug, Clone)]
++pub struct SensorProbeArgs {
++    /// Sensor MCU UART. Upstream OpenSleep hardcodes the same obsolete MT8365-devkit path Frozen's
++    /// upstream code does (see `frozen::PORT`'s own doc comment for that evidence); on this MT8365
++    /// Hub the candidate Sensor UART is `/dev/ttyS2`.
++    #[arg(long, default_value = "/dev/ttyS2")]
++    pub sensor_port: String,
++
++    /// I2C device used only by `--audit-expander` (read-only) -- see that flag.
++    #[arg(long, default_value = "/dev/i2c-1")]
++    pub i2c_device: String,
++
++    /// Zero UART writes and zero I2C writes: open the Sensor UART at each known baud in turn and
++    /// only listen. This is the default stage; does not need to be passed explicitly.
++    #[arg(long, default_value_t = false)]
++    pub passive: bool,
++
++    /// May send Sensor Ping packets (firmware baud first, then bootloader baud), but never
++    /// JumpToFirmware and never changes Sensor operating mode. Still zero I2C writes.
++    #[arg(long, default_value_t = false)]
++    pub ping: bool,
++
++    /// Implements the upstream Ping / JumpToFirmware discovery sequence: firmware Ping, then (only
++    /// if silent) bootloader Ping, then (only if bootloader responded) exactly one JumpToFirmware
++    /// and a re-ping at firmware baud. Never starts the normal Sensor CommandScheduler and never
++    /// sends any actuator/config command (vibration, alarm, piezo, temperature probe, presence
++    /// calibration) -- those command variants are not constructible by this binary at all. Still
++    /// zero I2C writes.
++    #[arg(long, default_value_t = false)]
++    pub discover: bool,
++
++    /// Per-baud listen duration for `--passive`, in seconds.
++    #[arg(long, default_value_t = 20)]
++    pub listen_seconds: u64,
++
++    /// How long to keep listening for unsolicited Sensor traffic after firmware communication is
++    /// established in `--discover` mode, in seconds.
++    #[arg(long, default_value_t = 60)]
++    pub observe_seconds: u64,
++
++    /// Only meaningful in `--discover` mode, and only sent after a confirmed firmware-mode Ping:
++    /// also send GetHardwareInfo and GetFirmwareHash (both read-only queries already present in
++    /// upstream `SensorCommand`). Never enables any actuator.
++    #[arg(long, default_value_t = false)]
++    pub query_info: bool,
++
++    /// Read-only audit of the PCAL6416A I2C expander (0x20): reads input/output/config port
++    /// registers and reports them in hex and binary. Never writes any register -- in particular,
++    /// registers 0x02, 0x06, and 0x07 (which the Frozen investigation proved are sensitive: bit 1
++    /// of port 0 is Frozen's reset line, and whole-register writes there previously broke unrelated
++    /// hardware) are never written by this command in this version. Independent of Sensor UART
++    /// communication; runs regardless of probe-mode outcome.
++    #[arg(long, default_value_t = false)]
++    pub audit_expander: bool,
++
++    #[arg(long, value_name = "PATH")]
++    pub json_output: Option<String>,
++
++    #[arg(long, value_name = "PATH")]
++    pub csv_output: Option<String>,
++
++    #[arg(long, default_value_t = false)]
++    pub verbose: bool,
++
++    /// Opt-in: print "Sensor RX/TX raw (...)" byte-array debug log lines. Off by default (even
++    /// under --verbose); raw serial bytes are hidden in the report unless this is passed.
++    #[arg(long, default_value_t = false)]
++    pub raw_serial_log: bool,
++
++    /// Perform no real UART or I2C access; run the full probe logic against a mocked Sensor device
++    /// instead.
 +    #[arg(long, default_value_t = false)]
 +    pub dry_run: bool,
 +}
@@ -9988,13 +10077,14 @@ index 0000000..216770e
 +}
 diff --git a/src/bin/opensleep-diagnostic/main.rs b/src/bin/opensleep-diagnostic/main.rs
 new file mode 100644
-index 0000000..9fff56f
+index 0000000..f7591cc
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/main.rs
-@@ -0,0 +1,312 @@
-+//! opensleep-diagnostic: a staged, Frozen-only hardware diagnostic for an Eight Sleep Pod 3 Hub.
+@@ -0,0 +1,385 @@
++//! opensleep-diagnostic: a staged hardware diagnostic for an Eight Sleep Pod 3 Hub, historically
++//! Frozen-only and now also covering the Sensor subsystem.
 +//!
-+//! Five subcommands, each with its own fixed command whitelist (see `safety.rs`):
++//! Six subcommands, each with its own fixed command whitelist (see `safety.rs`/`sensor_safety.rs`):
 +//!   - `frozen-passive`:    safe with the cover disconnected and no water.
 +//!   - `frozen-cool-test`:  intentionally activates one cooling channel; requires a filled,
 +//!     connected hydraulic loop and multiple explicit confirmations.
@@ -10007,13 +10097,18 @@ index 0000000..9fff56f
 +//!     reimplemented transport -- see `prime_opensleep_init` module docs and SAFETY.md for why
 +//!     both exist and how they differ.
 +//!   - `emergency-stop`:    independent fast-path disable + reset-assert command.
++//!   - `sensor-probe`:      investigates the Sensor subsystem (presence/piezo/temperature MCU)
++//!     over its own UART, entirely independent of Frozen; establishes communication only -- no
++//!     presence calibration, piezo configuration, vibration actuation, alarms, or expander reset
++//!     pulsing in this version -- see `sensor_probe` module docs and SAFETY.md.
 +//!
-+//! Every subcommand except `frozen-prime-opensleep-init` never runs `opensleep::frozen::manager::run`
-+//! (which schedules temperature targets and priming on its own), never loads `config.ron`, never
-+//! connects to MQTT, and never opens the Sensor subsystem or LED controller beyond the nonfatal
-+//! 0x53 probe. `frozen-prime-opensleep-init` is the one deliberate exception to all of that -- see
-+//! its module docs. See SAFETY.md for the full safety model, including how that mode's guarantees
-+//! differ from every other subcommand's.
++//! Every subcommand except `frozen-prime-opensleep-init` and `sensor-probe` never runs
++//! `opensleep::frozen::manager::run` (which schedules temperature targets and priming on its own),
++//! never loads `config.ron`, never connects to MQTT, and never opens the Sensor subsystem or LED
++//! controller beyond the nonfatal 0x53 probe. `frozen-prime-opensleep-init` and `sensor-probe` are
++//! the two deliberate exceptions to that, each in a different, narrow way -- see their own module
++//! docs. See SAFETY.md for the full safety model, including how each mode's guarantees differ from
++//! every other subcommand's.
 +
 +mod buildinfo;
 +mod cli;
@@ -10037,6 +10132,11 @@ index 0000000..9fff56f
 +mod report;
 +mod safe_stop;
 +mod safety;
++mod sensor_link;
++mod sensor_mock;
++mod sensor_probe;
++mod sensor_report;
++mod sensor_safety;
 +mod signals;
 +mod telemetry;
 +
@@ -10053,6 +10153,7 @@ index 0000000..9fff56f
 +        Commands::FrozenPrimeTest(a) => a.verbose,
 +        Commands::FrozenPrimeOpenSleepInit(a) => a.verbose,
 +        Commands::InternalCoolTestGuard(a) => a.verbose,
++        Commands::SensorProbe(a) => a.verbose,
 +    };
 +    buildinfo::init_logging(verbose);
 +    signals::install_panic_hook();
@@ -10098,6 +10199,10 @@ index 0000000..9fff56f
 +                code
 +            }
 +            Commands::InternalCoolTestGuard(args) => guard::run(&args).await,
++            Commands::SensorProbe(args) => {
++                let (_, code) = sensor_probe::run(&args).await;
++                code
++            }
 +        }
 +    });
 +
@@ -10144,17 +10249,33 @@ index 0000000..9fff56f
 +        std::fs::read_to_string(path).expect("readable prime_opensleep_init.rs")
 +    }
 +
++    /// `sensor-probe`'s own files (`sensor_probe.rs`, `sensor_link.rs`, `sensor_safety.rs`,
++    /// `sensor_report.rs`, `sensor_mock.rs`) are the one deliberate exception to
++    /// `opensleep::sensor`: that command's entire purpose is investigating the Sensor UART. Every
++    /// other file -- `frozen-prime-opensleep-init` included, unlike MQTT/the LED driver/the real
++    /// Frozen manager, none of which it carves out an exception for -- must still never reference
++    /// it: it never starts the Sensor subsystem either (a separate physical UART with no bearing on
++    /// Frozen priming). `sensor::run` (the full manager's scheduler loop, which sends vibration/
++    /// alarm/piezo commands on a timer) is banned everywhere, `sensor-probe` included -- see
++    /// `sensor_probe.rs`'s own module docs and `discover_never_launches_a_command_scheduler_or_
++    /// actuator_command` for the runtime-level complement of this check.
 +    #[test]
-+    fn sensor_subsystem_is_never_referenced() {
-+        // Unlike MQTT/the LED driver/the real Frozen manager, frozen-prime-opensleep-init does not
-+        // carve out an exception here: it never starts the Sensor subsystem either (a separate
-+        // physical UART with no bearing on Frozen priming) -- see that module's docs for why "must
-+        // not prevent priming" is satisfied by never running it, not by running it best-effort.
-+        let src = read_all_our_sources_except(&["main.rs"]);
++    fn sensor_subsystem_is_never_referenced_outside_sensor_probe() {
++        const SENSOR_PROBE_FILES: &[&str] =
++            &["sensor_probe.rs", "sensor_link.rs", "sensor_safety.rs", "sensor_report.rs", "sensor_mock.rs"];
++
++        let mut excluded: Vec<&str> = vec!["main.rs"];
++        excluded.extend_from_slice(SENSOR_PROBE_FILES);
++        let src_excl_sensor_probe = read_all_our_sources_except(&excluded);
 +        let needle_a = format!("{}{}{}", "opensleep", "::", "sensor");
++        assert!(
++            !src_excl_sensor_probe.contains(&needle_a),
++            "diagnostic source must never reference opensleep::sensor outside sensor-probe's own files"
++        );
++
++        let src_all = read_all_our_sources_except(&["main.rs"]);
 +        let needle_b = format!("{}{}{}", "sensor", "::", "run");
-+        assert!(!src.contains(&needle_a), "diagnostic source must never reference opensleep::sensor");
-+        assert!(!src.contains(&needle_b), "diagnostic source must never call the Sensor manager's run loop");
++        assert!(!src_all.contains(&needle_b), "diagnostic source must never call the Sensor manager's run loop, sensor-probe included");
 +    }
 +
 +    #[test]
@@ -10301,6 +10422,47 @@ index 0000000..9fff56f
 +                assert!(!src.contains(&needle_variant), "{path:?} must not reference FrozenAction::Prime");
 +                assert!(!src.contains(&needle_ctor), "{path:?} must not call FrozenAction::prime()");
 +            }
++        }
++    }
++
++    /// Item 9 of `sensor-probe`'s spec: it must never open `/dev/ttyS1` (Frozen's UART) or
++    /// reference the Frozen transport/command types at all. Complements the runtime counter
++    /// `frozen_uart_writes` (always 0, checked by
++    /// `sensor_probe::tests::frozen_uart_writes_always_zero_and_never_opened`) with a source-level
++    /// guarantee that the capability isn't even reachable.
++    #[test]
++    fn sensor_probe_never_touches_frozen() {
++        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/bin/opensleep-diagnostic");
++        for name in ["sensor_probe.rs", "sensor_link.rs", "sensor_safety.rs", "sensor_report.rs", "sensor_mock.rs"] {
++            let path = std::path::Path::new(dir).join(name);
++            let src = std::fs::read_to_string(&path).expect("readable .rs file");
++            for needle in ["/dev/ttyS1", "FrozenLink", "FrozenAction", "FrozenCommand", "FrozenPacket"] {
++                assert!(!src.contains(needle), "{name} must never reference {needle}");
++            }
++        }
++    }
++
++    /// Item 1/6 of `sensor-probe`'s spec: no actuator/config `SensorCommand` variant may ever be
++    /// referenced by this binary's own source -- complements `sensor_safety.rs`'s closed
++    /// `SensorProbeAction` enum (which has no such variant to construct in the first place) with a
++    /// source-level guarantee that no other file smuggles one in via `opensleep::sensor::
++    /// SensorCommand` directly.
++    #[test]
++    fn no_sensor_actuator_or_config_command_is_ever_referenced() {
++        let src = read_all_our_sources_except(&["main.rs"]);
++        for needle in [
++            "SensorCommand::EnableVibration",
++            "SensorCommand::SetAlarm",
++            "SensorCommand::EnablePiezo",
++            "SensorCommand::DisablePiezo",
++            "SensorCommand::SetPiezoGain",
++            "SensorCommand::SetPiezoFreq",
++            "SensorCommand::ProbeTemperature",
++            "SensorCommand::ClearAlarm",
++            "SensorCommand::GetHeaterOffset",
++            "SensorCommand::Random",
++        ] {
++            assert!(!src.contains(needle), "diagnostic source must never reference {needle}");
 +        }
 +    }
 +}
@@ -16258,6 +16420,2000 @@ index 0000000..dc28de5
 +                }
 +            }
 +        }
++    }
++}
+diff --git a/src/bin/opensleep-diagnostic/sensor_link.rs b/src/bin/opensleep-diagnostic/sensor_link.rs
+new file mode 100644
+index 0000000..d46ae4f
+--- /dev/null
++++ b/src/bin/opensleep-diagnostic/sensor_link.rs
+@@ -0,0 +1,266 @@
++//! Sensor UART transport, mirroring `link.rs`'s role for Frozen: every send goes through
++//! [`SensorAudit::check`] first, and the wire framing is entirely
++//! `opensleep::common::codec::PacketCodec` / `opensleep::sensor::{SensorCommand, SensorPacket}` --
++//! nothing here reimplements packet encoding or decoding. Generic over the underlying I/O so the
++//! same code runs against a real serial port, `tokio::io::duplex` mocks in tests, and the mock
++//! Sensor device used for `--dry-run`. Reuses [`LoggingIo`] unmodified, exactly as Frozen's own
++//! equivalent transport (`link.rs`) does, so raw-byte capture and the opt-in `--raw-serial-log`
++//! debug lines work identically.
++
++use std::time::Duration;
++
++use futures_util::{SinkExt, StreamExt};
++use opensleep::common::codec::PacketCodec;
++use opensleep::common::serial::create_port;
++use opensleep::sensor::{SensorCommand, SensorPacket};
++use tokio::io::{AsyncRead, AsyncWrite};
++use tokio_serial::SerialStream;
++use tokio_util::codec::Framed;
++
++use crate::io_logging::LoggingIo;
++use crate::sensor_safety::{ProbeMode, SensorAudit, SensorProbeAction, SensorSafetyViolation};
++
++/// Hard ceiling on a single write completing -- see `link.rs::WRITE_TIMEOUT`'s doc comment for why
++/// this exists at all (a stuck/disconnected UART must never hang this binary forever).
++const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
++
++#[derive(Debug)]
++pub enum PacketOutcome {
++    Received(SensorPacket),
++    TimedOut,
++    Closed,
++}
++
++#[derive(Debug)]
++pub enum LinkError {
++    Safety(SensorSafetyViolation),
++    WriteIo(std::io::Error),
++    ReadIo(std::io::Error),
++}
++
++impl std::fmt::Display for LinkError {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            LinkError::Safety(v) => write!(f, "{v}"),
++            LinkError::WriteIo(e) => write!(f, "write failed: {e}"),
++            LinkError::ReadIo(e) => write!(f, "read failed: {e}"),
++        }
++    }
++}
++impl std::error::Error for LinkError {}
++
++pub struct SensorLink<T> {
++    framed: Framed<LoggingIo<T>, PacketCodec<SensorPacket>>,
++}
++
++impl SensorLink<SerialStream> {
++    /// Opens the real Sensor UART at `baud` (8N1, no flow control -- matching stock OpenSleep's
++    /// `create_port`), retaining every raw RX/TX byte chunk in `capture` -- used to
++    /// compute candidate-frame-start statistics independent of what `PacketCodec` itself consumed.
++    pub fn open_capturing(
++        port: &str,
++        baud: u32,
++        capture: crate::io_logging::RawIoCapture,
++        raw_log_enabled: bool,
++    ) -> Result<Self, opensleep::common::serial::SerialError> {
++        let raw = create_port(port, baud)?;
++        log::info!("Sensor UART opened: {port} @ {baud} baud, 8N1, no flow control");
++        Ok(Self::wrap_capturing_with_raw_log(raw, "Sensor", capture, raw_log_enabled))
++    }
++}
++
++impl<T: AsyncRead + AsyncWrite + Unpin> SensorLink<T> {
++    pub fn wrap(inner: T, label: &'static str) -> Self {
++        Self { framed: Framed::new(LoggingIo::new(inner, label), PacketCodec::new()) }
++    }
++
++    pub fn wrap_capturing(inner: T, label: &'static str, capture: crate::io_logging::RawIoCapture) -> Self {
++        Self { framed: Framed::new(LoggingIo::with_capture(inner, label, capture), PacketCodec::new()) }
++    }
++
++    pub fn wrap_capturing_with_raw_log(
++        inner: T,
++        label: &'static str,
++        capture: crate::io_logging::RawIoCapture,
++        raw_log_enabled: bool,
++    ) -> Self {
++        Self {
++            framed: Framed::new(
++                LoggingIo::with_capture(inner, label, capture).with_raw_log_enabled(raw_log_enabled),
++                PacketCodec::new(),
++            ),
++        }
++    }
++
++    /// Checks `action` against `mode`'s whitelist, and only if it passes, serializes and transmits
++    /// it (bounded by [`WRITE_TIMEOUT`]), then waits up to `wait` for one decoded response packet.
++    pub async fn send(
++        &mut self,
++        audit: &mut SensorAudit,
++        mode: ProbeMode,
++        action: SensorProbeAction,
++        firmware_mode_confirmed: bool,
++        wait: Duration,
++    ) -> Result<PacketOutcome, LinkError> {
++        audit.check(mode, action, firmware_mode_confirmed).map_err(LinkError::Safety)?;
++        let cmd = action.to_command();
++        log::info!("-> {} ({:?})", action.name(), cmd);
++        Self::write_one(&mut self.framed, cmd).await?;
++        audit.record_sent(action);
++        Self::await_one(&mut self.framed, wait).await
++    }
++
++    /// Waits up to `wait` for the next decoded packet without sending anything -- the only
++    /// operation `--passive` mode (and the post-discovery observe phase) ever performs.
++    pub async fn recv(&mut self, wait: Duration) -> Result<PacketOutcome, LinkError> {
++        Self::await_one(&mut self.framed, wait).await
++    }
++
++    async fn write_one(
++        framed: &mut Framed<LoggingIo<T>, PacketCodec<SensorPacket>>,
++        cmd: SensorCommand,
++    ) -> Result<(), LinkError> {
++        match tokio::time::timeout(WRITE_TIMEOUT, framed.send(cmd)).await {
++            Ok(Ok(())) => Ok(()),
++            Ok(Err(e)) => Err(LinkError::WriteIo(e)),
++            Err(_elapsed) => Err(LinkError::WriteIo(std::io::Error::new(
++                std::io::ErrorKind::TimedOut,
++                format!("write did not complete within {WRITE_TIMEOUT:?}"),
++            ))),
++        }
++    }
++
++    async fn await_one(
++        framed: &mut Framed<LoggingIo<T>, PacketCodec<SensorPacket>>,
++        wait: Duration,
++    ) -> Result<PacketOutcome, LinkError> {
++        match tokio::time::timeout(wait, framed.next()).await {
++            Ok(Some(Ok(pkt))) => {
++                log::info!("<- decoded: {pkt:?}");
++                Ok(PacketOutcome::Received(pkt))
++            }
++            Ok(Some(Err(e))) => {
++                log::warn!("Sensor UART read error: {e}");
++                Err(LinkError::ReadIo(e))
++            }
++            Ok(None) => {
++                log::warn!("Sensor port closed");
++                Ok(PacketOutcome::Closed)
++            }
++            Err(_elapsed) => Ok(PacketOutcome::TimedOut),
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use bytes::{Buf, BytesMut};
++    use tokio::io::DuplexStream;
++
++    fn pong_frame(in_firmware: bool) -> Vec<u8> {
++        let code: u8 = if in_firmware { 0b0100_0110 } else { 0b0100_0010 };
++        opensleep::common::codec::command(vec![0x81, 0x00, code])
++    }
++
++    fn spawn_fake_sensor(mut device_side: DuplexStream, script: Vec<(u8, Vec<u8>)>) -> tokio::task::JoinHandle<Vec<u8>> {
++        tokio::spawn(async move {
++            use tokio::io::{AsyncReadExt, AsyncWriteExt};
++            let mut seen_opcodes = Vec::new();
++            let mut acc = BytesMut::new();
++            let mut read_buf = [0u8; 256];
++
++            'script: for (want_opcode, response) in script {
++                loop {
++                    if acc.len() >= 2 {
++                        let len = acc[1] as usize;
++                        let total = 1 + 1 + len + 2;
++                        if acc.len() >= total {
++                            let opcode = acc[2];
++                            seen_opcodes.push(opcode);
++                            acc.advance(total);
++                            if opcode == want_opcode {
++                                let _ = device_side.write_all(&response).await;
++                                continue 'script;
++                            }
++                            continue;
++                        }
++                    }
++                    let n = match device_side.read(&mut read_buf).await {
++                        Ok(0) | Err(_) => break 'script,
++                        Ok(n) => n,
++                    };
++                    acc.extend_from_slice(&read_buf[..n]);
++                }
++            }
++            seen_opcodes
++        })
++    }
++
++    #[tokio::test]
++    async fn ping_round_trips_over_the_real_wire_framing() {
++        let (client, device) = tokio::io::duplex(4096);
++        let device_task = spawn_fake_sensor(device, vec![(0x01, pong_frame(true))]);
++
++        let mut link = SensorLink::wrap(client, "test");
++        let mut audit = SensorAudit::new();
++        let outcome = link
++            .send(&mut audit, ProbeMode::Ping, SensorProbeAction::Ping, false, Duration::from_secs(1))
++            .await
++            .unwrap();
++
++        match outcome {
++            PacketOutcome::Received(SensorPacket::Pong(true)) => {}
++            other => panic!("unexpected outcome: {other:?}"),
++        }
++        assert_eq!(audit.sensor_uart_writes, 1);
++        drop(link);
++        assert_eq!(device_task.await.unwrap(), vec![0x01]);
++    }
++
++    #[tokio::test]
++    async fn safety_violation_is_returned_before_any_bytes_are_written() {
++        let (client, device) = tokio::io::duplex(4096);
++        let device_task = spawn_fake_sensor(device, vec![]);
++
++        let mut link = SensorLink::wrap(client, "test");
++        let mut audit = SensorAudit::new();
++        let err = link
++            .send(&mut audit, ProbeMode::Ping, SensorProbeAction::JumpToFirmware, false, Duration::from_millis(50))
++            .await;
++        assert!(matches!(err, Err(LinkError::Safety(_))));
++        assert_eq!(audit.sensor_uart_writes, 0);
++
++        drop(link);
++        device_task.abort();
++    }
++
++    #[tokio::test]
++    async fn recv_never_writes_anything() {
++        use tokio::io::AsyncReadExt;
++
++        // `device` is kept alive (not spawned into a task) so it never sees EOF from the peer
++        // closing -- otherwise `recv`'s timeout would race a spurious `Closed` outcome instead of
++        // genuinely proving nothing was written.
++        let (client, mut device) = tokio::io::duplex(4096);
++        let mut link = SensorLink::wrap(client, "test");
++        let outcome = link.recv(Duration::from_millis(50)).await.unwrap();
++        assert!(matches!(outcome, PacketOutcome::TimedOut));
++
++        let mut buf = [0u8; 16];
++        let read = tokio::time::timeout(Duration::from_millis(10), device.read(&mut buf)).await;
++        assert!(read.is_err(), "recv() must never write any bytes to the wire");
++    }
++
++    #[tokio::test]
++    async fn no_response_times_out_without_panicking() {
++        let (client, _device) = tokio::io::duplex(4096);
++        let mut link = SensorLink::wrap(client, "test");
++        let mut audit = SensorAudit::new();
++        let outcome = link
++            .send(&mut audit, ProbeMode::Ping, SensorProbeAction::Ping, false, Duration::from_millis(50))
++            .await
++            .unwrap();
++        assert!(matches!(outcome, PacketOutcome::TimedOut));
++    }
++}
+diff --git a/src/bin/opensleep-diagnostic/sensor_mock.rs b/src/bin/opensleep-diagnostic/sensor_mock.rs
+new file mode 100644
+index 0000000..29da4a1
+--- /dev/null
++++ b/src/bin/opensleep-diagnostic/sensor_mock.rs
+@@ -0,0 +1,181 @@
++//! Mock Sensor MCU used by `sensor-probe --dry-run` (so dry-run is testable on a normal
++//! development computer with no real hardware attached) and reused directly by integration tests.
++//! Speaks the exact real wire framing (`opensleep::common::codec::command`) on one end of a
++//! `tokio::io::duplex` pair; the diagnostic's own code talks to the other end exactly as it would a
++//! real serial port. Mirrors `mock.rs`'s role for Frozen.
++
++use bytes::{Buf, BytesMut};
++use hex_literal::hex;
++use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
++use tokio::time::Duration;
++
++fn mock_pong_frame(in_firmware: bool) -> Vec<u8> {
++    let code: u8 = if in_firmware { 0b0100_0110 } else { 0b0100_0010 };
++    opensleep::common::codec::command(vec![0x81, 0x00, code])
++}
++
++fn mock_jumping_to_firmware_frame() -> Vec<u8> {
++    opensleep::common::codec::command(vec![0x90, 0x00])
++}
++
++/// Reuses the exact CBOR fixture verified by `opensleep::common::packet::tests::test_hardware_info`.
++fn mock_hardware_info_frame() -> Vec<u8> {
++    let payload = hex!(
++        "82 00 A6 63 73 6B 75 01 68 64 61 74 65
++        63 6F 64 65 1A 00 16 01 0D 6B 66 61 63
++        74 6F 72 79 6C 69 6E 65 01 65 68 77 72
++        65 76 19 05 00 62 70 6E 19 50 78 68 64
++        65 76 69 63 65 73 6E 1A 00 01 08 9C"
++    );
++    opensleep::common::codec::command(payload.to_vec())
++}
++
++/// `SensorPacket::parse_get_firmware`'s exact layout: opcode 0x84 + one value byte (always 4, per
++/// `opensleep::sensor::packet::tests::test_get_fw`).
++fn mock_get_firmware_frame() -> Vec<u8> {
++    opensleep::common::codec::command(vec![0x84, 0x04])
++}
++
++/// `SensorPacket::parse_capacitance`'s exact layout: sequence + 6 index/value pairs (values 0-5).
++fn mock_capacitance_frame(sequence: u32, values: [u16; 6]) -> Vec<u8> {
++    let seq = sequence.to_be_bytes();
++    let mut payload = vec![0x33, seq[0], seq[1], seq[2], seq[3], 0x00, 0x00, 0x00, 0x00];
++    for (i, v) in values.iter().enumerate() {
++        let b = v.to_be_bytes();
++        payload.extend_from_slice(&[i as u8, b[0], b[1]]);
++    }
++    opensleep::common::codec::command(payload)
++}
++
++/// `SensorPacket::parse_temperature`'s exact layout: 11 index/value pairs (indices 0-10), the last
++/// three being ambient/humidity/microcontroller.
++fn mock_temperature_frame(bed: [u16; 8], ambient: u16, humidity: u16, microcontroller: u16) -> Vec<u8> {
++    let mut payload = vec![0xAF, 0x00];
++    for (i, v) in bed.iter().enumerate() {
++        let b = v.to_be_bytes();
++        payload.extend_from_slice(&[i as u8, b[0], b[1]]);
++    }
++    for (i, v) in [ambient, humidity, microcontroller].iter().enumerate() {
++        let b = v.to_be_bytes();
++        payload.extend_from_slice(&[(8 + i) as u8, b[0], b[1]]);
++    }
++    opensleep::common::codec::command(payload)
++}
++
++/// `SensorPacket::parse_piezo`'s exact layout: freq + sequence + gain pair + interleaved
++/// left/right sample pairs.
++fn mock_piezo_frame(freq: u32, sequence: u32, gain: (u16, u16), left: &[u16], right: &[u16]) -> Vec<u8> {
++    let mut payload = vec![0x32, 0x02];
++    payload.extend_from_slice(&freq.to_be_bytes());
++    payload.extend_from_slice(&sequence.to_be_bytes());
++    payload.extend_from_slice(&gain.0.to_be_bytes());
++    payload.extend_from_slice(&gain.1.to_be_bytes());
++    for (l, r) in left.iter().zip(right.iter()) {
++        payload.extend_from_slice(&l.to_be_bytes());
++        payload.extend_from_slice(&r.to_be_bytes());
++    }
++    opensleep::common::codec::command(payload)
++}
++
++/// Plausible fixed telemetry values used by every mock below.
++const MOCK_CAPACITANCE: [u16; 6] = [100, 110, 120, 200, 210, 220];
++const MOCK_BED_TEMP: [u16; 8] = [2400, 2401, 2402, 2403, 2404, 2405, 2406, 2407];
++const MOCK_AMBIENT_CENTIDEG: u16 = 2200;
++const MOCK_HUMIDITY_CENTIPCT: u16 = 4500;
++const MOCK_MCU_CENTIDEG: u16 = 3000;
++const MOCK_PIEZO_LEFT: [u16; 2] = [10, 12];
++const MOCK_PIEZO_RIGHT: [u16; 2] = [20, 22];
++
++/// Spawns a background task simulating a Sensor MCU already running in firmware mode (the common
++/// real-world case: "happens if program was recently running", per upstream's own comment).
++/// Answers Ping with a firmware Pong, GetHardwareInfo/GetFirmwareHash with fixed fixtures, and
++/// unconditionally pushes one unsolicited Capacitance + one Temperature + one Piezo frame shortly
++/// after connecting (mirrors real firmware pushing telemetry on its own schedule), so `--passive`
++/// dry-run (which sends nothing) still has something to observe. Runs until the client side closes.
++pub fn spawn_mock_sensor_device_firmware(device_side: DuplexStream) -> tokio::task::JoinHandle<Vec<u8>> {
++    spawn_mock_sensor_device(device_side, true)
++}
++
++/// Same, but starts in bootloader mode: Ping gets a bootloader Pong until `JumpToFirmware` is
++/// received, at which point it acks with `JumpingToFirmware` and switches to firmware mode for all
++/// subsequent Pings (and starts pushing unsolicited telemetry, same as the firmware-only mock).
++/// Only exercised by `sensor_probe.rs`'s discover-mode tests today (`--dry-run` itself always uses
++/// [`spawn_mock_sensor_device_firmware`] -- see that function's doc comment), kept public for any
++/// future test that wants the full bootloader -> jump -> firmware sequence.
++#[allow(dead_code)]
++pub fn spawn_mock_sensor_device_bootloader(device_side: DuplexStream) -> tokio::task::JoinHandle<Vec<u8>> {
++    spawn_mock_sensor_device(device_side, false)
++}
++
++/// Spawns a background task that never responds to anything -- models a genuinely silent Sensor
++/// MCU (both baud rates unanswered).
++pub fn spawn_mock_sensor_device_silent(mut device_side: DuplexStream) -> tokio::task::JoinHandle<Vec<u8>> {
++    tokio::spawn(async move {
++        let mut read_buf = [0u8; 256];
++        loop {
++            match device_side.read(&mut read_buf).await {
++                Ok(0) | Err(_) => break,
++                Ok(_) => {} // received bytes, never reply
++            }
++        }
++        Vec::new()
++    })
++}
++
++fn spawn_mock_sensor_device(mut device_side: DuplexStream, start_in_firmware: bool) -> tokio::task::JoinHandle<Vec<u8>> {
++    tokio::spawn(async move {
++        let mut acc = BytesMut::new();
++        let mut read_buf = [0u8; 256];
++        let mut in_firmware = start_in_firmware;
++        let mut seen_opcodes = Vec::new();
++        let mut pushed_telemetry = false;
++
++        loop {
++            if !pushed_telemetry && in_firmware {
++                pushed_telemetry = true;
++                let _ = device_side.write_all(&mock_capacitance_frame(1, MOCK_CAPACITANCE)).await;
++                let _ = device_side
++                    .write_all(&mock_temperature_frame(MOCK_BED_TEMP, MOCK_AMBIENT_CENTIDEG, MOCK_HUMIDITY_CENTIPCT, MOCK_MCU_CENTIDEG))
++                    .await;
++                let _ = device_side
++                    .write_all(&mock_piezo_frame(1000, 1, (400, 400), &MOCK_PIEZO_LEFT, &MOCK_PIEZO_RIGHT))
++                    .await;
++            }
++
++            if acc.len() >= 2 {
++                let len = acc[1] as usize;
++                let total = 1 + 1 + len + 2;
++                if acc.len() >= total {
++                    let opcode = acc[2];
++                    seen_opcodes.push(opcode);
++                    acc.advance(total);
++                    match opcode {
++                        0x01 => {
++                            let _ = device_side.write_all(&mock_pong_frame(in_firmware)).await;
++                        }
++                        0x10 => {
++                            let _ = device_side.write_all(&mock_jumping_to_firmware_frame()).await;
++                            in_firmware = true;
++                        }
++                        0x02 => {
++                            let _ = device_side.write_all(&mock_hardware_info_frame()).await;
++                        }
++                        0x04 => {
++                            let _ = device_side.write_all(&mock_get_firmware_frame()).await;
++                        }
++                        _ => {}
++                    }
++                    continue;
++                }
++            }
++
++            let read = tokio::time::timeout(Duration::from_millis(50), device_side.read(&mut read_buf)).await;
++            match read {
++                Ok(Ok(0)) | Ok(Err(_)) => break,
++                Ok(Ok(n)) => acc.extend_from_slice(&read_buf[..n]),
++                Err(_elapsed) => {} // no bytes within this tick; loop back to (maybe) push telemetry
++            }
++        }
++        seen_opcodes
++    })
++}
+diff --git a/src/bin/opensleep-diagnostic/sensor_probe.rs b/src/bin/opensleep-diagnostic/sensor_probe.rs
+new file mode 100644
+index 0000000..d0ed393
+--- /dev/null
++++ b/src/bin/opensleep-diagnostic/sensor_probe.rs
+@@ -0,0 +1,1106 @@
++//! `sensor-probe`: investigates the Eight Sleep Sensor subsystem (presence/piezo/temperature MCU)
++//! over its own UART, entirely independent of Frozen. This first version establishes reliable
++//! communication and decodes whatever is already available -- it deliberately does NOT attempt
++//! presence calibration, piezo configuration, vibration actuation, alarms, or expander reset
++//! pulsing (see SAFETY.md and `sensor_safety.rs` module docs for why those command variants are
++//! not even constructible in this binary).
++//!
++//! Three stages of increasing capability, all still zero-I2C-write:
++//!   - `--passive` (default): zero UART writes too. Opens `/dev/ttyS2` at each known Sensor baud
++//!     in turn and only listens, decoding through the real, unmodified
++//!     `opensleep::common::codec::PacketCodec<SensorPacket>`.
++//!   - `--ping`: may send `SensorCommand::Ping`, never `JumpToFirmware`, never changes Sensor mode.
++//!   - `--discover`: implements upstream's Ping / JumpToFirmware discovery sequence (firmware Ping
++//!     first, then bootloader Ping, then -- only if bootloader responded -- exactly one
++//!     `JumpToFirmware` and a re-ping at firmware baud), but never starts the normal Sensor
++//!     `CommandScheduler` and never sends any actuator/config command.
++//!
++//! `--audit-expander` (combinable with any stage) performs a read-only PCAL6416A register dump,
++//! reusing the existing `I2cPort::read_reg` -- this module contains no `write_reg` call at all, so
++//! registers 0x02/0x06/0x07 (and every other register) are structurally unwritable here. Port-0
++//! bit 0's function is deliberately left unproven: see SAFETY.md and item 8 of this feature's
++//! spec -- no reset-line pulsing of any kind is implemented in this version.
++//!
++//! Never opens Frozen's own dedicated UART device or references its transport/command types at
++//! all -- see `main.rs`'s `sensor_probe_never_touches_frozen` guardrail test.
++
++use std::collections::BTreeMap;
++use std::sync::{Arc, Mutex};
++use std::time::Duration;
++
++use opensleep::sensor::SensorPacket;
++use tokio::io::{AsyncRead, AsyncWrite};
++use tokio_serial::SerialStream;
++
++use crate::buildinfo::{DIAGNOSTIC_VERSION, kernel_release, source_commit};
++use crate::cli::SensorProbeArgs;
++use crate::i2c::{I2cPort, MockI2c, RealI2c};
++use crate::io_logging::RawIoCapture;
++use crate::ownership;
++use crate::sensor_link::{LinkError, PacketOutcome, SensorLink};
++use crate::sensor_mock::{spawn_mock_sensor_device_firmware, spawn_mock_sensor_device_silent};
++use crate::sensor_report::{ExpanderAudit, ExpanderRegisterReading, PacketTallyJson, SensorProbeReport};
++use crate::sensor_safety::{ProbeMode, SensorAudit, SensorProbeAction};
++
++/// Documented reference constant, cross-checked against `cli.rs`'s own `--sensor-port` default by
++/// `tests::default_sensor_port_is_dev_ttys2`; not read at runtime (the default lives in the
++/// `clap` attribute, same pattern as `safety::DEFAULT_COOL_DELTA_CENTIDEG`).
++#[allow(dead_code)]
++pub const DEFAULT_SENSOR_PORT: &str = "/dev/ttyS2";
++pub const FIRMWARE_BAUD: u32 = 115200;
++pub const BOOTLOADER_BAUD: u32 = 38400;
++
++pub async fn run(args: &SensorProbeArgs) -> (SensorProbeReport, u8) {
++    let mode = match determine_mode(args) {
++        Ok(m) => m,
++        Err(e) => {
++            log::error!("{e}");
++            return (empty_report(args, ProbeMode::Passive, args.dry_run, "invalid_arguments"), 2);
++        }
++    };
++
++    let (mut report, _code) = if args.dry_run {
++        log::warn!("--dry-run: no real UART or I2C access; using a mocked Sensor device");
++        run_dry(args, mode).await
++    } else {
++        if let Some(early) = refuse_if_owned(args) {
++            return early;
++        }
++        match mode {
++            ProbeMode::Passive => run_real_passive(args).await,
++            ProbeMode::Ping => run_real_ping(args).await,
++            ProbeMode::Discover => run_real_discover(args).await,
++        }
++    };
++
++    if args.audit_expander {
++        // `write_count` is always 0: `audit_expander` never calls `write_reg` (see its own doc
++        // comment and the `expander_audit_never_writes_any_register` test) -- computed from the
++        // mock's own write log rather than hardcoded, so a future regression would fail loudly.
++        let (audit, write_count) = if args.dry_run {
++            let mut mock = MockI2c::always_succeed();
++            let a = audit_expander(&mut mock);
++            (a, mock.writes.len() as u32)
++        } else {
++            match RealI2c::open(&args.i2c_device) {
++                Ok(mut dev) => (audit_expander(&mut dev), 0),
++                Err(e) => {
++                    log::error!("failed to open I2C device {} for --audit-expander: {e}", args.i2c_device);
++                    (ExpanderAudit::default(), 0)
++                }
++            }
++        };
++        report.i2c_reads += audit.readings.len() as u32;
++        report.i2c_writes += write_count;
++        report.expander_audit = Some(audit);
++    }
++
++    if let Some(path) = &args.json_output
++        && let Err(e) = report.write_json(path)
++    {
++        log::error!("failed to write JSON output to {path}: {e}");
++    }
++    if let Some(path) = &args.csv_output
++        && let Err(e) = report.write_csv(path)
++    {
++        log::error!("failed to write CSV output to {path}: {e}");
++    }
++    report.print_table();
++    let code = report.exit_code;
++    (report, code)
++}
++
++fn determine_mode(args: &SensorProbeArgs) -> Result<ProbeMode, String> {
++    let selected = [args.passive, args.ping, args.discover].iter().filter(|&&b| b).count();
++    if selected > 1 {
++        return Err("--passive, --ping, and --discover are mutually exclusive".to_string());
++    }
++    if args.ping {
++        Ok(ProbeMode::Ping)
++    } else if args.discover {
++        Ok(ProbeMode::Discover)
++    } else {
++        Ok(ProbeMode::Passive) // default; also covers an explicit --passive
++    }
++}
++
++fn refuse_if_owned(args: &SensorProbeArgs) -> Option<(SensorProbeReport, u8)> {
++    if ownership::device_exists(&args.sensor_port) && ownership::device_is_open_elsewhere(&args.sensor_port) {
++        log::error!("refusing to run: {} appears to be open in another process", args.sensor_port);
++        return Some((empty_report(args, ProbeMode::Passive, false, "sensor_port_open_elsewhere"), 40));
++    }
++    if args.audit_expander
++        && ownership::device_exists(&args.i2c_device)
++        && ownership::device_is_open_elsewhere(&args.i2c_device)
++    {
++        log::error!("refusing to run: {} appears to be open in another process", args.i2c_device);
++        return Some((empty_report(args, ProbeMode::Passive, false, "i2c_device_open_elsewhere"), 40));
++    }
++    None
++}
++
++// ---------------------------------------------------------------------------------------------
++// Packet tallying, shared by every listening context (passive per-baud, ping's incidental
++// listening, and discover's post-communication observe phase).
++// ---------------------------------------------------------------------------------------------
++
++#[derive(Default)]
++struct PacketTally {
++    frames_decoded: u64,
++    packet_type_counts: BTreeMap<&'static str, u64>,
++    capacitance_samples: u64,
++    cap_left_min: Option<u16>,
++    cap_left_max: Option<u16>,
++    cap_left_latest: Option<u16>,
++    cap_right_min: Option<u16>,
++    cap_right_max: Option<u16>,
++    cap_right_latest: Option<u16>,
++    piezo_samples: u64,
++    piezo_left_min: Option<u16>,
++    piezo_left_max: Option<u16>,
++    piezo_left_latest: Option<u16>,
++    piezo_right_min: Option<u16>,
++    piezo_right_max: Option<u16>,
++    piezo_right_latest: Option<u16>,
++    temperature_samples: u64,
++    first_valid_ts: Option<String>,
++    last_valid_ts: Option<String>,
++}
++
++fn fold_minmax(min: &mut Option<u16>, max: &mut Option<u16>, latest: &mut Option<u16>, values: &[u16]) {
++    for &v in values {
++        *min = Some(min.map_or(v, |m| m.min(v)));
++        *max = Some(max.map_or(v, |m| m.max(v)));
++        *latest = Some(v);
++    }
++}
++
++fn packet_type_name(pkt: &SensorPacket) -> &'static str {
++    match pkt {
++        SensorPacket::Pong(_) => "pong",
++        SensorPacket::Message(_) => "message",
++        SensorPacket::HardwareInfo(_) => "hardware_info",
++        SensorPacket::JumpingToFirmware(_) => "jumping_to_firmware",
++        SensorPacket::PiezoGainSet(_, _) => "piezo_gain_set",
++        SensorPacket::VibrationEnabled(_, _) => "vibration_enabled",
++        SensorPacket::GetFirmware(_) => "firmware_hash_response",
++        SensorPacket::PiezoFreqSet(_) => "piezo_freq_set",
++        SensorPacket::PiezoEnabled(_) => "piezo_enabled",
++        SensorPacket::Init(_) => "init",
++        SensorPacket::Capacitance(_) => "capacitance",
++        SensorPacket::Piezo(_) => "piezo",
++        SensorPacket::Temperature(_) => "temperature",
++        SensorPacket::AlarmSet(_) => "alarm_set",
++    }
++}
++
++impl PacketTally {
++    fn record(&mut self, pkt: &SensorPacket) {
++        self.frames_decoded += 1;
++        let now = jiff::Timestamp::now().to_string();
++        if self.first_valid_ts.is_none() {
++            self.first_valid_ts = Some(now.clone());
++        }
++        self.last_valid_ts = Some(now);
++        *self.packet_type_counts.entry(packet_type_name(pkt)).or_insert(0) += 1;
++
++        match pkt {
++            SensorPacket::Capacitance(data) => {
++                self.capacitance_samples += 1;
++                fold_minmax(&mut self.cap_left_min, &mut self.cap_left_max, &mut self.cap_left_latest, &data.values[0..3]);
++                fold_minmax(&mut self.cap_right_min, &mut self.cap_right_max, &mut self.cap_right_latest, &data.values[3..6]);
++            }
++            SensorPacket::Piezo(p) => {
++                self.piezo_samples += 1;
++                fold_minmax(&mut self.piezo_left_min, &mut self.piezo_left_max, &mut self.piezo_left_latest, &p.left_samples);
++                fold_minmax(&mut self.piezo_right_min, &mut self.piezo_right_max, &mut self.piezo_right_latest, &p.right_samples);
++            }
++            SensorPacket::Temperature(_) => self.temperature_samples += 1,
++            _ => {}
++        }
++    }
++
++    fn finalize(self, frames_found: u64) -> PacketTallyJson {
++        PacketTallyJson {
++            bytes_received: 0, // filled in by the caller, which owns the raw capture
++            frames_found,
++            frames_decoded: self.frames_decoded,
++            malformed_frames: frames_found.saturating_sub(self.frames_decoded),
++            packet_types_observed: self.packet_type_counts.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
++            capacitance_samples: self.capacitance_samples,
++            capacitance_left_min: self.cap_left_min,
++            capacitance_left_max: self.cap_left_max,
++            capacitance_left_latest: self.cap_left_latest,
++            capacitance_right_min: self.cap_right_min,
++            capacitance_right_max: self.cap_right_max,
++            capacitance_right_latest: self.cap_right_latest,
++            piezo_samples: self.piezo_samples,
++            piezo_left_min: self.piezo_left_min,
++            piezo_left_max: self.piezo_left_max,
++            piezo_left_latest: self.piezo_left_latest,
++            piezo_right_min: self.piezo_right_min,
++            piezo_right_max: self.piezo_right_max,
++            piezo_right_latest: self.piezo_right_latest,
++            temperature_samples: self.temperature_samples,
++            first_valid_packet_timestamp: self.first_valid_ts,
++            last_valid_packet_timestamp: self.last_valid_ts,
++        }
++    }
++}
++
++/// `(bytes received, candidate 0x7E frame starts)` -- see `PacketTallyJson::frames_found`'s doc
++/// comment for why the latter is a heuristic upper bound, not an exact count.
++fn tally_raw_capture(capture: &RawIoCapture) -> (u64, u64) {
++    let Ok(events) = capture.lock() else { return (0, 0) };
++    let mut bytes = 0u64;
++    let mut markers = 0u64;
++    for event in events.iter().filter(|e| e.direction == "rx") {
++        if let Some(b) = crate::io_logging::hex_to_bytes(&event.hex) {
++            bytes += b.len() as u64;
++            markers += b.iter().filter(|&&x| x == opensleep::common::codec::START).count() as u64;
++        }
++    }
++    (bytes, markers)
++}
++
++/// Listens (never sends) until `duration` elapses or the link closes, decoding every packet
++/// through the real `PacketCodec`. The sole operation `--passive` mode performs.
++async fn listen_and_tally<T: AsyncRead + AsyncWrite + Unpin>(link: &mut SensorLink<T>, duration: Duration) -> PacketTally {
++    let mut tally = PacketTally::default();
++    let deadline = tokio::time::Instant::now() + duration;
++    loop {
++        let now = tokio::time::Instant::now();
++        if now >= deadline {
++            break;
++        }
++        match link.recv(deadline - now).await {
++            Ok(PacketOutcome::Received(pkt)) => tally.record(&pkt),
++            Ok(PacketOutcome::TimedOut) | Ok(PacketOutcome::Closed) => break,
++            Err(_) => break,
++        }
++    }
++    tally
++}
++
++/// Sends `action` once, then keeps listening (never resending) until either a packet matching
++/// `want` arrives or `budget` elapses. Real Sensor firmware (and this binary's own mock) can push
++/// unsolicited telemetry (capacitance/piezo/temperature) interleaved with a solicited response --
++/// a naive single-`next()` pairing would mistake the first unrelated packet for the answer, or
++/// (worse) burn through the whole retry budget consuming unrelated packets while the real response
++/// sits unread. This drains and discards anything that doesn't match `want` instead of treating it
++/// as a failed attempt -- exactly the "do not abort merely because some packets use a firmware
++/// variant not yet understood" tolerance this feature's spec requires.
++async fn send_and_wait_for<T, F>(
++    link: &mut SensorLink<T>,
++    audit: &mut SensorAudit,
++    mode: ProbeMode,
++    action: SensorProbeAction,
++    firmware_mode_confirmed: bool,
++    budget: Duration,
++    mut want: F,
++) -> Option<SensorPacket>
++where
++    T: AsyncRead + AsyncWrite + Unpin,
++    F: FnMut(&SensorPacket) -> bool,
++{
++    let deadline = tokio::time::Instant::now() + budget;
++    let mut sent = false;
++    loop {
++        let now = tokio::time::Instant::now();
++        if now >= deadline {
++            return None;
++        }
++        let outcome = if !sent {
++            sent = true;
++            link.send(audit, mode, action, firmware_mode_confirmed, deadline - now).await
++        } else {
++            link.recv(deadline - now).await
++        };
++        match outcome {
++            Ok(PacketOutcome::Received(pkt)) if want(&pkt) => return Some(pkt),
++            Ok(PacketOutcome::Received(_)) => continue, // unsolicited packet; keep waiting
++            Ok(PacketOutcome::TimedOut) | Ok(PacketOutcome::Closed) => return None,
++            Err(LinkError::Safety(v)) => {
++                log::error!("refusing to send {}: {v}", action.name());
++                return None;
++            }
++            Err(e) => {
++                log::warn!("Sensor {} failed: {e}", action.name());
++                return None;
++            }
++        }
++    }
++}
++
++async fn try_ping<T: AsyncRead + AsyncWrite + Unpin>(
++    link: &mut SensorLink<T>,
++    audit: &mut SensorAudit,
++    mode: ProbeMode,
++    firmware_mode_confirmed: bool,
++    max_attempts: u32,
++) -> Option<bool> {
++    for _ in 0..max_attempts {
++        if let Some(SensorPacket::Pong(in_firmware)) = send_and_wait_for(
++            link,
++            audit,
++            mode,
++            SensorProbeAction::Ping,
++            firmware_mode_confirmed,
++            Duration::from_secs(1),
++            |p| matches!(p, SensorPacket::Pong(_)),
++        )
++        .await
++        {
++            return Some(in_firmware);
++        }
++    }
++    None
++}
++
++// ---------------------------------------------------------------------------------------------
++// Report assembly
++// ---------------------------------------------------------------------------------------------
++
++#[derive(Default)]
++struct ModeOutcome {
++    firmware_baud_opened: bool,
++    bootloader_baud_opened: bool,
++    passive_115200: Option<PacketTallyJson>,
++    passive_38400: Option<PacketTallyJson>,
++    active_probe: Option<PacketTallyJson>,
++    firmware_ping_response: Option<bool>,
++    bootloader_ping_response: Option<bool>,
++    jump_to_firmware_sent: bool,
++    firmware_mode_confirmed: bool,
++    hardware_info: Option<String>,
++    firmware_info: Option<String>,
++    overall_result: String,
++}
++
++fn base_report(args: &SensorProbeArgs, mode: ProbeMode, dry_run: bool) -> SensorProbeReport {
++    SensorProbeReport {
++        program_version: DIAGNOSTIC_VERSION.to_string(),
++        opensleep_base_version: opensleep::VERSION.to_string(),
++        opensleep_source_commit: source_commit().to_string(),
++        kernel: kernel_release(),
++        arch: std::env::consts::ARCH.to_string(),
++        mode: mode.label().to_string(),
++        dry_run,
++        sensor_port: args.sensor_port.clone(),
++        listen_seconds: args.listen_seconds,
++        observe_seconds: args.observe_seconds,
++        query_info_requested: args.query_info,
++        audit_expander_requested: args.audit_expander,
++        raw_serial_enabled: args.raw_serial_log,
++        firmware_baud_opened: false,
++        bootloader_baud_opened: false,
++        passive_115200: None,
++        passive_38400: None,
++        active_probe: None,
++        passive_bytes_115200: 0,
++        passive_bytes_38400: 0,
++        packet_types_observed: Vec::new(),
++        capacitance_samples: 0,
++        piezo_samples: 0,
++        temperature_samples: 0,
++        malformed_packets: 0,
++        firmware_ping_response: None,
++        bootloader_ping_response: None,
++        jump_to_firmware_sent: false,
++        firmware_mode_confirmed: false,
++        hardware_info: None,
++        firmware_info: None,
++        expander_audit: None,
++        sensor_uart_writes: 0,
++        frozen_uart_writes: 0,
++        i2c_reads: 0,
++        i2c_writes: 0,
++        actuator_commands_sent: 0,
++        frozen_port_never_opened: true,
++        frozen_command_sent: false,
++        prime_command_sent: false,
++        temperature_target_changed: false,
++        overall_result: "uart_silent".to_string(),
++        exit_code: 10,
++    }
++}
++
++fn empty_report(args: &SensorProbeArgs, mode: ProbeMode, dry_run: bool, result: &str) -> SensorProbeReport {
++    let mut r = base_report(args, mode, dry_run);
++    r.overall_result = result.to_string();
++    r.exit_code = exit_code_for(result);
++    r
++}
++
++fn exit_code_for(result: &str) -> u8 {
++    match result {
++        "communicating_firmware" | "communicating_bootloader" | "unsolicited_traffic_only" => 0,
++        "uart_silent" => 10,
++        "undecodable_traffic" => 11,
++        "unresolved" => 12,
++        _ => 20,
++    }
++}
++
++fn finish(args: &SensorProbeArgs, mode: ProbeMode, dry_run: bool, outcome: ModeOutcome, audit: SensorAudit) -> (SensorProbeReport, u8) {
++    let mut r = base_report(args, mode, dry_run);
++    r.firmware_baud_opened = outcome.firmware_baud_opened;
++    r.bootloader_baud_opened = outcome.bootloader_baud_opened;
++
++    if let Some(t) = &outcome.passive_115200 {
++        r.passive_bytes_115200 = t.bytes_received;
++    }
++    if let Some(t) = &outcome.passive_38400 {
++        r.passive_bytes_38400 = t.bytes_received;
++    }
++
++    let mut all_types: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
++    let mut malformed = 0u64;
++    let mut cap_samples = 0u64;
++    let mut piezo_samples = 0u64;
++    let mut temp_samples = 0u64;
++    for t in [&outcome.passive_115200, &outcome.passive_38400, &outcome.active_probe].into_iter().flatten() {
++        all_types.extend(t.packet_types_observed.keys().cloned());
++        malformed += t.malformed_frames;
++        cap_samples += t.capacitance_samples;
++        piezo_samples += t.piezo_samples;
++        temp_samples += t.temperature_samples;
++    }
++    r.packet_types_observed = all_types.into_iter().collect();
++    r.malformed_packets = malformed;
++    r.capacitance_samples = cap_samples;
++    r.piezo_samples = piezo_samples;
++    r.temperature_samples = temp_samples;
++
++    r.passive_115200 = outcome.passive_115200;
++    r.passive_38400 = outcome.passive_38400;
++    r.active_probe = outcome.active_probe;
++    r.firmware_ping_response = outcome.firmware_ping_response;
++    r.bootloader_ping_response = outcome.bootloader_ping_response;
++    r.jump_to_firmware_sent = outcome.jump_to_firmware_sent;
++    r.firmware_mode_confirmed = outcome.firmware_mode_confirmed;
++    r.hardware_info = outcome.hardware_info;
++    r.firmware_info = outcome.firmware_info;
++
++    r.sensor_uart_writes = audit.sensor_uart_writes;
++    r.actuator_commands_sent = audit.actuator_commands_sent;
++
++    r.overall_result = outcome.overall_result.clone();
++    r.exit_code = exit_code_for(&outcome.overall_result);
++    let code = r.exit_code;
++    (r, code)
++}
++
++// ---------------------------------------------------------------------------------------------
++// --passive
++// ---------------------------------------------------------------------------------------------
++
++async fn run_real_passive(args: &SensorProbeArgs) -> (SensorProbeReport, u8) {
++    let mut outcome = ModeOutcome::default();
++
++    let cap_115200: RawIoCapture = Arc::new(Mutex::new(Vec::new()));
++    match SensorLink::<SerialStream>::open_capturing(&args.sensor_port, FIRMWARE_BAUD, cap_115200.clone(), args.raw_serial_log) {
++        Ok(mut link) => {
++            outcome.firmware_baud_opened = true;
++            let tally = listen_and_tally(&mut link, Duration::from_secs(args.listen_seconds.max(1))).await;
++            let (bytes, found) = tally_raw_capture(&cap_115200);
++            let mut json = tally.finalize(found);
++            json.bytes_received = bytes;
++            outcome.passive_115200 = Some(json);
++        }
++        Err(e) => log::error!("failed to open Sensor UART @ {FIRMWARE_BAUD}: {e}"),
++    }
++
++    let cap_38400: RawIoCapture = Arc::new(Mutex::new(Vec::new()));
++    match SensorLink::<SerialStream>::open_capturing(&args.sensor_port, BOOTLOADER_BAUD, cap_38400.clone(), args.raw_serial_log) {
++        Ok(mut link) => {
++            outcome.bootloader_baud_opened = true;
++            let tally = listen_and_tally(&mut link, Duration::from_secs(args.listen_seconds.max(1))).await;
++            let (bytes, found) = tally_raw_capture(&cap_38400);
++            let mut json = tally.finalize(found);
++            json.bytes_received = bytes;
++            outcome.passive_38400 = Some(json);
++        }
++        Err(e) => log::error!("failed to open Sensor UART @ {BOOTLOADER_BAUD}: {e}"),
++    }
++
++    outcome.overall_result = passive_result(&outcome).to_string();
++    finish(args, ProbeMode::Passive, false, outcome, SensorAudit::new())
++}
++
++fn passive_result(outcome: &ModeOutcome) -> &'static str {
++    let decoded_any = [&outcome.passive_115200, &outcome.passive_38400]
++        .into_iter()
++        .flatten()
++        .any(|t| t.frames_decoded > 0);
++    let bytes_any = [&outcome.passive_115200, &outcome.passive_38400].into_iter().flatten().any(|t| t.bytes_received > 0);
++    if decoded_any {
++        "unsolicited_traffic_only"
++    } else if bytes_any {
++        "undecodable_traffic"
++    } else {
++        "uart_silent"
++    }
++}
++
++// ---------------------------------------------------------------------------------------------
++// --ping
++// ---------------------------------------------------------------------------------------------
++
++async fn run_real_ping(args: &SensorProbeArgs) -> (SensorProbeReport, u8) {
++    let mut audit = SensorAudit::new();
++    let mut outcome = ModeOutcome::default();
++    let mut any_bytes = false;
++
++    let cap_fw: RawIoCapture = Arc::new(Mutex::new(Vec::new()));
++    match SensorLink::<SerialStream>::open_capturing(&args.sensor_port, FIRMWARE_BAUD, cap_fw.clone(), args.raw_serial_log) {
++        Ok(mut link) => {
++            outcome.firmware_baud_opened = true;
++            let r = try_ping(&mut link, &mut audit, ProbeMode::Ping, false, 3).await;
++            outcome.firmware_ping_response = Some(matches!(r, Some(true)));
++        }
++        Err(e) => log::error!("failed to open Sensor UART @ {FIRMWARE_BAUD}: {e}"),
++    }
++    let (fw_bytes, _) = tally_raw_capture(&cap_fw);
++    any_bytes |= fw_bytes > 0;
++
++    if outcome.firmware_ping_response != Some(true) {
++        let cap_bl: RawIoCapture = Arc::new(Mutex::new(Vec::new()));
++        match SensorLink::<SerialStream>::open_capturing(&args.sensor_port, BOOTLOADER_BAUD, cap_bl.clone(), args.raw_serial_log) {
++            Ok(mut link) => {
++                outcome.bootloader_baud_opened = true;
++                let r = try_ping(&mut link, &mut audit, ProbeMode::Ping, false, 3).await;
++                outcome.bootloader_ping_response = Some(matches!(r, Some(false)));
++            }
++            Err(e) => log::error!("failed to open Sensor UART @ {BOOTLOADER_BAUD}: {e}"),
++        }
++        let (bl_bytes, _) = tally_raw_capture(&cap_bl);
++        any_bytes |= bl_bytes > 0;
++    }
++
++    outcome.firmware_mode_confirmed = outcome.firmware_ping_response == Some(true);
++    outcome.overall_result = if outcome.firmware_ping_response == Some(true) {
++        "communicating_firmware"
++    } else if outcome.bootloader_ping_response == Some(true) {
++        "communicating_bootloader"
++    } else if any_bytes {
++        "undecodable_traffic"
++    } else {
++        "uart_silent"
++    }
++    .to_string();
++
++    finish(args, ProbeMode::Ping, false, outcome, audit)
++}
++
++// ---------------------------------------------------------------------------------------------
++// --discover
++// ---------------------------------------------------------------------------------------------
++
++async fn run_real_discover(args: &SensorProbeArgs) -> (SensorProbeReport, u8) {
++    let mut audit = SensorAudit::new();
++    let mut outcome = ModeOutcome::default();
++    let mut any_bytes = false;
++    let mut bootloader_confirmed = false;
++
++    let cap_fw1: RawIoCapture = Arc::new(Mutex::new(Vec::new()));
++    let mut firmware_link: Option<SensorLink<SerialStream>> =
++        match SensorLink::<SerialStream>::open_capturing(&args.sensor_port, FIRMWARE_BAUD, cap_fw1.clone(), args.raw_serial_log) {
++            Ok(mut link) => {
++                outcome.firmware_baud_opened = true;
++                let r = try_ping(&mut link, &mut audit, ProbeMode::Discover, false, 3).await;
++                if r == Some(true) {
++                    outcome.firmware_ping_response = Some(true);
++                    outcome.firmware_mode_confirmed = true;
++                    Some(link)
++                } else {
++                    outcome.firmware_ping_response = Some(false);
++                    None
++                }
++            }
++            Err(e) => {
++                log::error!("failed to open Sensor UART @ {FIRMWARE_BAUD}: {e}");
++                None
++            }
++        };
++    let (b, _) = tally_raw_capture(&cap_fw1);
++    any_bytes |= b > 0;
++
++    if !outcome.firmware_mode_confirmed {
++        let cap_bl: RawIoCapture = Arc::new(Mutex::new(Vec::new()));
++        match SensorLink::<SerialStream>::open_capturing(&args.sensor_port, BOOTLOADER_BAUD, cap_bl.clone(), args.raw_serial_log) {
++            Ok(mut link) => {
++                outcome.bootloader_baud_opened = true;
++                let r = try_ping(&mut link, &mut audit, ProbeMode::Discover, false, 3).await;
++                bootloader_confirmed = r == Some(false);
++                outcome.bootloader_ping_response = Some(bootloader_confirmed);
++
++                if bootloader_confirmed {
++                    // Step 4: exactly one JumpToFirmware, observe the mode-switch traffic briefly.
++                    match link.send(&mut audit, ProbeMode::Discover, SensorProbeAction::JumpToFirmware, false, Duration::from_secs(1)).await {
++                        Ok(_) => outcome.jump_to_firmware_sent = true,
++                        Err(e) => log::error!("JumpToFirmware failed: {e}"),
++                    }
++                    let _ = listen_and_tally(&mut link, Duration::from_secs(2)).await;
++                    drop(link);
++
++                    let cap_fw2: RawIoCapture = Arc::new(Mutex::new(Vec::new()));
++                    match SensorLink::<SerialStream>::open_capturing(&args.sensor_port, FIRMWARE_BAUD, cap_fw2.clone(), args.raw_serial_log) {
++                        Ok(mut relink) => {
++                            let r2 = try_ping(&mut relink, &mut audit, ProbeMode::Discover, false, 3).await;
++                            if r2 == Some(true) {
++                                outcome.firmware_mode_confirmed = true;
++                                firmware_link = Some(relink);
++                            }
++                        }
++                        Err(e) => log::error!("failed to reopen Sensor UART @ {FIRMWARE_BAUD}: {e}"),
++                    }
++                    let (b2, _) = tally_raw_capture(&cap_fw2);
++                    any_bytes |= b2 > 0;
++                }
++            }
++            Err(e) => log::error!("failed to open Sensor UART @ {BOOTLOADER_BAUD}: {e}"),
++        }
++        let (b3, _) = tally_raw_capture(&cap_bl);
++        any_bytes |= b3 > 0;
++    }
++
++    if outcome.firmware_mode_confirmed
++        && let Some(link) = firmware_link.as_mut()
++    {
++        if args.query_info {
++            if let Some(SensorPacket::HardwareInfo(hw)) = send_and_wait_for(
++                link,
++                &mut audit,
++                ProbeMode::Discover,
++                SensorProbeAction::GetHardwareInfo,
++                true,
++                Duration::from_secs(1),
++                |p| matches!(p, SensorPacket::HardwareInfo(_)),
++            )
++            .await
++            {
++                outcome.hardware_info = Some(hw.to_string());
++            }
++            if let Some(SensorPacket::GetFirmware(v)) = send_and_wait_for(
++                link,
++                &mut audit,
++                ProbeMode::Discover,
++                SensorProbeAction::GetFirmwareHash,
++                true,
++                Duration::from_secs(1),
++                |p| matches!(p, SensorPacket::GetFirmware(_)),
++            )
++            .await
++            {
++                outcome.firmware_info = Some(format!("firmware hash response value: {v}"));
++            }
++        }
++
++        let observe = listen_and_tally(link, Duration::from_secs(args.observe_seconds)).await;
++        outcome.active_probe = Some(observe.finalize(0));
++    }
++
++    outcome.overall_result = if outcome.firmware_mode_confirmed {
++        "communicating_firmware"
++    } else if bootloader_confirmed {
++        "unresolved"
++    } else if any_bytes {
++        "undecodable_traffic"
++    } else {
++        "uart_silent"
++    }
++    .to_string();
++
++    finish(args, ProbeMode::Discover, false, outcome, audit)
++}
++
++// ---------------------------------------------------------------------------------------------
++// --dry-run: identical control flow, against a mocked Sensor device instead of real hardware.
++// ---------------------------------------------------------------------------------------------
++
++async fn run_dry(args: &SensorProbeArgs, mode: ProbeMode) -> (SensorProbeReport, u8) {
++    let mut audit = SensorAudit::new();
++    let mut outcome = ModeOutcome::default();
++
++    match mode {
++        ProbeMode::Passive => {
++            let (client, device) = tokio::io::duplex(4096);
++            let _ = spawn_mock_sensor_device_firmware(device);
++            let cap: RawIoCapture = Arc::new(Mutex::new(Vec::new()));
++            let mut link = SensorLink::wrap_capturing(client, "dry-run-115200", cap.clone());
++            outcome.firmware_baud_opened = true;
++            let tally = listen_and_tally(&mut link, Duration::from_millis(200)).await;
++            let (bytes, found) = tally_raw_capture(&cap);
++            let mut json = tally.finalize(found);
++            json.bytes_received = bytes;
++            outcome.passive_115200 = Some(json);
++
++            let (client2, device2) = tokio::io::duplex(4096);
++            let _ = spawn_mock_sensor_device_silent(device2);
++            let cap2: RawIoCapture = Arc::new(Mutex::new(Vec::new()));
++            let mut link2 = SensorLink::wrap_capturing(client2, "dry-run-38400", cap2.clone());
++            outcome.bootloader_baud_opened = true;
++            let tally2 = listen_and_tally(&mut link2, Duration::from_millis(200)).await;
++            let (bytes2, found2) = tally_raw_capture(&cap2);
++            let mut json2 = tally2.finalize(found2);
++            json2.bytes_received = bytes2;
++            outcome.passive_38400 = Some(json2);
++
++            outcome.overall_result = passive_result(&outcome).to_string();
++        }
++        ProbeMode::Ping => {
++            let (client, device) = tokio::io::duplex(4096);
++            let _ = spawn_mock_sensor_device_firmware(device);
++            let mut link = SensorLink::wrap(client, "dry-run");
++            outcome.firmware_baud_opened = true;
++            let r = try_ping(&mut link, &mut audit, ProbeMode::Ping, false, 3).await;
++            outcome.firmware_ping_response = Some(matches!(r, Some(true)));
++            outcome.firmware_mode_confirmed = outcome.firmware_ping_response == Some(true);
++            outcome.overall_result = if outcome.firmware_mode_confirmed { "communicating_firmware" } else { "uart_silent" }.to_string();
++        }
++        ProbeMode::Discover => {
++            let (client, device) = tokio::io::duplex(4096);
++            let _ = spawn_mock_sensor_device_firmware(device);
++            let mut link = SensorLink::wrap(client, "dry-run");
++            outcome.firmware_baud_opened = true;
++            let r = try_ping(&mut link, &mut audit, ProbeMode::Discover, false, 3).await;
++            outcome.firmware_ping_response = Some(matches!(r, Some(true)));
++            outcome.firmware_mode_confirmed = outcome.firmware_ping_response == Some(true);
++
++            if outcome.firmware_mode_confirmed {
++                if args.query_info {
++                    if let Some(SensorPacket::HardwareInfo(hw)) = send_and_wait_for(
++                        &mut link,
++                        &mut audit,
++                        ProbeMode::Discover,
++                        SensorProbeAction::GetHardwareInfo,
++                        true,
++                        Duration::from_secs(1),
++                        |p| matches!(p, SensorPacket::HardwareInfo(_)),
++                    )
++                    .await
++                    {
++                        outcome.hardware_info = Some(hw.to_string());
++                    }
++                    if let Some(SensorPacket::GetFirmware(v)) = send_and_wait_for(
++                        &mut link,
++                        &mut audit,
++                        ProbeMode::Discover,
++                        SensorProbeAction::GetFirmwareHash,
++                        true,
++                        Duration::from_secs(1),
++                        |p| matches!(p, SensorPacket::GetFirmware(_)),
++                    )
++                    .await
++                    {
++                        outcome.firmware_info = Some(format!("firmware hash response value: {v}"));
++                    }
++                }
++                let observe = listen_and_tally(&mut link, Duration::from_millis(200)).await;
++                outcome.active_probe = Some(observe.finalize(0));
++                outcome.overall_result = "communicating_firmware".to_string();
++            } else {
++                outcome.overall_result = "uart_silent".to_string();
++            }
++        }
++    }
++
++    finish(args, mode, true, outcome, audit)
++}
++
++// ---------------------------------------------------------------------------------------------
++// --audit-expander: read-only. No `write_reg` call anywhere in this module.
++// ---------------------------------------------------------------------------------------------
++
++const EXPANDER_REGISTERS: &[(u8, &str)] = &[
++    (0x00, "Input Port 0"),
++    (0x01, "Input Port 1"),
++    (0x02, "Output Port 0"),
++    (0x03, "Output Port 1"),
++    (0x04, "Polarity Inversion Port 0"),
++    (0x05, "Polarity Inversion Port 1"),
++    (0x06, "Configuration Port 0"),
++    (0x07, "Configuration Port 1"),
++];
++
++fn audit_expander<P: I2cPort>(dev: &mut P) -> ExpanderAudit {
++    let mut readings = Vec::with_capacity(EXPANDER_REGISTERS.len());
++    for &(reg, label) in EXPANDER_REGISTERS {
++        match dev.read_reg(crate::i2c::RESET_EXPANDER_ADDR, reg) {
++            Ok(v) => readings.push(ExpanderRegisterReading {
++                register: reg,
++                register_hex: format!("0x{reg:02X}"),
++                label,
++                success: true,
++                value: Some(v),
++                value_hex: Some(format!("0x{v:02X}")),
++                value_binary: Some(format!("0b{v:08b}")),
++                os_error: None,
++            }),
++            Err(e) => readings.push(ExpanderRegisterReading {
++                register: reg,
++                register_hex: format!("0x{reg:02X}"),
++                label,
++                success: false,
++                value: None,
++                value_hex: None,
++                value_binary: None,
++                os_error: e.os_error,
++            }),
++        }
++    }
++    ExpanderAudit { readings, read_only: true }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn args(dry_run: bool) -> SensorProbeArgs {
++        SensorProbeArgs {
++            sensor_port: "/dev/ttyS2".into(),
++            i2c_device: "/dev/i2c-1".into(),
++            passive: false,
++            ping: false,
++            discover: false,
++            listen_seconds: 20,
++            observe_seconds: 60,
++            query_info: false,
++            audit_expander: false,
++            json_output: None,
++            csv_output: None,
++            verbose: false,
++            raw_serial_log: false,
++            dry_run,
++        }
++    }
++
++    // ---- item 11: default port/baud ----
++
++    #[test]
++    fn default_sensor_port_is_dev_ttys2() {
++        assert_eq!(args(true).sensor_port, "/dev/ttyS2");
++        assert_eq!(DEFAULT_SENSOR_PORT, "/dev/ttyS2");
++    }
++
++    #[test]
++    fn firmware_baud_is_115200_and_bootloader_baud_is_38400() {
++        assert_eq!(FIRMWARE_BAUD, 115200);
++        assert_eq!(BOOTLOADER_BAUD, 38400);
++    }
++
++    #[test]
++    fn passive_is_the_default_mode() {
++        assert_eq!(determine_mode(&args(true)).unwrap(), ProbeMode::Passive);
++    }
++
++    #[test]
++    fn mutually_exclusive_mode_flags_are_rejected() {
++        let mut a = args(true);
++        a.ping = true;
++        a.discover = true;
++        assert!(determine_mode(&a).is_err());
++    }
++
++    // ---- item 11: passive mode performs zero UART/I2C writes ----
++
++    #[tokio::test]
++    async fn passive_mode_performs_zero_uart_writes() {
++        let mut a = args(true);
++        a.passive = true;
++        a.listen_seconds = 0;
++        let (report, _) = run(&a).await;
++        assert_eq!(report.sensor_uart_writes, 0);
++        assert_eq!(report.actuator_commands_sent, 0);
++    }
++
++    #[tokio::test]
++    async fn passive_mode_performs_zero_i2c_writes() {
++        let mut a = args(true);
++        a.passive = true;
++        a.audit_expander = true;
++        a.listen_seconds = 0;
++        let (report, _) = run(&a).await;
++        assert_eq!(report.i2c_writes, 0);
++        assert!(report.i2c_reads > 0, "audit-expander should still perform reads");
++    }
++
++    // ---- item 11: ping mode sends only Ping, never JumpToFirmware ----
++
++    #[tokio::test]
++    async fn ping_mode_sends_only_ping() {
++        let mut a = args(true);
++        a.ping = true;
++        let (report, _) = run(&a).await;
++        assert!(report.sensor_uart_writes >= 1);
++        assert_eq!(report.jump_to_firmware_sent, false);
++        assert_eq!(report.actuator_commands_sent, 0);
++    }
++
++    #[tokio::test]
++    async fn ping_mode_never_sends_jump_to_firmware() {
++        let audit = SensorAudit::new();
++        let err = audit.check(ProbeMode::Ping, SensorProbeAction::JumpToFirmware, false);
++        assert!(err.is_err());
++    }
++
++    // ---- item 11: discover only jumps after a confirmed bootloader response ----
++
++    #[tokio::test]
++    async fn discover_never_launches_a_command_scheduler_or_actuator_command() {
++        let mut a = args(true);
++        a.discover = true;
++        let (report, _) = run(&a).await;
++        assert_eq!(report.actuator_commands_sent, 0);
++    }
++
++    #[tokio::test]
++    async fn discover_against_a_silent_device_never_sends_jump_to_firmware() {
++        let (client, device) = tokio::io::duplex(4096);
++        let _ = crate::sensor_mock::spawn_mock_sensor_device_silent(device);
++        let mut link = SensorLink::wrap(client, "test");
++        let mut audit = SensorAudit::new();
++        let r = try_ping(&mut link, &mut audit, ProbeMode::Discover, false, 1).await;
++        assert_eq!(r, None);
++        assert!(!audit.sent.contains(&"JumpToFirmware"));
++    }
++
++    #[tokio::test]
++    async fn discover_sends_jump_to_firmware_only_after_bootloader_confirms() {
++        let (client, device) = tokio::io::duplex(4096);
++        let _ = crate::sensor_mock::spawn_mock_sensor_device_bootloader(device);
++        let mut link = SensorLink::wrap(client, "test");
++        let mut audit = SensorAudit::new();
++        let r = try_ping(&mut link, &mut audit, ProbeMode::Discover, false, 3).await;
++        assert_eq!(r, Some(false)); // bootloader Pong
++        assert!(!audit.sent.contains(&"JumpToFirmware"), "must not have jumped yet");
++
++        let outcome = link.send(&mut audit, ProbeMode::Discover, SensorProbeAction::JumpToFirmware, false, Duration::from_secs(1)).await;
++        assert!(outcome.is_ok());
++        assert!(audit.sent.contains(&"JumpToFirmware"));
++    }
++
++    #[tokio::test]
++    async fn full_discover_dry_run_reaches_firmware_mode() {
++        let mut a = args(true);
++        a.discover = true;
++        let (report, code) = run(&a).await;
++        assert!(report.firmware_mode_confirmed);
++        assert_eq!(report.overall_result, "communicating_firmware");
++        assert_eq!(code, 0);
++    }
++
++    // ---- item 11: query-info is gated on firmware confirmation ----
++
++    #[tokio::test]
++    async fn query_info_is_refused_before_firmware_mode_is_confirmed() {
++        let audit = SensorAudit::new();
++        assert!(audit.check(ProbeMode::Discover, SensorProbeAction::GetHardwareInfo, false).is_err());
++        assert!(audit.check(ProbeMode::Discover, SensorProbeAction::GetHardwareInfo, true).is_ok());
++    }
++
++    #[tokio::test]
++    async fn query_info_populates_hardware_and_firmware_info_in_dry_run() {
++        let mut a = args(true);
++        a.discover = true;
++        a.query_info = true;
++        let (report, _) = run(&a).await;
++        assert!(report.hardware_info.is_some());
++        assert!(report.firmware_info.is_some());
++    }
++
++    // ---- item 11: Frozen is never touched ----
++
++    #[tokio::test]
++    async fn frozen_uart_writes_always_zero_and_never_opened() {
++        for (passive, ping, discover) in [(true, false, false), (false, true, false), (false, false, true)] {
++            let mut a = args(true);
++            a.passive = passive;
++            a.ping = ping;
++            a.discover = discover;
++            let (report, _) = run(&a).await;
++            assert_eq!(report.frozen_uart_writes, 0);
++            assert!(report.frozen_port_never_opened);
++            assert!(!report.frozen_command_sent);
++            assert!(!report.prime_command_sent);
++            assert!(!report.temperature_target_changed);
++        }
++    }
++
++    // ---- item 11: expander audit is read-only ----
++
++    #[test]
++    fn expander_audit_never_writes_any_register() {
++        let mut mock = MockI2c::always_succeed();
++        audit_expander(&mut mock);
++        assert!(mock.writes.is_empty(), "audit_expander must never call write_reg");
++    }
++
++    #[test]
++    fn expander_audit_never_writes_register_0x07() {
++        let mut mock = MockI2c::always_succeed();
++        audit_expander(&mut mock);
++        assert!(mock.writes.iter().all(|(_, reg, _)| *reg != 0x07));
++    }
++
++    #[test]
++    fn expander_audit_never_modifies_port_0_bit_0_or_bit_1() {
++        let mut mock = MockI2c::always_succeed();
++        audit_expander(&mut mock);
++        // No writes at all means neither bit of any register (including 0x02/0x06) is touched.
++        assert!(mock.writes.is_empty());
++    }
++
++    #[test]
++    fn expander_audit_reads_the_documented_minimum_registers() {
++        let mut mock = MockI2c::always_succeed();
++        let audit = audit_expander(&mut mock);
++        let regs: Vec<u8> = audit.readings.iter().map(|r| r.register).collect();
++        for expected in [0x00, 0x01, 0x02, 0x03, 0x06, 0x07] {
++            assert!(regs.contains(&expected), "missing register 0x{expected:02X}");
++        }
++    }
++
++    #[tokio::test]
++    async fn audit_expander_flag_performs_reads_only_end_to_end() {
++        let mut a = args(true);
++        a.passive = true;
++        a.audit_expander = true;
++        a.listen_seconds = 0;
++        let (report, _) = run(&a).await;
++        let audit = report.expander_audit.expect("expander_audit should be populated");
++        assert!(audit.read_only);
++        assert!(!audit.readings.is_empty());
++        assert_eq!(report.i2c_writes, 0);
++    }
++
++    // ---- item 11: raw serial logging is opt-in ----
++
++    #[test]
++    fn raw_serial_log_defaults_to_false() {
++        assert!(!args(true).raw_serial_log);
++    }
++
++    #[tokio::test]
++    async fn raw_serial_enabled_reflects_the_flag() {
++        let mut a = args(true);
++        a.passive = true;
++        a.listen_seconds = 0;
++        a.raw_serial_log = true;
++        let (report, _) = run(&a).await;
++        assert!(report.raw_serial_enabled);
++    }
++
++    // ---- extra: dry-run passive sees decoded telemetry from the firmware mock ----
++
++    #[tokio::test]
++    async fn passive_dry_run_decodes_unsolicited_telemetry() {
++        let mut a = args(true);
++        a.passive = true;
++        let (report, code) = run(&a).await;
++        assert_eq!(code, 0);
++        assert!(report.capacitance_samples > 0 || report.temperature_samples > 0);
++        assert_eq!(report.overall_result, "unsolicited_traffic_only");
++    }
++}
+diff --git a/src/bin/opensleep-diagnostic/sensor_report.rs b/src/bin/opensleep-diagnostic/sensor_report.rs
+new file mode 100644
+index 0000000..9b58bfe
+--- /dev/null
++++ b/src/bin/opensleep-diagnostic/sensor_report.rs
+@@ -0,0 +1,225 @@
++//! `sensor-probe`'s report: a self-contained struct with its own JSON/CSV/text output, entirely
++//! separate from `report.rs`'s `Report` (which is Frozen-specific top to bottom -- `frozen_port`,
++//! `frozen_uart_opened`, `cool_test_results`, ... -- and stays untouched by this file). Mirrors
++//! that module's role, scoped to the Sensor investigation.
++
++use std::collections::BTreeMap;
++
++use serde::Serialize;
++
++#[derive(Debug, Clone, Serialize)]
++pub struct ExpanderRegisterReading {
++    pub register: u8,
++    pub register_hex: String,
++    pub label: &'static str,
++    pub success: bool,
++    pub value: Option<u8>,
++    pub value_hex: Option<String>,
++    pub value_binary: Option<String>,
++    pub os_error: Option<i32>,
++}
++
++#[derive(Debug, Clone, Serialize, Default)]
++pub struct ExpanderAudit {
++    pub readings: Vec<ExpanderRegisterReading>,
++    /// Always `true`: no register is ever written by this audit (defense-in-depth mirror of the
++    /// same fact `PROTOCOL_AUDIT.md`/`SAFETY.md` document -- see `sensor_probe::audit_expander`,
++    /// which only ever calls `I2cPort::read_reg`, never `write_reg`).
++    pub read_only: bool,
++}
++
++#[derive(Debug, Clone, Default, Serialize)]
++pub struct PacketTallyJson {
++    pub bytes_received: u64,
++    /// Candidate frame starts: raw `0x7E` byte occurrences observed on the wire during this
++    /// window. An upper-bound heuristic, not an exact frame count -- a payload or checksum byte can
++    /// coincidentally equal `0x7E` too. See `frames_decoded`/`malformed_frames` for the precise,
++    /// codec-verified counts.
++    pub frames_found: u64,
++    /// Frames `opensleep::common::codec::PacketCodec` actually decoded successfully.
++    pub frames_decoded: u64,
++    /// `frames_found` minus `frames_decoded`, floored at zero -- frames with a bad checksum, an
++    /// unrecognized opcode, or a firmware variant this binary doesn't yet decode. Never treated as
++    /// fatal; see module docs.
++    pub malformed_frames: u64,
++    pub packet_types_observed: BTreeMap<String, u64>,
++    pub capacitance_samples: u64,
++    pub capacitance_left_min: Option<u16>,
++    pub capacitance_left_max: Option<u16>,
++    pub capacitance_left_latest: Option<u16>,
++    pub capacitance_right_min: Option<u16>,
++    pub capacitance_right_max: Option<u16>,
++    pub capacitance_right_latest: Option<u16>,
++    pub piezo_samples: u64,
++    pub piezo_left_min: Option<u16>,
++    pub piezo_left_max: Option<u16>,
++    pub piezo_left_latest: Option<u16>,
++    pub piezo_right_min: Option<u16>,
++    pub piezo_right_max: Option<u16>,
++    pub piezo_right_latest: Option<u16>,
++    pub temperature_samples: u64,
++    pub first_valid_packet_timestamp: Option<String>,
++    pub last_valid_packet_timestamp: Option<String>,
++}
++
++#[derive(Debug, Clone, Serialize)]
++pub struct SensorProbeReport {
++    pub program_version: String,
++    pub opensleep_base_version: String,
++    pub opensleep_source_commit: String,
++    pub kernel: String,
++    pub arch: String,
++
++    pub mode: String, // "passive" | "ping" | "discover"
++    pub dry_run: bool,
++    pub sensor_port: String,
++    pub listen_seconds: u64,
++    pub observe_seconds: u64,
++    pub query_info_requested: bool,
++    pub audit_expander_requested: bool,
++    pub raw_serial_enabled: bool,
++
++    pub firmware_baud_opened: bool,
++    pub bootloader_baud_opened: bool,
++
++    /// `--passive` only: per-baud tallies. `None` for `--ping`/`--discover`.
++    pub passive_115200: Option<PacketTallyJson>,
++    pub passive_38400: Option<PacketTallyJson>,
++    /// `--ping`/`--discover` only: the round-trip/observe tally. `None` for `--passive`.
++    pub active_probe: Option<PacketTallyJson>,
++
++    // Flat convenience fields matching section 10's exact names, mirrored from whichever of the
++    // above tallies is relevant to the mode that actually ran.
++    pub passive_bytes_115200: u64,
++    pub passive_bytes_38400: u64,
++    pub packet_types_observed: Vec<String>,
++    pub capacitance_samples: u64,
++    pub piezo_samples: u64,
++    pub temperature_samples: u64,
++    pub malformed_packets: u64,
++
++    pub firmware_ping_response: Option<bool>,
++    pub bootloader_ping_response: Option<bool>,
++    pub jump_to_firmware_sent: bool,
++    pub firmware_mode_confirmed: bool,
++    pub hardware_info: Option<String>,
++    pub firmware_info: Option<String>,
++
++    pub expander_audit: Option<ExpanderAudit>,
++
++    // Section 9 safety counters.
++    pub sensor_uart_writes: u32,
++    pub frozen_uart_writes: u32,
++    pub i2c_reads: u32,
++    pub i2c_writes: u32,
++    pub actuator_commands_sent: u32,
++    pub frozen_port_never_opened: bool,
++    pub frozen_command_sent: bool,
++    pub prime_command_sent: bool,
++    pub temperature_target_changed: bool,
++
++    pub overall_result: String,
++    pub exit_code: u8,
++}
++
++impl SensorProbeReport {
++    pub fn write_json(&self, path: &str) -> std::io::Result<()> {
++        let json = serde_json::to_string_pretty(self)?;
++        std::fs::write(path, json)
++    }
++
++    pub fn write_csv(&self, path: &str) -> std::io::Result<()> {
++        use std::io::Write as _;
++        let mut w = std::fs::File::create(path)?;
++        writeln!(w, "field,value")?;
++        macro_rules! csv_field {
++            ($name:literal, $val:expr) => {
++                writeln!(w, "{},{}", $name, $val)?;
++            };
++        }
++        csv_field!("mode", self.mode);
++        csv_field!("dry_run", self.dry_run);
++        csv_field!("sensor_port", self.sensor_port);
++        csv_field!("firmware_baud_opened", self.firmware_baud_opened);
++        csv_field!("bootloader_baud_opened", self.bootloader_baud_opened);
++        csv_field!("passive_bytes_115200", self.passive_bytes_115200);
++        csv_field!("passive_bytes_38400", self.passive_bytes_38400);
++        csv_field!("firmware_ping_response", self.firmware_ping_response.map(|v| v.to_string()).unwrap_or_default());
++        csv_field!("bootloader_ping_response", self.bootloader_ping_response.map(|v| v.to_string()).unwrap_or_default());
++        csv_field!("jump_to_firmware_sent", self.jump_to_firmware_sent);
++        csv_field!("firmware_mode_confirmed", self.firmware_mode_confirmed);
++        csv_field!("hardware_info", self.hardware_info.clone().unwrap_or_default());
++        csv_field!("firmware_info", self.firmware_info.clone().unwrap_or_default());
++        csv_field!("packet_types_observed", self.packet_types_observed.join(" "));
++        csv_field!("capacitance_samples", self.capacitance_samples);
++        csv_field!("piezo_samples", self.piezo_samples);
++        csv_field!("temperature_samples", self.temperature_samples);
++        csv_field!("malformed_packets", self.malformed_packets);
++        csv_field!("raw_serial_enabled", self.raw_serial_enabled);
++        csv_field!("i2c_reads", self.i2c_reads);
++        csv_field!("i2c_writes", self.i2c_writes);
++        csv_field!("frozen_uart_writes", self.frozen_uart_writes);
++        csv_field!("sensor_uart_writes", self.sensor_uart_writes);
++        csv_field!("actuator_commands_sent", self.actuator_commands_sent);
++        csv_field!("overall_result", self.overall_result);
++        csv_field!("exit_code", self.exit_code);
++        Ok(())
++    }
++
++    pub fn print_table(&self) {
++        log::info!("================ opensleep-diagnostic sensor-probe summary ================");
++        log::info!("mode: {} (dry_run={})", self.mode, self.dry_run);
++        log::info!("sensor_port: {}", self.sensor_port);
++        log::info!("firmware_baud_opened: {}  bootloader_baud_opened: {}", self.firmware_baud_opened, self.bootloader_baud_opened);
++        if self.mode == "passive" {
++            log::info!(
++                "passive @115200: bytes={} frames_found(candidate 0x7E markers)={} decoded={} malformed={}",
++                self.passive_bytes_115200,
++                self.passive_115200.as_ref().map(|t| t.frames_found).unwrap_or(0),
++                self.passive_115200.as_ref().map(|t| t.frames_decoded).unwrap_or(0),
++                self.passive_115200.as_ref().map(|t| t.malformed_frames).unwrap_or(0),
++            );
++            log::info!(
++                "passive @38400:  bytes={} frames_found(candidate 0x7E markers)={} decoded={} malformed={}",
++                self.passive_bytes_38400,
++                self.passive_38400.as_ref().map(|t| t.frames_found).unwrap_or(0),
++                self.passive_38400.as_ref().map(|t| t.frames_decoded).unwrap_or(0),
++                self.passive_38400.as_ref().map(|t| t.malformed_frames).unwrap_or(0),
++            );
++        } else {
++            log::info!("firmware_ping_response: {:?}", self.firmware_ping_response);
++            log::info!("bootloader_ping_response: {:?}", self.bootloader_ping_response);
++            log::info!("jump_to_firmware_sent: {}  firmware_mode_confirmed: {}", self.jump_to_firmware_sent, self.firmware_mode_confirmed);
++        }
++        if let Some(hw) = &self.hardware_info {
++            log::info!("hardware_info: {hw}");
++        }
++        if let Some(fw) = &self.firmware_info {
++            log::info!("firmware_info: {fw}");
++        }
++        log::info!("packet_types_observed: {:?}", self.packet_types_observed);
++        log::info!(
++            "capacitance_samples={} piezo_samples={} temperature_samples={} malformed_packets={}",
++            self.capacitance_samples, self.piezo_samples, self.temperature_samples, self.malformed_packets
++        );
++        if let Some(audit) = &self.expander_audit {
++            log::info!("---- PCAL6416A expander audit (read-only; read_only={}) ----", audit.read_only);
++            for r in &audit.readings {
++                match r.value {
++                    Some(v) => log::info!(
++                        "  reg {} ({}): 0x{:02X} = 0b{:08b}",
++                        r.register_hex, r.label, v, v
++                    ),
++                    None => log::info!("  reg {} ({}): read failed (errno {:?})", r.register_hex, r.label, r.os_error),
++                }
++            }
++        }
++        log::info!(
++            "safety counters: sensor_uart_writes={} frozen_uart_writes={} i2c_reads={} i2c_writes={} actuator_commands_sent={}",
++            self.sensor_uart_writes, self.frozen_uart_writes, self.i2c_reads, self.i2c_writes, self.actuator_commands_sent
++        );
++        log::info!("frozen_port_never_opened: {}", self.frozen_port_never_opened);
++        log::info!("overall_result: {}  exit_code: {}", self.overall_result, self.exit_code);
++        log::info!("=============================================================================");
++    }
++}
+diff --git a/src/bin/opensleep-diagnostic/sensor_safety.rs b/src/bin/opensleep-diagnostic/sensor_safety.rs
+new file mode 100644
+index 0000000..559baa4
+--- /dev/null
++++ b/src/bin/opensleep-diagnostic/sensor_safety.rs
+@@ -0,0 +1,186 @@
++//! Structural enforcement of `sensor-probe`'s command whitelist, mirroring `safety.rs`'s model for
++//! Frozen but scoped far narrower: this binary's Sensor vocabulary has exactly four members.
++//!
++//! 1. [`SensorProbeAction`] is a closed enum with no actuator/config variant at all --
++//!    `EnableVibration`, `SetAlarm`, `EnablePiezo`, `SetPiezoGain`, `SetPiezoFreq`,
++//!    `ProbeTemperature`, `ClearAlarm`, `DisablePiezo`, and `Random` from upstream's
++//!    `SensorCommand` are not merely disallowed, they are unrepresentable in this type. Only
++//!    `Ping`, `JumpToFirmware`, `GetHardwareInfo`, and `GetFirmwareHash` exist.
++//! 2. [`ProbeMode::allows`] additionally gates every action against the current mode:
++//!    `Passive` allows nothing at all (zero UART writes, enforced even if a future bug tried to
++//!    call send); `Ping` allows only `Ping`; `Discover` allows `Ping`/`JumpToFirmware` always, and
++//!    `GetHardwareInfo`/`GetFirmwareHash` only once firmware-mode communication is confirmed
++//!    (`--query-info`).
++//!
++//! [`SensorAudit`] records every accepted send (`sensor_uart_writes`) and exists specifically so
++//! `actuator_commands_sent` can be an audited, always-zero fact in the report rather than an
++//! assumption -- it is incremented only by a constructor this module never calls, since no
++//! actuator variant exists to construct.
++
++use opensleep::sensor::SensorCommand;
++
++/// The only Sensor actions constructible anywhere in this binary. See module docs.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum SensorProbeAction {
++    Ping,
++    JumpToFirmware,
++    GetHardwareInfo,
++    GetFirmwareHash,
++}
++
++impl SensorProbeAction {
++    pub fn name(self) -> &'static str {
++        match self {
++            SensorProbeAction::Ping => "Ping",
++            SensorProbeAction::JumpToFirmware => "JumpToFirmware",
++            SensorProbeAction::GetHardwareInfo => "GetHardwareInfo",
++            SensorProbeAction::GetFirmwareHash => "GetFirmwareHash",
++        }
++    }
++
++    /// Reuses upstream `SensorCommand`/`CommandTrait` encoding unmodified -- this binary never
++    /// reimplements Sensor packet framing.
++    pub fn to_command(self) -> SensorCommand {
++        match self {
++            SensorProbeAction::Ping => SensorCommand::Ping,
++            SensorProbeAction::JumpToFirmware => SensorCommand::JumpToFirmware,
++            SensorProbeAction::GetHardwareInfo => SensorCommand::GetHardwareInfo,
++            SensorProbeAction::GetFirmwareHash => SensorCommand::GetFirmwareHash,
++        }
++    }
++}
++
++/// Which `sensor-probe` stage is running. Determines the whitelist [`ProbeMode::allows`] enforces.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum ProbeMode {
++    Passive,
++    Ping,
++    Discover,
++}
++
++impl ProbeMode {
++    pub fn label(self) -> &'static str {
++        match self {
++            ProbeMode::Passive => "passive",
++            ProbeMode::Ping => "ping",
++            ProbeMode::Discover => "discover",
++        }
++    }
++
++    /// `firmware_mode_confirmed`: whether a Sensor Pong reporting firmware mode has already been
++    /// observed this run -- gates `GetHardwareInfo`/`GetFirmwareHash` (`--query-info`), which must
++    /// never be sent before communication is actually established.
++    pub fn allows(self, action: SensorProbeAction, firmware_mode_confirmed: bool) -> bool {
++        match self {
++            ProbeMode::Passive => false,
++            ProbeMode::Ping => matches!(action, SensorProbeAction::Ping),
++            ProbeMode::Discover => match action {
++                SensorProbeAction::Ping | SensorProbeAction::JumpToFirmware => true,
++                SensorProbeAction::GetHardwareInfo | SensorProbeAction::GetFirmwareHash => {
++                    firmware_mode_confirmed
++                }
++            },
++        }
++    }
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct SensorSafetyViolation {
++    pub mode: ProbeMode,
++    pub action: SensorProbeAction,
++}
++
++impl std::fmt::Display for SensorSafetyViolation {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        write!(f, "{} is not permitted in sensor-probe --{} mode", self.action.name(), self.mode.label())
++    }
++}
++impl std::error::Error for SensorSafetyViolation {}
++
++/// Records every accepted Sensor UART write. `actuator_commands_sent` is exposed purely as an
++/// audited counter: nothing in this binary ever increments it, since [`SensorProbeAction`] has no
++/// actuator variant to construct -- see module docs.
++#[derive(Debug, Clone, Default)]
++pub struct SensorAudit {
++    pub sensor_uart_writes: u32,
++    pub actuator_commands_sent: u32,
++    pub sent: Vec<&'static str>,
++}
++
++impl SensorAudit {
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    /// Checks `action` against `mode`'s whitelist; only records it as sent if this returns `Ok`.
++    pub fn check(&self, mode: ProbeMode, action: SensorProbeAction, firmware_mode_confirmed: bool) -> Result<(), SensorSafetyViolation> {
++        if mode.allows(action, firmware_mode_confirmed) {
++            Ok(())
++        } else {
++            Err(SensorSafetyViolation { mode, action })
++        }
++    }
++
++    pub fn record_sent(&mut self, action: SensorProbeAction) {
++        self.sensor_uart_writes += 1;
++        self.sent.push(action.name());
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn passive_mode_allows_nothing() {
++        for action in [
++            SensorProbeAction::Ping,
++            SensorProbeAction::JumpToFirmware,
++            SensorProbeAction::GetHardwareInfo,
++            SensorProbeAction::GetFirmwareHash,
++        ] {
++            assert!(!ProbeMode::Passive.allows(action, true));
++            assert!(!ProbeMode::Passive.allows(action, false));
++        }
++    }
++
++    #[test]
++    fn ping_mode_allows_only_ping() {
++        assert!(ProbeMode::Ping.allows(SensorProbeAction::Ping, false));
++        assert!(!ProbeMode::Ping.allows(SensorProbeAction::JumpToFirmware, false));
++        assert!(!ProbeMode::Ping.allows(SensorProbeAction::GetHardwareInfo, true));
++        assert!(!ProbeMode::Ping.allows(SensorProbeAction::GetFirmwareHash, true));
++    }
++
++    #[test]
++    fn discover_mode_allows_ping_and_jump_always() {
++        assert!(ProbeMode::Discover.allows(SensorProbeAction::Ping, false));
++        assert!(ProbeMode::Discover.allows(SensorProbeAction::JumpToFirmware, false));
++        assert!(ProbeMode::Discover.allows(SensorProbeAction::Ping, true));
++        assert!(ProbeMode::Discover.allows(SensorProbeAction::JumpToFirmware, true));
++    }
++
++    #[test]
++    fn discover_mode_gates_query_info_on_firmware_confirmation() {
++        assert!(!ProbeMode::Discover.allows(SensorProbeAction::GetHardwareInfo, false));
++        assert!(!ProbeMode::Discover.allows(SensorProbeAction::GetFirmwareHash, false));
++        assert!(ProbeMode::Discover.allows(SensorProbeAction::GetHardwareInfo, true));
++        assert!(ProbeMode::Discover.allows(SensorProbeAction::GetFirmwareHash, true));
++    }
++
++    #[test]
++    fn audit_only_records_after_a_successful_check() {
++        let audit = SensorAudit::new();
++        assert!(audit.check(ProbeMode::Ping, SensorProbeAction::JumpToFirmware, false).is_err());
++        assert_eq!(audit.sensor_uart_writes, 0);
++    }
++
++    #[test]
++    fn actuator_commands_sent_can_never_become_nonzero() {
++        // No code path in this binary can construct an actuator SensorProbeAction (there is no
++        // such variant), so record_sent can never be called for one; this counter documents that
++        // invariant as an audited fact.
++        let audit = SensorAudit::new();
++        assert_eq!(audit.actuator_commands_sent, 0);
 +    }
 +}
 diff --git a/src/bin/opensleep-diagnostic/signals.rs b/src/bin/opensleep-diagnostic/signals.rs

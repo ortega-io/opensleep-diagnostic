@@ -747,3 +747,68 @@ observed, reservoir level dropped, reservoir topped up, leak observed, abnormal 
 smell, free-text notes) use their own distinctly-typed `PrimeOperatorObservations` struct/JSON
 field — never merged with `frozen-cool-test`'s `operator_observations` field, and never merged with
 any machine-decoded field above.
+
+## `sensor-probe`: command and packet audit
+
+Entirely separate subsystem from everything above: a different physical UART (`/dev/ttyS2` by
+default, not Frozen's `/dev/ttyS1`), a different baud pair (115200 firmware / 38400 bootloader, vs.
+Frozen's fixed 38400), and `opensleep::sensor::{SensorCommand, SensorPacket}` instead of
+`opensleep::frozen::{FrozenCommand, FrozenPacket}` — but the same wire framing
+(`opensleep::common::codec::PacketCodec`/`checksum`) reused unmodified, exactly as Frozen's own
+commands are.
+
+| Command | Opcode | Example serialized frame | `--passive` | `--ping` | `--discover` |
+|---|---|---|:---:|:---:|:---:|
+| `Ping` | `0x01` | `7E 01 01 DC BD` | never sent (listen-only) | yes, up to 3 tries per baud | yes, up to 3 tries per baud |
+| `JumpToFirmware` | `0x10` | `7E 01 10 DE AD` | never | **never reachable** (`SensorProbeAction` has no path to it in `ProbeMode::Ping`) | yes, **at most once per run**, and only after a confirmed bootloader `Pong` |
+| `GetHardwareInfo` | `0x02` | `7E 01 02 EC DE` | never | **never reachable** | yes, only with `--query-info`, and only after a confirmed firmware-mode `Pong` |
+| `GetFirmwareHash` | `0x04` | `7E 01 04 8C 18` | never | **never reachable** | yes, only with `--query-info`, and only after a confirmed firmware-mode `Pong` |
+| `EnableVibration`, `SetAlarm`, `EnablePiezo`, `SetPiezoGain`, `SetPiezoFreq`, `ProbeTemperature`, `ClearAlarm`, `DisablePiezo`, `GetHeaterOffset`, `Random(_)` | various | — | **never reachable in any mode**: `sensor_safety::SensorProbeAction` has no variant for any of them | | |
+
+These frames are asserted byte-for-byte by upstream's own
+`sensor::command::tests::test_sensor_commands`, reused unmodified by this fork; `sensor_link.rs`'s
+own tests round-trip `Ping`/`Pong` over the real wire framing again as a fork-level cross-check.
+
+**Why the actuator/config commands are unreachable, structurally, not by convention:** unlike
+`FrozenAction` (which represents every Frozen command including `Prime`, gated by a runtime
+whitelist), `sensor_safety::SensorProbeAction` is a closed four-variant enum
+(`Ping`/`JumpToFirmware`/`GetHardwareInfo`/`GetFirmwareHash`) with **no variant at all** for any
+actuator or configuration command. There is no code path that can construct a
+`SensorProbeAction::EnableVibration` because no such thing exists to construct — this is checked
+both by `sensor_safety::tests` (the closed enum itself) and by the
+`no_sensor_actuator_or_config_command_is_ever_referenced` source-scanning guardrail test in
+`main.rs`, which additionally proves no other file in this binary references those
+`SensorCommand` variants directly, bypassing `SensorProbeAction` entirely.
+
+**`GetHardwareInfo`/`GetFirmwareHash` are read-only by inspection, not by name alone**, per this
+feature's own instruction not to infer read-only-ness from a command's name: `GetHardwareInfo`'s
+decoded response (`SensorPacket::HardwareInfo`) carries only device identification fields (serial
+number, part number, SKU, hardware revision, factory line, date code — see
+`common::packet::HardwareInfo`); `GetFirmwareHash`'s response (`SensorPacket::GetFirmware`) carries
+a single acknowledgement byte. Neither upstream command implementation has any side effect on
+Sensor's own state (unlike, say, `SetPiezoGain`, which configures amplifier hardware). By contrast,
+`GetHeaterOffset` (opcode `0x2A`) is deliberately **excluded** from `--query-info` even though its
+name also starts with "Get": upstream never decodes a response for it (no `0xAA` case in
+`SensorPacket::parse`) and it is never exercised anywhere in the pinned upstream source, so this
+fork has no evidence it is actually side-effect-free.
+
+### Packet decoding and the "malformed frames" tolerance
+
+`sensor-probe` feeds every received byte through the same, unmodified
+`PacketCodec<SensorPacket>::decode` Frozen uses, and never aborts merely because a frame doesn't
+decode (a bad checksum, an unrecognized opcode, or a firmware variant not yet reverse-engineered).
+`frames_found` in the report is a **heuristic upper bound**, not an exact frame count: it counts raw
+`0x7E` (`codec::START`) byte occurrences observed on the wire, which can be inflated by a payload or
+checksum byte that coincidentally equals `0x7E` too. `frames_decoded` (and therefore
+`malformed_frames = frames_found − frames_decoded`) is exact, since it counts only what the codec
+itself successfully decoded. This is documented in `sensor_report::PacketTallyJson`'s own field doc
+comments and printed as "candidate 0x7E markers" in the text summary specifically so it is never
+mistaken for a precise count.
+
+### Capacitance/piezo left/right channel mapping
+
+`CapacitanceData::values` is a fixed six-element array, "ordered LTR" per upstream's own doc
+comment; cross-checked against `sensor::presence::PresenseManager::update_presence`'s own indexing
+(`values[0..3]` feeds `left_present`, `values[3..6]` feeds `right_present`) — the same split
+`sensor-probe`'s per-side min/max/latest stats use. `PiezoData` already carries explicit
+`left_samples`/`right_samples` vectors from upstream's own decoder, so no inference is needed there.
