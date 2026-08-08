@@ -1,9 +1,11 @@
 opensleep-diagnostic — build report
 ====================================
 
-Patch revision: 21 (add sensor-probe --combined-narrow-subsystem-init: reproduces only the port-0
-portion of upstream's startup sequence, PCAL6416A bits 0 and 1, never register 0x07)
-Supersedes revision 20 (add sensor-probe --enable-suspected-sensor-line: an experimental, opt-in
+Patch revision: 22 (add frozen-hold-start/frozen-hold-stop/frozen-hold-status: persistent,
+firmware-owned absolute-temperature thermal control)
+Supersedes revision 21 (add sensor-probe --combined-narrow-subsystem-init: reproduces only the
+port-0 portion of upstream's startup sequence, PCAL6416A bits 0 and 1, never register 0x07),
+revision 20 (add sensor-probe --enable-suspected-sensor-line: an experimental, opt-in
 test of the suspected Sensor enable line, PCAL6416A port-0 bit 0), revision 19 (add sensor-probe:
 read-only-for-I2C investigation of the Sensor subsystem over its own UART, independent of Frozen),
 revision 18 (remove the 900s duration ceiling, add
@@ -25,6 +27,50 @@ frozen-prime-test, now removed), revision 5 (added frozen-prime-test), revision 
 active-test preflight/monitoring), revision 3 (staged, Frozen-only diagnostic redesign), revision 2
 (sensor-first post-reset bootloader retry-probe), and revision 1 (initial diagnostic-only fork).
 Same upstream base commit; only source.patch changed.
+
+What changed in revision 22
+----------------------------
+Every prior active mode is a bounded, host-observed session. This revision adds a genuinely
+different shape: a one-shot configuration transaction that sets a fixed target and exits, leaving
+Frozen firmware to run it indefinitely -- exactly how stock OpenSleep's own scheduled
+SetTargetTemperature calls already work, just triggered manually instead of by a schedule.
+
+  - Added frozen-hold-start --target-c <C> (or --left-target-c/--right-target-c together, both
+    required): sends one absolute SetTargetTemperature(enabled=true) per side -- no baseline, no
+    delta, validated against the same 0-45C backstop frozen-cool-test's own --target-c already
+    used (extracted into a shared validate_absolute_target_centideg helper so there is still only
+    one operating-range constant) -- requires an exact matching TargetUpdate confirmation for
+    each, prints the required confirmation banner, and exits.
+  - After both confirmations, sends zero further Frozen commands of any kind: no disable, no
+    independent shutdown guard, no Drop-based shutdown, no duration timer, no firmware-message
+    interpretation, no pump/TEC/fan observer, no host thermal watchdog, no reaction to priming or
+    tec[...] locked (pump) messages -- there is no code path left to run once the confirming
+    function returns, regardless of process exit, descriptor close, or a UART disconnect
+    afterward.
+  - Never resets a Frozen that is already responsive (it may be adjusting targets on a Frozen a
+    previous frozen-hold-start already brought up). Startup is "probe first, reset only if
+    silent": a bounded, reset-free Ping probe runs first; only if Frozen never answers does this
+    fall back to the already-audited, unmodified frozen_startup::start_frozen_narrow. Register
+    0x07 is never written on either path.
+  - Partial-transaction rollback (disable the confirmed side if the other never confirms) before
+    success is declared; once both sides confirm, that path is structurally unreachable.
+  - Added frozen-hold-stop: Pings first (logging only, never to justify a reset), then disables
+    both sides via a new, independent repeated-disable-and-confirm loop (deliberately not calling
+    into cool_test.rs's own shutdown directly, since this one must never parse firmware message
+    text and must never fall back to asserting the I2C reset), requiring confirmation of both
+    sides before exiting successfully.
+  - Added frozen-hold-status: strictly non-controlling, Ping/GetTemperatures only -- never
+    SetTargetTemperature in either direction, never resets Frozen, never touches PCAL state. Safe
+    to run at any time, including while frozen-hold-start's targets remain active.
+  - New closed action FrozenAction::HoldTarget serializes to the identical SetTargetTemperature
+    wire frame EnableCooling already produces (no new opcode); reachable only in the new
+    Mode::HoldStart, refused everywhere else (including frozen-cool-test) by the same exhaustive
+    per-mode match every other action already goes through.
+
+14 net new tests, all in frozen_hold.rs (361 total, up from 347). Every other existing test file
+was re-run unmodified against this revision and still passes -- enable_cooling's own behavior is
+unchanged; only its internal range check was extracted into the shared helper hold_target now also
+calls. See TEST_RESULTS.md for the full writeup.
 
 What changed in revision 21
 ----------------------------
@@ -820,17 +866,15 @@ Tests:       cargo test --locked (run under the image's built-in QEMU test runne
 Test results (this build, inside the builder image)
 -----------------------------------------------------
 opensleep (lib) unit tests:               51 passed, 0 failed
-opensleep-diagnostic (bin) unit tests:    347 passed, 0 failed
+opensleep-diagnostic (bin) unit tests:    361 passed, 0 failed
 Doc-tests:                                 0 (none defined)
 
 This revision's build was run with --no-cache (confirmed: only the Dockerfile-syntax pragma
 resolution and a trivial WORKDIR step were served from cache; the git clone/checkout, source.patch
 apply, `cargo test --locked`, and `cargo build --release` steps all executed fresh against this
-exact source.patch). The bin test suite finished in 123.31s under the builder image's QEMU aarch64
-runner (118.53s for revision 20) -- the 15 net new tests avoided any real-time sleep-heavy sweeps
-(the two i2c.rs sweep tests use the sleep-free `read_modify_write_combined` helper directly, not
-the full public function with its ~100ms settle wait, learning from revision 20's own 60s-wait
-mistake).
+exact source.patch). The 14 net new tests (all in frozen_hold.rs) avoided unnecessary real-time
+waits: the two rollback/mismatch tests that do need a real confirm-window timeout use the module's
+own short CONFIRM_WINDOW (3s), not a long one invented for the test.
 
 See TEST_RESULTS.md for the full breakdown against the safety spec's checklists (30-item for the
 original redesign, 28-item for frozen-prime-test), plus the "New tests added" sections for each
@@ -842,24 +886,29 @@ file:      dist/opensleep-diagnostic-aarch64-static: ELF 64-bit LSB executable, 
            version 1 (SYSV), statically linked, stripped
 readelf -l: 6 program headers (LOAD x2, TLS, GNU_EH_FRAME, GNU_STACK, GNU_RELRO); no
            PT_INTERP segment -- confirms no dynamic program interpreter, i.e. truly static.
-sha256sum: 6784a03a44f79473559ac45f6582eb3b069b64c0387b639472926d15bc4f0a94  opensleep-diagnostic-aarch64-static
-           (3,151,688 bytes)
+sha256sum: 36a70ec88995cc16856b03ed224e2e885cda11c5a9ae492804eed3032facd10e  opensleep-diagnostic-aarch64-static
+           (3,217,416 bytes)
            Verified against the .sha256 file written by the same build: OK
 Smoke test: qemu-aarch64-static (user-mode emulation, via the host's binfmt_misc registration) was
            used to actually run the built ARM64 binary directly on the x86-64 build host, exercising
-           this revision's new --combined-narrow-subsystem-init flag:
-           (a) `sensor-probe --combined-narrow-subsystem-init --query-info --dry-run
-           --json-output ...` -- three-write expander sequence verified (reg 0x02 final 0xFD, reg
-           0x06 final 0xFC, matching the spec's own stated expected final state exactly), register
-           0x07 read both before and after (0x77 -> 0x77, combined_reg07_preserved: true), Frozen
-           verified reachable (Ping only), Sensor bootloader-first discovery reached firmware mode,
-           GetHardwareInfo/GetFirmwareHash both decoded, overall_result:
-           sensor_firmware_alive_after_combined_init, exit 0.
-           (b) `sensor-probe --combined-narrow-subsystem-init --audit-expander --dry-run` confirmed
-           refused instantly (mutually exclusive fixed expander sequences), exit 2.
-           No regressions observed in plain sensor-probe (no --combined-narrow-subsystem-init), the
-           revision 19/20 experimental flags, or the five Frozen subcommands, all unchanged by this
-           revision.
+           this revision's three new subcommands:
+           (a) `frozen-hold-start --target-c 24 --dry-run --json-output ...` -- printed the exact
+           required confirmation banner ("Frozen thermal control enabled" / target lines /
+           "Targets confirmed by firmware" / "Host control transaction complete" / "Frozen now owns
+           thermal regulation"), JSON hold_results shows left_target_confirmed/
+           right_target_confirmed both true, reset_performed: false (already-responsive mock,
+           no I2C write at all), exit 0.
+           (b) `frozen-hold-start --left-target-c 22 --right-target-c 26 --dry-run` -- independent
+           per-side targets, exit 0.
+           (c) `frozen-hold-start --target-c 24 --left-target-c 20 --dry-run` -- confirmed refused
+           instantly (mutual exclusion), exit 2.
+           (d) `frozen-hold-stop --dry-run` -- both sides disabled and confirmed, exit 0.
+           (e) `frozen-hold-status --dry-run` -- Ping + GetTemperatures only, decoded water
+           temperatures printed, zero enabled/disable commands sent, exit 0.
+           No regressions observed in sensor-probe --combined-narrow-subsystem-init (re-run
+           unchanged: three-write sequence verified, register 0x07 preserved 0x77 -> 0x77,
+           overall_result: sensor_firmware_alive_after_combined_init, exit 0) or any of the other
+           existing subcommands, all unchanged by this revision.
 
            KNOWN COSMETIC GAP (carried over from revision 18, --side both smoke test, itself
            carried over from revision 8): in plain `frozen-prime-opensleep-init --dry-run`'s JSON
