@@ -37,8 +37,8 @@ verification, then move it into place):
 
 ```sh
 cd /tmp
-curl -L -O https://github.com/ortega-io/opensleep-diagnostic/releases/download/diagnostic-v18/opensleep-diagnostic-aarch64-static
-curl -L -O https://github.com/ortega-io/opensleep-diagnostic/releases/download/diagnostic-v18/opensleep-diagnostic-aarch64-static.sha256
+curl -L -O https://github.com/ortega-io/opensleep-diagnostic/releases/download/diagnostic-v19/opensleep-diagnostic-aarch64-static
+curl -L -O https://github.com/ortega-io/opensleep-diagnostic/releases/download/diagnostic-v19/opensleep-diagnostic-aarch64-static.sha256
 sha256sum -c opensleep-diagnostic-aarch64-static.sha256
 mv opensleep-diagnostic-aarch64-static /persistent/tools/opensleep-diagnostic
 ```
@@ -572,6 +572,63 @@ disown
 Either way, `emergency-stop` from a second session remains available as a last resort regardless of
 how the run was started (see "Keep a second session open" in SAFETY.md).
 
+## 8. Investigating the Sensor subsystem, independently of Frozen
+
+`sensor-probe` is unrelated to the hydraulic workflow above: it never touches Frozen's UART or the
+water loop, and can be run at any point, in any order, relative to the Frozen steps above (it does
+not require the cover to be connected or the reservoir filled). It defaults to `/dev/ttyS2` (the
+candidate Sensor UART on this MT8365 Hub) — override with `--sensor-port` if needed.
+
+**Start with `--passive` (the default) — zero UART writes, zero I2C writes:**
+
+```sh
+opensleep-diagnostic sensor-probe --listen-seconds 20 --json-output /tmp/sensor-passive.json
+```
+
+This opens `/dev/ttyS2` at 115200 baud, listens for 20 seconds, then repeats at 38400 baud, and
+reports byte/frame counts and any decoded packet types for each — without ever writing a byte to
+the UART or the I2C bus. Review the output before doing anything more active.
+
+**`--ping`: confirm two-way communication, without changing Sensor's mode:**
+
+```sh
+opensleep-diagnostic sensor-probe --ping --verbose
+```
+
+Sends up to 3 `Ping` packets at firmware baud (115200); only if that stays silent, up to 3 more at
+bootloader baud (38400). Never sends `JumpToFirmware`.
+
+**`--discover`: the full upstream discovery sequence, plus optional read-only info queries and an
+observation window:**
+
+```sh
+opensleep-diagnostic sensor-probe --discover --query-info --observe-seconds 60 \
+    --json-output /tmp/sensor-discover.json --csv-output /tmp/sensor-discover.csv
+```
+
+Pings firmware baud first; only if silent, pings bootloader baud; only if *that* responds, sends
+exactly one `JumpToFirmware` and re-pings at firmware baud. `--query-info` (only sent after a
+confirmed firmware-mode `Pong`) additionally requests `GetHardwareInfo`/`GetFirmwareHash`. Once
+communication is established, listens for unsolicited traffic (capacitance/piezo/temperature/
+messages) for `--observe-seconds` (default 60) and summarizes what was seen, including per-side
+capacitance/piezo min/max/latest values when those packets appear. Never starts the normal Sensor
+command scheduler and never sends a vibration, alarm, piezo-configuration, or presence-calibration
+command — see SAFETY.md.
+
+**Read-only PCAL6416A expander audit** (combinable with any mode above):
+
+```sh
+opensleep-diagnostic sensor-probe --passive --listen-seconds 1 --audit-expander --verbose
+```
+
+Reads (never writes) the expander's input/output/config/polarity registers and prints each in hex
+and binary. Safe to run at any time, including with Frozen actively running a test in another
+session — it reads the same I2C bus but never contends for a write.
+
+**If Sensor stays silent:** `overall_result: "uart_silent"` is expected, informative output, not a
+crash or a claim of hardware failure — see SAFETY.md's `sensor-probe` section for why this version
+deliberately stops there instead of guessing at a reset/enable line for the Sensor MCU.
+
 ## Dry-run mode (safe on any development machine, no hardware needed)
 
 Every subcommand accepts `--dry-run`, which performs no I2C or UART writes at all and instead runs
@@ -589,6 +646,7 @@ opensleep-diagnostic frozen-cool-test --side left --dry-run --non-interactive \
     --confirm-no-visible-leaks --confirm-active-test \
     --json-output /tmp/dryrun-cool.json
 opensleep-diagnostic emergency-stop --dry-run
+opensleep-diagnostic sensor-probe --discover --query-info --dry-run --json-output /tmp/dryrun-sensor.json
 ```
 
 `frozen-prime-test --dry-run` still requires its interactive typed confirmations unless stdin is
@@ -601,7 +659,9 @@ can't run against the mock, it refuses, the same as live mode would.
 
 See SAFETY.md and PROTOCOL_AUDIT.md for the full accounting. In short: no subcommand ever loads
 your saved `config.ron`, runs the Home Assistant integration, starts a profile or temperature
-schedule outside its own bounded active phase, opens the Sensor subsystem, or sends `Prime` outside
+schedule outside its own bounded active phase, opens the Sensor subsystem's UART (except
+`sensor-probe` itself, whose own guarantees are described in step 8 above and in SAFETY.md), or
+sends `Prime` outside
 `frozen-prime-test`/`frozen-prime-opensleep-init` (including its `--release-frozen-only` mode;
 always sent at most once per invocation, always
 manually confirmed, never scheduled or repeated automatically) or an arbitrary/undocumented
