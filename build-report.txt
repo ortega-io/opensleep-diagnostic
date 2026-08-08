@@ -1,10 +1,12 @@
 opensleep-diagnostic — build report
 ====================================
 
-Patch revision: 19 (add sensor-probe: read-only-for-I2C investigation of the Sensor subsystem over
-its own UART, independent of Frozen)
-Supersedes revision 18 (remove the 900s duration ceiling, add --side both for simultaneous
-dual-side operation, harden the independent shutdown guard for hours-long runs), revision 17 (full
+Patch revision: 20 (add sensor-probe --enable-suspected-sensor-line: an experimental, opt-in test
+of the suspected Sensor enable line, PCAL6416A port-0 bit 0)
+Supersedes revision 19 (add sensor-probe: read-only-for-I2C investigation of the Sensor subsystem
+over its own UART, independent of Frozen), revision 18 (remove the 900s duration ceiling, add
+--side both for simultaneous dual-side operation, harden the independent shutdown guard for
+hours-long runs), revision 17 (full
 firmware-authoritative cooling tests: no delta cap, no interactive confirmations, fixes a second
 false firmware-fault positive), revision 16 (adds
 --firmware-authoritative, an optional narrower active-phase mode),
@@ -21,6 +23,45 @@ frozen-prime-test, now removed), revision 5 (added frozen-prime-test), revision 
 active-test preflight/monitoring), revision 3 (staged, Frozen-only diagnostic redesign), revision 2
 (sensor-first post-reset bootloader retry-probe), and revision 1 (initial diagnostic-only fork).
 Same upstream base commit; only source.patch changed.
+
+What changed in revision 20
+----------------------------
+Real hardware evidence narrowed the candidate Sensor enable/reset-release/power-enable line to one
+specific bit: /proc/tty/driver/serial confirms ttyS2 is the only remaining real MMIO UART besides
+Frozen's ttyS1, plain sensor-probe against it shows transmitted bytes but zero RX at both known
+baud rates, and upstream OpenSleep's own reset sequence configures register 0x06 to 0xFC (bits 0
+and 1 both outputs) and keeps register 0x02 bit 0 HIGH throughout -- never pulsing it low -- while
+this fork's own proven narrow Frozen-only initialization leaves register 0x06 at 0xFD (bit 0 still
+an input). Only bit 0 differs between the two initialization paths, and upstream never drives it
+low.
+
+  - Added --enable-suspected-sensor-line: opt-in, never implied by --passive/--ping/--discover/
+    --query-info. A dedicated, independent helper (i2c::configure_suspected_sensor_enable_high --
+    deliberately not a reuse of pulse_frozen_reset_bit, bit 1's own helper) configures only bit 0
+    of registers 0x02/0x06 as an output, driven HIGH -- never a pulse, never LOW, never bit 1,
+    never register 0x07, never a whole-register constant. Every write's changed-bit mask is
+    verified to be a subset of {0x00, 0x01} before proceeding; a mismatch aborts before any Sensor
+    UART probing at all (overall_result: expander_verification_failed). Waits 500ms, then mirrors
+    upstream's own bootloader-first discovery ordering when combined with --discover (the reverse
+    of plain --discover's firmware-first order), or, combined with --passive, sends zero further
+    Sensor UART writes and just listens, recording the elapsed time from the enable sequence
+    completing to the first raw byte/decoded packet.
+  - Added --restore-suspected-sensor-line (requires --enable-suspected-sensor-line in the same
+    invocation): restores only bit 0 of 0x02/0x06 to the value this same invocation captured
+    before enabling, preserving every other bit as it exists at restore time. Never automatic on
+    normal exit -- if bit 0 really is a Sensor enable line, reverting it would immediately disable
+    the Sensor MCU again and make the experiment impossible to interpret.
+  - Added ~20 new report fields (reg_0x02_*/reg_0x06_* four-tuples, port0_bit0_* booleans,
+    passive_rx_before/after_enable, first_rx/first_decoded_packet_after_enable_ms,
+    frozen_uart_opens) and five new overall_result states (sensor_alive_after_line_enable,
+    sensor_bootloader_after_line_enable, spontaneous_sensor_traffic_after_line_enable,
+    still_silent_after_line_enable, expander_verification_failed).
+  - Caught and fixed two bugs before release: a latent guardrail-test gap from revision 19 itself
+    (cli.rs's own doc comment contained the literal substring the guardrail test bans, undetected
+    until this revision's full test re-run), and a test that incurred a real 60-second wait from
+    an unset --observe-seconds override (fixed to well under 1s).
+
+23 net new tests (332 total, up from 309). See TEST_RESULTS.md for the full writeup.
 
 What changed in revision 19
 ----------------------------
@@ -744,15 +785,16 @@ Tests:       cargo test --locked (run under the image's built-in QEMU test runne
 Test results (this build, inside the builder image)
 -----------------------------------------------------
 opensleep (lib) unit tests:               51 passed, 0 failed
-opensleep-diagnostic (bin) unit tests:    309 passed, 0 failed
+opensleep-diagnostic (bin) unit tests:    332 passed, 0 failed
 Doc-tests:                                 0 (none defined)
 
 This revision's build was run with --no-cache (confirmed: only the Dockerfile-syntax pragma
 resolution and a trivial WORKDIR step were served from cache; the git clone/checkout, source.patch
 apply, `cargo test --locked`, and `cargo build --release` steps all executed fresh against this
-exact source.patch). The bin test suite finished in 117.02s under the builder image's QEMU aarch64
-runner (117.02s for revision 18) -- effectively unchanged despite the 35 net new sensor-probe
-tests, since they exercise mocked `tokio::io::duplex` transports with short/no artificial delays.
+exact source.patch). The bin test suite finished in 118.53s under the builder image's QEMU aarch64
+runner (117.02s for revision 19) -- effectively unchanged despite the 23 net new tests, after
+fixing one test that initially incurred a real 60-second wait from an unset --observe-seconds
+override (see TEST_RESULTS.md).
 
 See TEST_RESULTS.md for the full breakdown against the safety spec's checklists (30-item for the
 original redesign, 28-item for frozen-prime-test), plus the "New tests added" sections for each
@@ -764,25 +806,30 @@ file:      dist/opensleep-diagnostic-aarch64-static: ELF 64-bit LSB executable, 
            version 1 (SYSV), statically linked, stripped
 readelf -l: 6 program headers (LOAD x2, TLS, GNU_EH_FRAME, GNU_STACK, GNU_RELRO); no
            PT_INTERP segment -- confirms no dynamic program interpreter, i.e. truly static.
-sha256sum: bb8f2b7cec7c0db09a9a43f22de08eafef34ce671ea9ff28de487c01835a2d06  opensleep-diagnostic-aarch64-static
-           (3,020,520 bytes)
+sha256sum: 6e02074e78e1fa410618d2d3b2a244dc3e3f147c25988a95a0ead29a45da9395  opensleep-diagnostic-aarch64-static
+           (3,086,120 bytes)
            Verified against the .sha256 file written by the same build: OK
 Smoke test: qemu-aarch64-static (user-mode emulation, via the host's binfmt_misc registration) was
            used to actually run the built ARM64 binary directly on the x86-64 build host, exercising
-           this revision's new sensor-probe subcommand:
-           (a) `sensor-probe --listen-seconds 1 --dry-run --json-output ...` (passive, the default
-           mode) -- both baud rates opened, 3 unsolicited packets decoded (capacitance/temperature/
-           piezo) from the mocked device, overall_result: unsolicited_traffic_only, exit 0.
-           (b) `sensor-probe --discover --query-info --dry-run --json-output ...` -- firmware-mode
-           Ping confirmed on the first attempt, GetHardwareInfo/GetFirmwareHash both decoded
-           (hardware_info populated, firmware_info populated), overall_result:
-           communicating_firmware, exit 0.
-           (c) `sensor-probe --passive --listen-seconds 1 --audit-expander --dry-run` -- all 8
-           PCAL6416A registers (0x00-0x07) read and printed in hex/binary, i2c_writes=0,
-           overall_result reflects the passive listen, exit 0.
-           A `sensor-probe --ping --discover --dry-run` command was also confirmed refused instantly
-           ("--passive, --ping, and --discover are mutually exclusive", exit code 2). No regressions
-           observed in the five Frozen subcommands, all unchanged by this revision.
+           this revision's new --enable-suspected-sensor-line/--restore-suspected-sensor-line flags:
+           (a) `sensor-probe --passive --enable-suspected-sensor-line --listen-seconds 1 --dry-run
+           --json-output ...` -- bit 0 of 0x02/0x06 configured (changed-bit mask 0x00/0x01
+           respectively, matching the spec's own motivating evidence), zero Sensor UART writes,
+           spontaneous telemetry decoded from the mocked device after enabling, overall_result:
+           spontaneous_sensor_traffic_after_line_enable, exit 0.
+           (b) `sensor-probe --discover --enable-suspected-sensor-line --query-info --dry-run
+           --json-output ...` -- bootloader-first discovery, JumpToFirmware sent, firmware
+           confirmed, GetHardwareInfo/GetFirmwareHash both decoded, overall_result:
+           sensor_alive_after_line_enable, exit 0.
+           (c) `sensor-probe --discover --enable-suspected-sensor-line
+           --restore-suspected-sensor-line --dry-run --json-output ...` -- reg_0x02_final/
+           reg_0x06_final both restored back to reg_0x02_original/reg_0x06_original (0xFD/0xFD)
+           after the run, exit 0.
+           (d) `sensor-probe --restore-suspected-sensor-line --dry-run` (no
+           --enable-suspected-sensor-line) confirmed refused instantly ("--restore-suspected-
+           sensor-line requires --enable-suspected-sensor-line in the same invocation"), exit 2.
+           No regressions observed in plain sensor-probe (no --enable-suspected-sensor-line) or the
+           five Frozen subcommands, all unchanged by this revision.
 
            KNOWN COSMETIC GAP (carried over from revision 18, --side both smoke test, itself
            carried over from revision 8): in plain `frozen-prime-opensleep-init --dry-run`'s JSON
