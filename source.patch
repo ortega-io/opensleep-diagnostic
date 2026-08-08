@@ -164,10 +164,10 @@ index 0000000..be05be7
 +}
 diff --git a/src/bin/opensleep-diagnostic/cli.rs b/src/bin/opensleep-diagnostic/cli.rs
 new file mode 100644
-index 0000000..33543fe
+index 0000000..040b72f
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/cli.rs
-@@ -0,0 +1,548 @@
+@@ -0,0 +1,639 @@
 +//! CLI surface. Every flag here maps to a fixed, validated field -- there is no flag that accepts
 +//! a raw opcode, a raw frame, or an arbitrary absolute temperature target. Side selection is a
 +//! closed `ValueEnum`; the cooling delta and duration are validated in `cool_test.rs` against
@@ -227,6 +227,24 @@ index 0000000..33543fe
 +    /// disable this safety net) -- only the parent's own disarm byte, or firing, ends it.
 +    #[command(name = "internal-cool-test-guard", hide = true)]
 +    InternalCoolTestGuard(GuardArgs),
++    /// Configures Frozen with fixed absolute target temperatures, confirms both sides, and exits.
++    /// Not an observation session: once both targets are confirmed, this process sends zero
++    /// further Frozen commands of any kind and performs no shutdown/reset behavior on exit.
++    /// Frozen firmware owns pumps, TECs, PID, fans, solenoids, priming, interlocks, and thermal
++    /// safety for as long as the targets remain enabled. See `frozen_hold.rs` module docs and
++    /// SAFETY.md.
++    #[command(name = "frozen-hold-start")]
++    FrozenHoldStart(HoldStartArgs),
++    /// Explicitly stops persistent thermal control started by `frozen-hold-start`: disables both
++    /// sides and requires confirmation of both before exiting successfully. Does not reset a
++    /// responsive Frozen and does not pulse Frozen reset as part of ordinary stop.
++    #[command(name = "frozen-hold-stop")]
++    FrozenHoldStop(HoldStopArgs),
++    /// Strictly non-controlling status check: Ping/GetTemperatures only. Never sends
++    /// SetTargetTemperature (enabled or disabled), never resets Frozen, never touches PCAL state.
++    /// Safe to run at any time, including while `frozen-hold-start`'s targets remain active.
++    #[command(name = "frozen-hold-status")]
++    FrozenHoldStatus(HoldStatusArgs),
 +}
 +
 +#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -716,6 +734,79 @@ index 0000000..33543fe
 +    #[arg(long, default_value_t = false)]
 +    pub verbose: bool,
 +}
++
++/// Args for `frozen-hold-start`. `--target-c` sets the same absolute target on both sides; it is
++/// mutually exclusive with `--left-target-c`/`--right-target-c`, which require both sides to be
++/// explicitly specified together. No baseline measurement or delta calculation is involved in any
++/// of the three -- these are absolute Celsius targets, validated the same way `frozen-cool-test`'s
++/// `--target-c` is (see `safety::validate_absolute_target_centideg`).
++#[derive(clap::Args, Debug, Clone)]
++pub struct HoldStartArgs {
++    /// Absolute target in degrees C for both sides. Mutually exclusive with
++    /// `--left-target-c`/`--right-target-c`.
++    #[arg(long, value_name = "TARGET_C")]
++    pub target_c: Option<f64>,
++
++    /// Absolute target in degrees C for the left side only. Requires `--right-target-c` in the
++    /// same invocation. Mutually exclusive with `--target-c`.
++    #[arg(long, value_name = "TARGET_C")]
++    pub left_target_c: Option<f64>,
++
++    /// Absolute target in degrees C for the right side only. Requires `--left-target-c` in the
++    /// same invocation. Mutually exclusive with `--target-c`.
++    #[arg(long, value_name = "TARGET_C")]
++    pub right_target_c: Option<f64>,
++
++    #[arg(long, default_value = "/dev/i2c-1")]
++    pub i2c_device: String,
++
++    #[arg(long, default_value = "/dev/ttyS1")]
++    pub frozen_port: String,
++
++    #[arg(long, value_name = "PATH")]
++    pub json_output: Option<String>,
++
++    #[arg(long, default_value_t = false)]
++    pub verbose: bool,
++
++    /// Perform no I2C or UART writes; run the full configuration transaction against a mocked
++    /// Frozen device instead.
++    #[arg(long, default_value_t = false)]
++    pub dry_run: bool,
++}
++
++/// Args for `frozen-hold-stop`.
++#[derive(clap::Args, Debug, Clone)]
++pub struct HoldStopArgs {
++    #[arg(long, default_value = "/dev/ttyS1")]
++    pub frozen_port: String,
++
++    #[arg(long, value_name = "PATH")]
++    pub json_output: Option<String>,
++
++    #[arg(long, default_value_t = false)]
++    pub verbose: bool,
++
++    #[arg(long, default_value_t = false)]
++    pub dry_run: bool,
++}
++
++/// Args for `frozen-hold-status`. No I2C device flag: this mode never touches PCAL state, so it
++/// has no use for one.
++#[derive(clap::Args, Debug, Clone)]
++pub struct HoldStatusArgs {
++    #[arg(long, default_value = "/dev/ttyS1")]
++    pub frozen_port: String,
++
++    #[arg(long, value_name = "PATH")]
++    pub json_output: Option<String>,
++
++    #[arg(long, default_value_t = false)]
++    pub verbose: bool,
++
++    #[arg(long, default_value_t = false)]
++    pub dry_run: bool,
++}
 diff --git a/src/bin/opensleep-diagnostic/compat_counters.rs b/src/bin/opensleep-diagnostic/compat_counters.rs
 new file mode 100644
 index 0000000..1ffa228
@@ -903,10 +994,10 @@ index 0000000..9c6296b
 +}
 diff --git a/src/bin/opensleep-diagnostic/cool_test.rs b/src/bin/opensleep-diagnostic/cool_test.rs
 new file mode 100644
-index 0000000..ec906fa
+index 0000000..188c845
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/cool_test.rs
-@@ -0,0 +1,6403 @@
+@@ -0,0 +1,6405 @@
 +//! `frozen-cool-test`: the one subcommand that intentionally activates a cooling channel. Every
 +//! hard limit here (max delta, max duration, baseline range, heatsink ceiling) is a compile-time
 +//! constant; no CLI flag can raise any of them. See SAFETY.md for the operator-facing version of
@@ -4907,6 +4998,7 @@ index 0000000..ec906fa
 +        opensleep_init_results: None,
 +        release_frozen_only_results: None,
 +        cool_test_results: Some(ct),
++        hold_results: None,
 +        overall_pass,
 +        exit_code,
 +    };
@@ -5007,6 +5099,7 @@ index 0000000..ec906fa
 +        opensleep_init_results: None,
 +        release_frozen_only_results: None,
 +        cool_test_results: None,
++        hold_results: None,
 +        overall_pass: false,
 +        exit_code: 30,
 +    }
@@ -7732,6 +7825,1026 @@ index 0000000..1fce892
 +        scanner.feed(&bytes);
 +        let frames = scanner.drain_frames();
 +        assert_eq!(frames.len(), 3);
++    }
++}
+diff --git a/src/bin/opensleep-diagnostic/frozen_hold.rs b/src/bin/opensleep-diagnostic/frozen_hold.rs
+new file mode 100644
+index 0000000..2cf2571
+--- /dev/null
++++ b/src/bin/opensleep-diagnostic/frozen_hold.rs
+@@ -0,0 +1,1014 @@
++//! `frozen-hold-start`/`frozen-hold-stop`/`frozen-hold-status`: persistent, firmware-owned
++//! absolute-temperature thermal control.
++//!
++//! `frozen-hold-start` sends one absolute target per side, requires an exact-matching
++//! `TargetUpdate` confirmation for each, and then **exits**. It is a one-shot configuration
++//! transaction, not an observation session: once both targets are confirmed, this process sends
++//! zero further Frozen commands of any kind -- no disable, no `SafetyOff`, no independent shutdown
++//! guard, no `Drop`-based shutdown behavior, no duration timer, no firmware-text interpretation, no
++//! pump/TEC/fan observer, no target-attainment logic, no host thermal watchdog, no reaction to
++//! priming or `tec[...] locked` messages, no UART monitoring, and no reset on exit. Frozen firmware
++//! remains completely responsible for pumps, TECs, PID, fans, solenoids, priming, interlocks,
++//! thermal control, current protection, and firmware safety behavior for as long as the targets
++//! remain enabled -- exactly the way stock OpenSleep's own scheduled `SetTargetTemperature` calls
++//! work (see `opensleep::frozen::manager`), just sent once, explicitly, by an operator instead of a
++//! schedule.
++//!
++//! Unlike `frozen-cool-test`/`frozen-prime-opensleep-init --release-frozen-only`, this mode must
++//! never reset a Frozen that is already responsive -- it may be adjusting targets on a Frozen a
++//! previous `frozen-hold-start` already brought up and is actively regulating. So startup here is
++//! "probe first, reset only if silent": a bounded, reset-free Ping probe runs first
++//! ([`probe_responsive_without_reset`]); only if that finds nothing does this fall back to the
++//! already-audited narrow startup/reset mechanism ([`crate::frozen_startup::start_frozen_narrow`]).
++//! Never reintroduces the historical whole-register PCAL initialization, and never writes register
++//! `0x07` -- exactly the same guarantee every other mode in this binary already holds.
++//!
++//! `frozen-hold-stop` explicitly disables both sides and requires confirmation of both before
++//! exiting successfully -- it Pings first (never to justify a reset, only to log responsiveness),
++//! never pulses Frozen reset as part of an ordinary stop, and never parses firmware message text.
++//!
++//! `frozen-hold-status` is strictly non-controlling: Ping/GetTemperatures only, safe to run at any
++//! time -- including while `frozen-hold-start`'s targets remain active -- since it never sends
++//! `SetTargetTemperature` (enabled or disabled), never resets Frozen, and never touches PCAL state.
++
++use std::time::Duration;
++
++use opensleep::common::packet::BedSide;
++use opensleep::frozen::FrozenPacket;
++use tokio::io::{AsyncRead, AsyncWrite};
++use tokio::time::Instant;
++
++use crate::buildinfo::{DIAGNOSTIC_VERSION, kernel_release, source_commit};
++use crate::cli::{HoldStartArgs, HoldStatusArgs, HoldStopArgs};
++use crate::frozen_ops;
++use crate::frozen_startup::start_frozen_narrow;
++use crate::i2c::{I2cPort, MockI2c, RealI2c};
++use crate::link::{FrozenLink, PacketOutcome};
++use crate::mock::mock_frozen_link_pair;
++use crate::ownership;
++use crate::report::{AuditEntryJson, Confirmations, HoldResults, Report};
++use crate::safety::{AuditedTransport, FrozenAction, Mode};
++
++const COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
++/// Per-attempt timeout for the initial, reset-free responsiveness probe.
++const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
++/// How many Ping attempts the reset-free probe makes before concluding Frozen is silent and
++/// falling back to the narrow startup/reset mechanism.
++const PROBE_ATTEMPTS: u32 = 3;
++/// After a send's own reply isn't already the matching confirmation, how much longer to keep
++/// draining packets looking for it.
++const CONFIRM_WINDOW: Duration = Duration::from_secs(3);
++const DISABLE_WAIT: Duration = Duration::from_millis(500);
++const SHUTDOWN_REPEAT_COUNT: usize = 3;
++const SHUTDOWN_BETWEEN_ATTEMPTS_DELAY: Duration = Duration::from_millis(150);
++
++// ================================================================================================
++// frozen-hold-start
++// ================================================================================================
++
++pub async fn run_start(args: &HoldStartArgs) -> (Report, u8) {
++    let (left_c, right_c) = match resolve_requested_targets_c(args) {
++        Ok(t) => t,
++        Err(msg) => {
++            log::error!("frozen-hold-start: {msg}");
++            return (refused_start_report(args, &msg), 2);
++        }
++    };
++    let left_action = match hold_target_action(BedSide::Left, left_c) {
++        Ok(a) => a,
++        Err(msg) => {
++            log::error!("frozen-hold-start: {msg}");
++            return (refused_start_report(args, &msg), 2);
++        }
++    };
++    let right_action = match hold_target_action(BedSide::Right, right_c) {
++        Ok(a) => a,
++        Err(msg) => {
++            log::error!("frozen-hold-start: {msg}");
++            return (refused_start_report(args, &msg), 2);
++        }
++    };
++
++    if args.dry_run {
++        log::warn!("--dry-run: no I2C or UART writes will be performed; using a mocked Frozen device");
++        let mut i2c = MockI2c::always_succeed();
++        let (client, task) = mock_frozen_link_pair();
++        let mut link = FrozenLink::wrap(client, "dry-run");
++        let result = run_start_core(args, &mut i2c, &mut link, true, left_c, right_c, left_action, right_action).await;
++        drop(link);
++        task.abort();
++        return result;
++    }
++
++    if let Some(reason) = refuse_if_owned(Some(&args.i2c_device), &args.frozen_port) {
++        log::error!("frozen-hold-start: refusing to run: {reason}");
++        return (refused_start_report(args, &reason), 40);
++    }
++
++    let mut i2c = match RealI2c::open(&args.i2c_device) {
++        Ok(dev) => dev,
++        Err(e) => {
++            log::error!("frozen-hold-start: failed to open I2C device {}: {e}", args.i2c_device);
++            return (refused_start_report(args, "I2C bus failed to open"), 20);
++        }
++    };
++    let mut link = match FrozenLink::<tokio_serial::SerialStream>::open(&args.frozen_port) {
++        Ok(l) => l,
++        Err(e) => {
++            log::error!("frozen-hold-start: failed to open Frozen UART {}: {e}", args.frozen_port);
++            return (refused_start_report(args, "Frozen UART failed to open"), 20);
++        }
++    };
++
++    run_start_core(args, &mut i2c, &mut link, false, left_c, right_c, left_action, right_action).await
++}
++
++/// `--target-c` sets the same absolute target on both sides and cannot be combined with
++/// `--left-target-c`/`--right-target-c`; those two must both be supplied together. No baseline
++/// measurement or delta calculation is involved in either form.
++fn resolve_requested_targets_c(args: &HoldStartArgs) -> Result<(f64, f64), String> {
++    match (args.target_c, args.left_target_c, args.right_target_c) {
++        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
++            Err("--target-c cannot be combined with --left-target-c/--right-target-c".to_string())
++        }
++        (Some(t), None, None) => Ok((t, t)),
++        (None, Some(l), Some(r)) => Ok((l, r)),
++        (None, Some(_), None) | (None, None, Some(_)) => {
++            Err("--left-target-c and --right-target-c must both be supplied together".to_string())
++        }
++        (None, None, None) => Err("one of --target-c or --left-target-c/--right-target-c is required".to_string()),
++    }
++}
++
++/// Converts a requested absolute Celsius target directly to centidegrees (no baseline, no delta)
++/// and validates it via [`FrozenAction::hold_target`] -- the same absolute-range backstop
++/// `frozen-cool-test`'s `--target-c` uses, not a separately invented range.
++fn hold_target_action(side: BedSide, target_c: f64) -> Result<FrozenAction, String> {
++    let target_centideg = (target_c * 100.0).round() as i32;
++    FrozenAction::hold_target(side, target_centideg).map_err(|e| e.to_string())
++}
++
++fn refuse_if_owned(i2c_device: Option<&str>, frozen_port: &str) -> Option<String> {
++    let services = ownership::check_stock_services();
++    let active: Vec<_> = services.iter().filter(|s| s.active).map(|s| s.name.clone()).collect();
++    if !active.is_empty() {
++        return Some(format!("stock service(s) active: {active:?}"));
++    }
++    if let Some(dev) = i2c_device
++        && ownership::device_exists(dev)
++        && ownership::device_is_open_elsewhere(dev)
++    {
++        return Some(format!("{dev} appears to be open in another process"));
++    }
++    if ownership::device_exists(frozen_port) && ownership::device_is_open_elsewhere(frozen_port) {
++        return Some(format!("{frozen_port} appears to be open in another process"));
++    }
++    None
++}
++
++#[allow(clippy::too_many_arguments)]
++async fn run_start_core<T, P>(
++    args: &HoldStartArgs,
++    i2c: &mut P,
++    link: &mut FrozenLink<T>,
++    dry_run: bool,
++    left_c: f64,
++    right_c: f64,
++    left_action: FrozenAction,
++    right_action: FrozenAction,
++) -> (Report, u8)
++where
++    T: AsyncRead + AsyncWrite + Unpin,
++    P: I2cPort,
++{
++    let mut audit = AuditedTransport::new(Mode::HoldStart);
++
++    let ready = ensure_frozen_ready(i2c, link, &mut audit).await;
++    if !ready.responsive {
++        log::error!("frozen-hold-start: Frozen did not reach application firmware; refusing to send any target");
++        let report = finish_start(
++            args, dry_run, &audit, left_c, right_c, false, false, ready.reset_performed, false,
++            "Frozen not responsive", 21,
++        );
++        return (report, 21);
++    }
++
++    let left_confirmed = send_and_confirm_hold_target(link, &mut audit, BedSide::Left, left_action).await;
++    if !left_confirmed {
++        log::error!("frozen-hold-start: Left target was not confirmed by firmware");
++        let report = finish_start(
++            args, dry_run, &audit, left_c, right_c, false, false, ready.reset_performed, false,
++            "Left target not confirmed", 22,
++        );
++        return (report, 22);
++    }
++
++    let right_confirmed = send_and_confirm_hold_target(link, &mut audit, BedSide::Right, right_action).await;
++    if !right_confirmed {
++        log::error!("frozen-hold-start: Right target was not confirmed by firmware; rolling back Left");
++        rollback_left(link, &mut audit).await;
++        let report = finish_start(
++            args, dry_run, &audit, left_c, right_c, true, false, ready.reset_performed, true,
++            "Right target not confirmed; Left rolled back", 22,
++        );
++        return (report, 22);
++    }
++
++    eprintln!("Frozen thermal control enabled");
++    eprintln!("Left target:  {left_c:.2} C");
++    eprintln!("Right target: {right_c:.2} C");
++    eprintln!("Targets confirmed by firmware");
++    eprintln!("Host control transaction complete");
++    eprintln!("Frozen now owns thermal regulation");
++
++    let report = finish_start(
++        args, dry_run, &audit, left_c, right_c, true, true, ready.reset_performed, false, "", 0,
++    );
++    (report, 0)
++}
++
++struct ReadyOutcome {
++    responsive: bool,
++    reset_performed: bool,
++}
++
++/// Probes for a responsive Frozen without ever pulsing reset; only if that finds nothing does this
++/// fall back to the already-audited narrow startup/reset mechanism. See module docs.
++async fn ensure_frozen_ready<T, P>(i2c: &mut P, link: &mut FrozenLink<T>, audit: &mut AuditedTransport) -> ReadyOutcome
++where
++    T: AsyncRead + AsyncWrite + Unpin,
++    P: I2cPort,
++{
++    if probe_responsive_without_reset(link, audit).await {
++        log::info!("frozen-hold-start: Frozen is already responsive; no reset performed");
++        return ReadyOutcome { responsive: true, reset_performed: false };
++    }
++
++    log::info!(
++        "frozen-hold-start: Frozen did not answer the initial no-reset probe; falling back to the \
++         narrow startup/reset mechanism"
++    );
++    let startup = start_frozen_narrow(i2c, link, audit).await;
++    ReadyOutcome { responsive: startup.started_successfully(), reset_performed: true }
++}
++
++/// Up to [`PROBE_ATTEMPTS`] quick Pings, never touching I2C. A bootloader response is followed by
++/// the ordinary bootloader-to-firmware handoff (`JumpToFirmware`) -- that is not a reset, just the
++/// same transition every other mode in this binary already performs.
++async fn probe_responsive_without_reset<T>(link: &mut FrozenLink<T>, audit: &mut AuditedTransport) -> bool
++where
++    T: AsyncRead + AsyncWrite + Unpin,
++{
++    for _ in 0..PROBE_ATTEMPTS {
++        let (ok, mode) = frozen_ops::ping(link, audit, PROBE_TIMEOUT).await;
++        if ok {
++            return match mode {
++                frozen_ops::DeviceMode::Firmware => true,
++                frozen_ops::DeviceMode::Bootloader => frozen_ops::jump_to_firmware_and_wait(link, audit, PROBE_TIMEOUT).await,
++                frozen_ops::DeviceMode::Unknown => false,
++            };
++        }
++    }
++    false
++}
++
++/// Sends `action` and requires an *exact* matching `TargetUpdate(side, enabled=true,
++/// temp=<requested>)` -- the send's own reply may already be it (the normal case); otherwise keeps
++/// draining further packets (which may include firmware `Message`s -- priming text,
++/// `tec[...] locked`, anything -- all silently ignored here) for up to [`CONFIRM_WINDOW`].
++async fn send_and_confirm_hold_target<T>(
++    link: &mut FrozenLink<T>,
++    audit: &mut AuditedTransport,
++    side: BedSide,
++    action: FrozenAction,
++) -> bool
++where
++    T: AsyncRead + AsyncWrite + Unpin,
++{
++    let target_centideg = action.target_centideg().expect("hold_target always carries a target");
++    let send_result = link.send(audit, action, COMMAND_TIMEOUT).await;
++    if let Ok(PacketOutcome::Received(FrozenPacket::TargetUpdate((s, t)))) = &send_result
++        && *s == side
++        && t.enabled
++        && t.temp == target_centideg
++    {
++        return true;
++    }
++    if send_result.is_err() {
++        return false;
++    }
++
++    let deadline = Instant::now() + CONFIRM_WINDOW;
++    loop {
++        let remaining = deadline.saturating_duration_since(Instant::now());
++        if remaining.is_zero() {
++            return false;
++        }
++        match link.recv(remaining).await {
++            Ok(PacketOutcome::Received(FrozenPacket::TargetUpdate((s, t)))) if s == side && t.enabled && t.temp == target_centideg => {
++                return true;
++            }
++            Ok(PacketOutcome::Received(_)) => {}
++            Ok(PacketOutcome::TimedOut) | Ok(PacketOutcome::Closed) | Err(_) => return false,
++        }
++    }
++}
++
++/// Partial-transaction rollback: Left was already confirmed enabled but Right never confirmed, so
++/// disable Left again (best-effort -- this is a failure report either way, not a second success
++/// path requiring its own confirmation).
++async fn rollback_left<T>(link: &mut FrozenLink<T>, audit: &mut AuditedTransport)
++where
++    T: AsyncRead + AsyncWrite + Unpin,
++{
++    match link.send(audit, FrozenAction::safety_off(BedSide::Left), DISABLE_WAIT).await {
++        Ok(_) => log::warn!("frozen-hold-start: rolled back Left target after Right failed to confirm"),
++        Err(e) => log::error!("frozen-hold-start: rollback disable for Left failed: {e}"),
++    }
++}
++
++#[allow(clippy::too_many_arguments)]
++fn finish_start(
++    args: &HoldStartArgs,
++    dry_run: bool,
++    audit: &AuditedTransport,
++    left_c: f64,
++    right_c: f64,
++    left_confirmed: bool,
++    right_confirmed: bool,
++    reset_performed: bool,
++    rolled_back: bool,
++    stop_reason: &str,
++    exit_code: u8,
++) -> Report {
++    let mut report = base_report("frozen-hold-start", dry_run, &args.i2c_device, &args.frozen_port, stop_reason, exit_code);
++    report.i2c_bus_open = true;
++    report.frozen_uart_opened = true;
++    report.outgoing_commands = audit.entries().iter().map(AuditEntryJson::from).collect();
++    report.enabled_target_command_count = audit.enabled_target_count();
++    report.safety_off_commands_sent = audit.entries().iter().filter(|e| e.enabled == Some(false)).count() as u32;
++    report.hold_results = Some(HoldResults {
++        action: "start".to_string(),
++        requested_left_target_c: Some(left_c),
++        requested_right_target_c: Some(right_c),
++        left_target_confirmed: left_confirmed,
++        right_target_confirmed: right_confirmed,
++        reset_performed,
++        rolled_back,
++        ..Default::default()
++    });
++    report.overall_pass = left_confirmed && right_confirmed;
++    report.exit_code = exit_code;
++
++    write_json_if_requested(&report, args.json_output.as_deref());
++    report.print_table();
++    report
++}
++
++fn refused_start_report(args: &HoldStartArgs, reason: &str) -> Report {
++    let mut report = base_report("frozen-hold-start", args.dry_run, &args.i2c_device, &args.frozen_port, reason, 2);
++    report.hold_results = Some(HoldResults { action: "start".to_string(), ..Default::default() });
++    write_json_if_requested(&report, args.json_output.as_deref());
++    report
++}
++
++// ================================================================================================
++// frozen-hold-stop
++// ================================================================================================
++
++pub async fn run_stop(args: &HoldStopArgs) -> (Report, u8) {
++    if args.dry_run {
++        log::warn!("--dry-run: no UART writes will be performed; using a mocked Frozen device");
++        let (client, task) = mock_frozen_link_pair();
++        let mut link = FrozenLink::wrap(client, "dry-run");
++        let result = run_stop_core(args, &mut link, true).await;
++        drop(link);
++        task.abort();
++        return result;
++    }
++
++    if let Some(reason) = refuse_if_owned(None, &args.frozen_port) {
++        log::error!("frozen-hold-stop: refusing to run: {reason}");
++        let mut report = base_report("frozen-hold-stop", false, "", &args.frozen_port, &reason, 40);
++        report.hold_results = Some(HoldResults { action: "stop".to_string(), ..Default::default() });
++        write_json_if_requested(&report, args.json_output.as_deref());
++        return (report, 40);
++    }
++
++    let mut link = match FrozenLink::<tokio_serial::SerialStream>::open(&args.frozen_port) {
++        Ok(l) => l,
++        Err(e) => {
++            log::error!("frozen-hold-stop: failed to open Frozen UART {}: {e}", args.frozen_port);
++            let mut report = base_report(
++                "frozen-hold-stop", false, "", &args.frozen_port, "Frozen UART failed to open", 20,
++            );
++            report.hold_results = Some(HoldResults { action: "stop".to_string(), ..Default::default() });
++            write_json_if_requested(&report, args.json_output.as_deref());
++            return (report, 20);
++        }
++    };
++
++    run_stop_core(args, &mut link, false).await
++}
++
++async fn run_stop_core<T>(args: &HoldStopArgs, link: &mut FrozenLink<T>, dry_run: bool) -> (Report, u8)
++where
++    T: AsyncRead + AsyncWrite + Unpin,
++{
++    let mut audit = AuditedTransport::new(Mode::HoldStop);
++
++    // Ping first, purely for logging/reporting -- never to justify a reset, and the disable
++    // sequence below runs regardless of the result (best-effort, matching emergency-stop's own
++    // "send anyway" philosophy for a stop path).
++    let (ping_ok, mode) = frozen_ops::ping(link, &mut audit, COMMAND_TIMEOUT).await;
++    if !ping_ok {
++        log::warn!("frozen-hold-stop: Frozen did not answer the initial Ping; sending disables anyway");
++    }
++
++    let (left_disabled, right_disabled) = disable_both_and_confirm(link, &mut audit).await;
++    let overall_pass = left_disabled && right_disabled;
++
++    eprintln!("Left disabled:  {left_disabled}");
++    eprintln!("Right disabled: {right_disabled}");
++    if overall_pass {
++        eprintln!("Frozen thermal control stopped");
++    } else {
++        eprintln!("WARNING: could not confirm both sides disabled");
++    }
++
++    let mut report = base_report(
++        "frozen-hold-stop", dry_run, "", &args.frozen_port,
++        if overall_pass { "stopped" } else { "stop_not_confirmed" },
++        if overall_pass { 0 } else { 23 },
++    );
++    report.frozen_uart_opened = true;
++    report.frozen_bootloader_ping = ping_ok.then_some(mode == frozen_ops::DeviceMode::Bootloader);
++    report.frozen_firmware_ping = ping_ok.then_some(mode == frozen_ops::DeviceMode::Firmware);
++    report.outgoing_commands = audit.entries().iter().map(AuditEntryJson::from).collect();
++    report.safety_off_commands_sent = audit.entries().iter().filter(|e| e.enabled == Some(false)).count() as u32;
++    report.hold_results = Some(HoldResults {
++        action: "stop".to_string(),
++        left_disabled_confirmed: left_disabled,
++        right_disabled_confirmed: right_disabled,
++        frozen_responsive: ping_ok,
++        ..Default::default()
++    });
++    report.overall_pass = overall_pass;
++
++    write_json_if_requested(&report, args.json_output.as_deref());
++    report.print_table();
++    let code = report.exit_code;
++    (report, code)
++}
++
++/// The repeated-disable-and-confirm pattern `frozen-cool-test`'s own controlled shutdown uses
++/// (`cool_test::run_cool_test_shutdown`): send both disables, repeated with short spacing, checking
++/// each send's own reply for the confirming `TargetUpdate(enabled=false)`; only if that didn't
++/// already confirm both sides, keep draining a bit longer for a further unsolicited confirmation.
++/// Deliberately independent of that function rather than calling it directly: unlike cool-test's
++/// shutdown, this must never parse firmware message text and must never fall back to asserting the
++/// I2C reset -- see module docs.
++async fn disable_both_and_confirm<T>(link: &mut FrozenLink<T>, audit: &mut AuditedTransport) -> (bool, bool)
++where
++    T: AsyncRead + AsyncWrite + Unpin,
++{
++    let mut left_confirmed = false;
++    let mut right_confirmed = false;
++
++    for attempt in 0..SHUTDOWN_REPEAT_COUNT {
++        log::info!("frozen-hold-stop: disable attempt {}/{SHUTDOWN_REPEAT_COUNT}", attempt + 1);
++        if !left_confirmed {
++            let outcome = link.send(audit, FrozenAction::safety_off(BedSide::Left), DISABLE_WAIT).await;
++            if let Ok(PacketOutcome::Received(FrozenPacket::TargetUpdate((BedSide::Left, t)))) = &outcome
++                && !t.enabled
++            {
++                left_confirmed = true;
++            }
++        }
++        if !right_confirmed {
++            let outcome = link.send(audit, FrozenAction::safety_off(BedSide::Right), DISABLE_WAIT).await;
++            if let Ok(PacketOutcome::Received(FrozenPacket::TargetUpdate((BedSide::Right, t)))) = &outcome
++                && !t.enabled
++            {
++                right_confirmed = true;
++            }
++        }
++        if left_confirmed && right_confirmed {
++            break;
++        }
++        if attempt + 1 < SHUTDOWN_REPEAT_COUNT {
++            tokio::time::sleep(SHUTDOWN_BETWEEN_ATTEMPTS_DELAY).await;
++        }
++    }
++
++    if !(left_confirmed && right_confirmed) {
++        let deadline = Instant::now() + CONFIRM_WINDOW;
++        loop {
++            if left_confirmed && right_confirmed {
++                break;
++            }
++            let remaining = deadline.saturating_duration_since(Instant::now());
++            if remaining.is_zero() {
++                break;
++            }
++            match link.recv(remaining).await {
++                Ok(PacketOutcome::Received(FrozenPacket::TargetUpdate((s, t)))) if !t.enabled => match s {
++                    BedSide::Left => left_confirmed = true,
++                    BedSide::Right => right_confirmed = true,
++                },
++                Ok(PacketOutcome::Received(_)) => {}
++                Ok(PacketOutcome::TimedOut) | Ok(PacketOutcome::Closed) | Err(_) => break,
++            }
++        }
++    }
++
++    (left_confirmed, right_confirmed)
++}
++
++// ================================================================================================
++// frozen-hold-status
++// ================================================================================================
++
++pub async fn run_status(args: &HoldStatusArgs) -> (Report, u8) {
++    if args.dry_run {
++        let (client, task) = mock_frozen_link_pair();
++        let mut link = FrozenLink::wrap(client, "dry-run");
++        let result = run_status_core(args, &mut link, true).await;
++        drop(link);
++        task.abort();
++        return result;
++    }
++
++    if let Some(reason) = refuse_if_owned(None, &args.frozen_port) {
++        log::error!("frozen-hold-status: refusing to run: {reason}");
++        let mut report = base_report("frozen-hold-status", false, "", &args.frozen_port, &reason, 40);
++        report.hold_results = Some(HoldResults { action: "status".to_string(), ..Default::default() });
++        write_json_if_requested(&report, args.json_output.as_deref());
++        return (report, 40);
++    }
++
++    let mut link = match FrozenLink::<tokio_serial::SerialStream>::open(&args.frozen_port) {
++        Ok(l) => l,
++        Err(e) => {
++            log::error!("frozen-hold-status: failed to open Frozen UART {}: {e}", args.frozen_port);
++            let mut report = base_report(
++                "frozen-hold-status", false, "", &args.frozen_port, "Frozen UART failed to open", 20,
++            );
++            report.hold_results = Some(HoldResults { action: "status".to_string(), ..Default::default() });
++            write_json_if_requested(&report, args.json_output.as_deref());
++            return (report, 20);
++        }
++    };
++
++    run_status_core(args, &mut link, false).await
++}
++
++async fn run_status_core<T>(args: &HoldStatusArgs, link: &mut FrozenLink<T>, dry_run: bool) -> (Report, u8)
++where
++    T: AsyncRead + AsyncWrite + Unpin,
++{
++    let mut audit = AuditedTransport::new(Mode::HoldStatus);
++
++    let (ping_ok, mode) = frozen_ops::ping(link, &mut audit, COMMAND_TIMEOUT).await;
++
++    let mut left_water_c = None;
++    let mut right_water_c = None;
++    let mut heatsink_c = None;
++    if ping_ok {
++        match link.send(&mut audit, FrozenAction::get_temperatures(), COMMAND_TIMEOUT).await {
++            Ok(PacketOutcome::Received(FrozenPacket::GetTemperature(g))) => {
++                left_water_c = Some(crate::telemetry::centideg_to_celsius(g.left_temp));
++                right_water_c = Some(crate::telemetry::centideg_to_celsius(g.right_temp));
++                heatsink_c = Some(crate::telemetry::centideg_to_celsius(g.heatsink_temp));
++            }
++            Ok(PacketOutcome::Received(FrozenPacket::TemperatureUpdate(u))) => {
++                left_water_c = Some(crate::telemetry::centideg_to_celsius(u.left_temp));
++                right_water_c = Some(crate::telemetry::centideg_to_celsius(u.right_temp));
++                heatsink_c = Some(crate::telemetry::centideg_to_celsius(u.heatsink_temp));
++            }
++            _ => {}
++        }
++    }
++
++    eprintln!("Frozen responsive: {ping_ok}");
++    if let Some(l) = left_water_c {
++        eprintln!("Left water temperature:  {l:.2} C");
++    }
++    if let Some(r) = right_water_c {
++        eprintln!("Right water temperature: {r:.2} C");
++    }
++
++    let mut report = base_report(
++        "frozen-hold-status", dry_run, "", &args.frozen_port, if ping_ok { "responsive" } else { "silent" },
++        if ping_ok { 0 } else { 10 },
++    );
++    report.frozen_uart_opened = true;
++    report.frozen_bootloader_ping = ping_ok.then_some(mode == frozen_ops::DeviceMode::Bootloader);
++    report.frozen_firmware_ping = ping_ok.then_some(mode == frozen_ops::DeviceMode::Firmware);
++    report.outgoing_commands = audit.entries().iter().map(AuditEntryJson::from).collect();
++    report.hold_results = Some(HoldResults {
++        action: "status".to_string(),
++        frozen_responsive: ping_ok,
++        left_water_c,
++        right_water_c,
++        heatsink_c,
++        ..Default::default()
++    });
++    report.overall_pass = ping_ok;
++
++    write_json_if_requested(&report, args.json_output.as_deref());
++    report.print_table();
++    let code = report.exit_code;
++    (report, code)
++}
++
++// ================================================================================================
++// Shared
++// ================================================================================================
++
++fn base_report(mode_label: &str, dry_run: bool, i2c_device: &str, frozen_port: &str, stop_reason: &str, exit_code: u8) -> Report {
++    Report {
++        program_version: DIAGNOSTIC_VERSION.to_string(),
++        opensleep_base_version: opensleep::VERSION.to_string(),
++        opensleep_source_commit: source_commit().to_string(),
++        kernel: kernel_release(),
++        arch: std::env::consts::ARCH.to_string(),
++        mode: mode_label.to_string(),
++        dry_run,
++        confirmations: Confirmations::default(),
++        i2c_device: i2c_device.to_string(),
++        i2c_bus_open: false,
++        reset_expander_probe_ok: false,
++        reset_expander_value: None,
++        led_controller_probe_ok: false,
++        subsystem_reset_performed: false,
++        subsystem_reset_ok: false,
++        frozen_port: frozen_port.to_string(),
++        frozen_uart_opened: false,
++        frozen_bootloader_ping: None,
++        frozen_firmware_ping: None,
++        frozen_hardware_info: None,
++        firmware_version_or_hash: None,
++        frozen_firmware_probed: false,
++        detected_initial_mode: None,
++        firmware_jump_sent: false,
++        outgoing_commands: Vec::new(),
++        enabled_target_command_count: 0,
++        prime_command_count: 0,
++        random_command_count: 0,
++        safety_off_commands_sent: 0,
++        rejected_command_count: 0,
++        prime_frame_hex: None,
++        telemetry_samples: Vec::new(),
++        raw_packets_decoded: 0,
++        malformed_windows: 0,
++        communication_timeouts: 0,
++        unsolicited_telemetry_seen: false,
++        firmware_messages: Vec::new(),
++        pump_samples: Vec::new(),
++        solenoid_valve_messages: Vec::new(),
++        reservoir_transition_messages: Vec::new(),
++        other_decoded_packets: Vec::new(),
++        raw_io_events: Vec::new(),
++        priming_start_observed: false,
++        priming_done_observed: false,
++        priming_done_because_empty: false,
++        operator_observations: None,
++        prime_operator_observations: None,
++        stop_reason: stop_reason.to_string(),
++        safe_stop: None,
++        component_results: None,
++        prime_results: None,
++        opensleep_init_results: None,
++        release_frozen_only_results: None,
++        cool_test_results: None,
++        hold_results: None,
++        overall_pass: false,
++        exit_code,
++    }
++}
++
++fn write_json_if_requested(report: &Report, path: Option<&str>) {
++    if let Some(path) = path
++        && let Err(e) = report.write_json(path)
++    {
++        log::error!("failed to write JSON output to {path}: {e}");
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use bytes::{Buf, BytesMut};
++    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
++
++    fn start_args(dry_run: bool) -> HoldStartArgs {
++        HoldStartArgs {
++            target_c: Some(24.0),
++            left_target_c: None,
++            right_target_c: None,
++            i2c_device: "/dev/i2c-1".into(),
++            frozen_port: "/dev/ttyS1".into(),
++            json_output: None,
++            verbose: false,
++            dry_run,
++        }
++    }
++
++    fn stop_args(dry_run: bool) -> HoldStopArgs {
++        HoldStopArgs { frozen_port: "/dev/ttyS1".into(), json_output: None, verbose: false, dry_run }
++    }
++
++    fn status_args(dry_run: bool) -> HoldStatusArgs {
++        HoldStatusArgs { frozen_port: "/dev/ttyS1".into(), json_output: None, verbose: false, dry_run }
++    }
++
++    // -------------------------------------------------------------------------------------------
++    // Target resolution / validation -- no hardware involved.
++    // -------------------------------------------------------------------------------------------
++
++    #[test]
++    fn target_c_produces_exactly_2400_centidegrees_for_both_sides() {
++        let (left_c, right_c) = resolve_requested_targets_c(&start_args(false)).unwrap();
++        assert_eq!(left_c, 24.0);
++        assert_eq!(right_c, 24.0);
++        let left = hold_target_action(BedSide::Left, left_c).unwrap();
++        let right = hold_target_action(BedSide::Right, right_c).unwrap();
++        assert_eq!(left.target_centideg(), Some(2400));
++        assert_eq!(right.target_centideg(), Some(2400));
++    }
++
++    #[test]
++    fn independent_left_and_right_target_c_values_work() {
++        let mut args = start_args(false);
++        args.target_c = None;
++        args.left_target_c = Some(22.5);
++        args.right_target_c = Some(26.75);
++        let (left_c, right_c) = resolve_requested_targets_c(&args).unwrap();
++        assert_eq!(left_c, 22.5);
++        assert_eq!(right_c, 26.75);
++        assert_eq!(hold_target_action(BedSide::Left, left_c).unwrap().target_centideg(), Some(2250));
++        assert_eq!(hold_target_action(BedSide::Right, right_c).unwrap().target_centideg(), Some(2675));
++    }
++
++    #[test]
++    fn no_baseline_is_used_to_calculate_targets() {
++        // The requested target converts directly to centidegrees regardless of any measured
++        // water temperature -- there is no baseline parameter to this function at all, and the
++        // mock device's own baseline (24.50C/24.60C, see mock.rs) never enters the computation.
++        assert_eq!(hold_target_action(BedSide::Left, 24.0).unwrap().target_centideg(), Some(2400));
++        assert_ne!(2400, crate::mock::MOCK_BASELINE_LEFT_CENTIDEG);
++    }
++
++    #[test]
++    fn target_c_conflicts_with_left_and_right_target_c() {
++        let mut args = start_args(false);
++        args.left_target_c = Some(22.0);
++        args.right_target_c = Some(22.0);
++        assert!(resolve_requested_targets_c(&args).is_err());
++    }
++
++    #[test]
++    fn side_specific_targets_require_both_sides() {
++        let mut args = start_args(false);
++        args.target_c = None;
++        args.left_target_c = Some(22.0);
++        assert!(resolve_requested_targets_c(&args).is_err());
++    }
++
++    // -------------------------------------------------------------------------------------------
++    // frozen-hold-start against the shared, correct-by-default mock device.
++    // -------------------------------------------------------------------------------------------
++
++    #[tokio::test]
++    async fn successful_start_sends_exactly_one_enabled_command_per_side_and_no_reset() {
++        let (report, code) = run_start(&start_args(true)).await;
++        assert_eq!(code, 0);
++        assert!(report.overall_pass);
++        let hr = report.hold_results.clone().unwrap();
++        assert!(hr.left_target_confirmed);
++        assert!(hr.right_target_confirmed);
++        assert!(!hr.reset_performed, "an already-responsive Frozen must never be reset");
++        assert_eq!(report.enabled_target_command_count, 2);
++        assert_eq!(report.safety_off_commands_sent, 0);
++        let enabled: Vec<_> = report.outgoing_commands.iter().filter(|c| c.enabled == Some(true)).collect();
++        assert_eq!(enabled.len(), 2);
++        assert!(enabled.iter().any(|c| c.side.as_deref() == Some("left")));
++        assert!(enabled.iter().any(|c| c.side.as_deref() == Some("right")));
++    }
++
++    #[tokio::test]
++    async fn no_pcal_write_when_frozen_is_already_responsive() {
++        let mut i2c = MockI2c::always_succeed();
++        let (client, task) = mock_frozen_link_pair();
++        let mut link = FrozenLink::wrap(client, "test");
++        let left = FrozenAction::hold_target(BedSide::Left, 2400).unwrap();
++        let right = FrozenAction::hold_target(BedSide::Right, 2400).unwrap();
++        let (report, code) = run_start_core(&start_args(true), &mut i2c, &mut link, true, 24.0, 24.0, left, right).await;
++        assert_eq!(code, 0);
++        assert!(i2c.writes.is_empty(), "no I2C write of any kind may happen when Frozen is already responsive");
++        assert!(!report.hold_results.unwrap().reset_performed);
++        drop(link);
++        task.abort();
++    }
++
++    #[tokio::test]
++    async fn register_0x07_is_never_written_even_when_the_reset_fallback_fires() {
++        // A silent device (nothing ever answers Ping) forces ensure_frozen_ready to fall back to
++        // the narrow startup/reset mechanism.
++        let (client, _silent_device_side) = tokio::io::duplex(64);
++        let mut i2c = MockI2c::always_succeed();
++        let mut link = FrozenLink::wrap(client, "test");
++        let left = FrozenAction::hold_target(BedSide::Left, 2400).unwrap();
++        let right = FrozenAction::hold_target(BedSide::Right, 2400).unwrap();
++        let (report, _code) = run_start_core(&start_args(true), &mut i2c, &mut link, true, 24.0, 24.0, left, right).await;
++        assert!(report.hold_results.unwrap().reset_performed);
++        assert!(i2c.writes.iter().all(|(_, reg, _)| *reg != 0x07), "register 0x07 must never be written");
++        assert!(i2c.writes.iter().all(|(_, reg, _)| *reg == 0x02 || *reg == 0x06), "only the narrow bit-1 pulse registers may be written");
++    }
++
++    #[tokio::test]
++    async fn messages_and_tec_lock_text_during_confirmation_do_not_affect_the_result() {
++        let (client, device) = tokio::io::duplex(4096);
++        let task = spawn_scripted_device(device, |opcode, payload| match opcode {
++            0x01 => Some(pong_frame(true)),
++            0x40 if payload.len() == 5 => {
++                let side = if payload[1] == 0 { BedSide::Left } else { BedSide::Right };
++                let temp = u16::from_be_bytes([payload[3], payload[4]]);
++                let mut combined = Vec::new();
++                if side == BedSide::Right {
++                    // Injected exactly ahead of the real confirmation, on the wire, for the
++                    // packet the confirm-loop must skip past without being derailed by.
++                    combined.extend(message_frame("FW: [priming] start"));
++                    combined.extend(message_frame("FW: tec[right] locked (pump)"));
++                }
++                combined.extend(target_update_frame(side, true, temp));
++                Some(combined)
++            }
++            _ => None,
++        });
++
++        let mut i2c = MockI2c::always_succeed();
++        let mut link = FrozenLink::wrap(client, "test");
++        let left = FrozenAction::hold_target(BedSide::Left, 2400).unwrap();
++        let right = FrozenAction::hold_target(BedSide::Right, 2400).unwrap();
++        let (report, code) = run_start_core(&start_args(true), &mut i2c, &mut link, true, 24.0, 24.0, left, right).await;
++        assert_eq!(code, 0);
++        assert!(report.overall_pass);
++        drop(link);
++        task.abort();
++    }
++
++    #[tokio::test]
++    async fn exact_target_mismatch_is_not_confirmed() {
++        let (client, device) = tokio::io::duplex(4096);
++        let task = spawn_scripted_device(device, |opcode, payload| match opcode {
++            0x01 => Some(pong_frame(true)),
++            0x40 if payload.len() == 5 => {
++                let side = if payload[1] == 0 { BedSide::Left } else { BedSide::Right };
++                // Always answers with the wrong temperature.
++                Some(target_update_frame(side, true, 2000))
++            }
++            _ => None,
++        });
++        let mut link = FrozenLink::wrap(client, "test");
++        let mut audit = AuditedTransport::new(Mode::HoldStart);
++        let action = FrozenAction::hold_target(BedSide::Left, 2400).unwrap();
++        let confirmed = send_and_confirm_hold_target(&mut link, &mut audit, BedSide::Left, action).await;
++        assert!(!confirmed);
++        drop(link);
++        task.abort();
++    }
++
++    #[tokio::test]
++    async fn partial_enable_failure_is_rolled_back() {
++        let (client, device) = tokio::io::duplex(4096);
++        let task = spawn_scripted_device(device, |opcode, payload| match opcode {
++            0x01 => Some(pong_frame(true)),
++            0x40 if payload.len() == 5 => {
++                if payload[1] == 0 {
++                    // Left always answers correctly.
++                    let temp = u16::from_be_bytes([payload[3], payload[4]]);
++                    let enabled = payload[2] != 0;
++                    Some(target_update_frame(BedSide::Left, enabled, temp))
++                } else {
++                    // Right: silence, for both the enable attempt and the rollback-triggered
++                    // disable check on the other side (irrelevant here, Left's own disable is
++                    // what this test inspects).
++                    None
++                }
++            }
++            _ => None,
++        });
++
++        let mut i2c = MockI2c::always_succeed();
++        let mut link = FrozenLink::wrap(client, "test");
++        let left = FrozenAction::hold_target(BedSide::Left, 2400).unwrap();
++        let right = FrozenAction::hold_target(BedSide::Right, 2400).unwrap();
++        let (report, code) = run_start_core(&start_args(true), &mut i2c, &mut link, true, 24.0, 24.0, left, right).await;
++        assert_ne!(code, 0);
++        assert!(!report.overall_pass);
++        let hr = report.hold_results.unwrap();
++        assert!(hr.left_target_confirmed);
++        assert!(!hr.right_target_confirmed);
++        assert!(hr.rolled_back);
++        // The rollback disable for Left was actually transmitted, as the very last outgoing
++        // command.
++        let last = report.outgoing_commands.last().expect("at least the rollback disable was sent");
++        assert_eq!(last.side.as_deref(), Some("left"));
++        assert_eq!(last.enabled, Some(false));
++        drop(link);
++        task.abort();
++    }
++
++    #[tokio::test]
++    async fn successful_start_sends_nothing_further_after_confirmation_including_after_uart_loss() {
++        let (report, code) = run_start(&start_args(true)).await;
++        assert_eq!(code, 0);
++        // Exactly the responsiveness Ping plus the two enabled sends -- nothing else was ever
++        // transmitted, and in particular no disable of any kind: nothing left to run after
++        // confirmation would send one regardless of what happens to the transport afterward
++        // (simulated process exit, descriptor close, or a UART loss).
++        assert_eq!(report.outgoing_commands.len(), 3);
++        assert_eq!(report.safety_off_commands_sent, 0);
++        assert!(report.outgoing_commands.iter().filter(|c| c.enabled == Some(true)).count() == 2);
++        assert!(report.outgoing_commands.iter().all(|c| c.enabled != Some(false)));
++    }
++
++    // -------------------------------------------------------------------------------------------
++    // frozen-hold-stop / frozen-hold-status
++    // -------------------------------------------------------------------------------------------
++
++    #[tokio::test]
++    async fn stop_disables_and_confirms_both_sides() {
++        let (report, code) = run_stop(&stop_args(true)).await;
++        assert_eq!(code, 0);
++        let hr = report.hold_results.unwrap();
++        assert!(hr.left_disabled_confirmed);
++        assert!(hr.right_disabled_confirmed);
++        assert_eq!(report.safety_off_commands_sent, 2);
++    }
++
++    #[tokio::test]
++    async fn status_sends_zero_control_commands() {
++        let (report, code) = run_status(&status_args(true)).await;
++        assert_eq!(code, 0);
++        assert_eq!(report.enabled_target_command_count, 0);
++        assert_eq!(report.safety_off_commands_sent, 0);
++        assert!(report.outgoing_commands.iter().all(|c| !c.command_name.starts_with("SetTargetTemperature")));
++    }
++
++    // -------------------------------------------------------------------------------------------
++    // Test helpers: a minimal scriptable fake Frozen device for cases the shared, correct-by-
++    // default mock (`mock::spawn_mock_frozen_device`) can't produce (wrong replies, silence for
++    // one side, injected messages ahead of a confirmation).
++    // -------------------------------------------------------------------------------------------
++
++    fn target_update_frame(side: BedSide, enabled: bool, temp: u16) -> Vec<u8> {
++        let s: u8 = if side == BedSide::Left { 0 } else { 1 };
++        let t = temp.to_be_bytes();
++        opensleep::common::codec::command(vec![0xC0, 0x00, s, enabled as u8, t[0], t[1]])
++    }
++
++    fn message_frame(text: &str) -> Vec<u8> {
++        let mut payload = vec![0x07u8, 0x00];
++        payload.extend_from_slice(text.as_bytes());
++        opensleep::common::codec::command(payload)
++    }
++
++    fn pong_frame(in_firmware: bool) -> Vec<u8> {
++        let code: u8 = if in_firmware { 0b0100_0110 } else { 0b0100_0010 };
++        opensleep::common::codec::command(vec![0x81, 0x00, code])
++    }
++
++    fn spawn_scripted_device(
++        mut device_side: DuplexStream,
++        mut respond: impl FnMut(u8, &[u8]) -> Option<Vec<u8>> + Send + 'static,
++    ) -> tokio::task::JoinHandle<()> {
++        tokio::spawn(async move {
++            let mut acc = BytesMut::new();
++            let mut read_buf = [0u8; 256];
++            loop {
++                if acc.len() >= 2 {
++                    let len = acc[1] as usize;
++                    let total = 1 + 1 + len + 2;
++                    if acc.len() >= total {
++                        let opcode = acc[2];
++                        let payload = acc[2..2 + len].to_vec();
++                        acc.advance(total);
++                        if let Some(resp) = respond(opcode, &payload)
++                            && device_side.write_all(&resp).await.is_err()
++                        {
++                            break;
++                        }
++                        continue;
++                    }
++                }
++                match device_side.read(&mut read_buf).await {
++                    Ok(0) | Err(_) => break,
++                    Ok(n) => acc.extend_from_slice(&read_buf[..n]),
++                }
++            }
++        })
 +    }
 +}
 diff --git a/src/bin/opensleep-diagnostic/frozen_ops.rs b/src/bin/opensleep-diagnostic/frozen_ops.rs
@@ -10713,10 +11826,10 @@ index 0000000..216770e
 +}
 diff --git a/src/bin/opensleep-diagnostic/main.rs b/src/bin/opensleep-diagnostic/main.rs
 new file mode 100644
-index 0000000..bc751fd
+index 0000000..823bf08
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/main.rs
-@@ -0,0 +1,401 @@
+@@ -0,0 +1,417 @@
 +//! opensleep-diagnostic: a staged hardware diagnostic for an Eight Sleep Pod 3 Hub, historically
 +//! Frozen-only and now also covering the Sensor subsystem.
 +//!
@@ -10753,6 +11866,7 @@ index 0000000..bc751fd
 +mod cool_test;
 +mod emergency_stop;
 +mod frozen_compat;
++mod frozen_hold;
 +mod frozen_ops;
 +mod frozen_startup;
 +mod guard;
@@ -10790,6 +11904,9 @@ index 0000000..bc751fd
 +        Commands::FrozenPrimeOpenSleepInit(a) => a.verbose,
 +        Commands::InternalCoolTestGuard(a) => a.verbose,
 +        Commands::SensorProbe(a) => a.verbose,
++        Commands::FrozenHoldStart(a) => a.verbose,
++        Commands::FrozenHoldStop(a) => a.verbose,
++        Commands::FrozenHoldStatus(a) => a.verbose,
 +    };
 +    buildinfo::init_logging(verbose);
 +    signals::install_panic_hook();
@@ -10837,6 +11954,18 @@ index 0000000..bc751fd
 +            Commands::InternalCoolTestGuard(args) => guard::run(&args).await,
 +            Commands::SensorProbe(args) => {
 +                let (_, code) = sensor_probe::run(&args).await;
++                code
++            }
++            Commands::FrozenHoldStart(args) => {
++                let (_, code) = frozen_hold::run_start(&args).await;
++                code
++            }
++            Commands::FrozenHoldStop(args) => {
++                let (_, code) = frozen_hold::run_stop(&args).await;
++                code
++            }
++            Commands::FrozenHoldStatus(args) => {
++                let (_, code) = frozen_hold::run_status(&args).await;
 +                code
 +            }
 +        }
@@ -11666,10 +12795,10 @@ index 0000000..910d8c6
 +}
 diff --git a/src/bin/opensleep-diagnostic/passive.rs b/src/bin/opensleep-diagnostic/passive.rs
 new file mode 100644
-index 0000000..dbe251f
+index 0000000..1e2ce9e
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/passive.rs
-@@ -0,0 +1,443 @@
+@@ -0,0 +1,444 @@
 +//! `frozen-passive`: safe with the cover disconnected and no water. Never constructs an enabled
 +//! `SetTargetTemperature`; the only actuator-shaped command it can ever send is the disabled
 +//! (`enabled=false`) safety-off, which both `AuditedTransport` and the closed `FrozenAction` enum
@@ -12057,6 +13186,7 @@ index 0000000..dbe251f
 +        opensleep_init_results: None,
 +        release_frozen_only_results: None,
 +        cool_test_results: None,
++        hold_results: None,
 +        overall_pass: false,
 +        exit_code: exit_code_override.unwrap_or(30),
 +    }
@@ -12115,10 +13245,10 @@ index 0000000..dbe251f
 +}
 diff --git a/src/bin/opensleep-diagnostic/prime_opensleep_init.rs b/src/bin/opensleep-diagnostic/prime_opensleep_init.rs
 new file mode 100644
-index 0000000..268213c
+index 0000000..74b5525
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/prime_opensleep_init.rs
-@@ -0,0 +1,1394 @@
+@@ -0,0 +1,1395 @@
 +//! `frozen-prime-opensleep-init`: fills an empty or partially-filled hydraulic loop by sending
 +//! `Prime` exactly once, through the real, unmodified upstream OpenSleep initialization and Frozen
 +//! manager code -- `opensleep::reset::ResetController::reset_subsystems`, `opensleep::led`,
@@ -13166,6 +14296,7 @@ index 0000000..268213c
 +        opensleep_init_results: None,
 +        release_frozen_only_results: None,
 +        cool_test_results: None,
++        hold_results: None,
 +        overall_pass: false,
 +        exit_code: 30,
 +    }
@@ -13515,10 +14646,10 @@ index 0000000..268213c
 +}
 diff --git a/src/bin/opensleep-diagnostic/prime_test.rs b/src/bin/opensleep-diagnostic/prime_test.rs
 new file mode 100644
-index 0000000..e668cde
+index 0000000..eddfb31
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/prime_test.rs
-@@ -0,0 +1,1502 @@
+@@ -0,0 +1,1504 @@
 +//! `frozen-prime-test`: the one subcommand that intentionally sends `Prime` (opcode 0x52) to fill
 +//! an empty or partially-filled Eight Sleep Pod 3 hydraulic loop. See SAFETY.md for the
 +//! operator-facing guarantees and PROTOCOL_AUDIT.md for the full source audit behind every claim
@@ -14453,6 +15584,7 @@ index 0000000..e668cde
 +        opensleep_init_results: None,
 +        release_frozen_only_results: None,
 +        cool_test_results: None,
++        hold_results: None,
 +        overall_pass,
 +        exit_code: 0,
 +    };
@@ -14532,6 +15664,7 @@ index 0000000..e668cde
 +        opensleep_init_results: None,
 +        release_frozen_only_results: None,
 +        cool_test_results: None,
++        hold_results: None,
 +        overall_pass: false,
 +        exit_code: 30,
 +    }
@@ -15023,10 +16156,10 @@ index 0000000..e668cde
 +}
 diff --git a/src/bin/opensleep-diagnostic/report.rs b/src/bin/opensleep-diagnostic/report.rs
 new file mode 100644
-index 0000000..ff1b83d
+index 0000000..ba8ad6a
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/report.rs
-@@ -0,0 +1,1146 @@
+@@ -0,0 +1,1182 @@
 +//! Structured JSON/CSV/text reporting shared by all three subcommands. Machine evidence (audit
 +//! log, decoded telemetry) is always kept in separate fields from operator-entered observations,
 +//! per the safety model: a component may only be marked PASS from decoded evidence or an explicit
@@ -15717,6 +16850,39 @@ index 0000000..ff1b83d
 +    }
 +}
 +
++/// `frozen-hold-start`/`frozen-hold-stop`/`frozen-hold-status`'s own result block. `action`
++/// distinguishes which of the three produced it. Populated fields vary by action: `start` fills
++/// the requested/confirmed-target and rollback fields; `stop` fills the disable-confirmation
++/// fields; `status` fills the read-only telemetry fields. Fields not applicable to the action that
++/// ran are left at their default (`None`/`false`).
++#[derive(Debug, Clone, Serialize, Default)]
++pub struct HoldResults {
++    pub action: String,
++    pub requested_left_target_c: Option<f64>,
++    pub requested_right_target_c: Option<f64>,
++    /// `true` iff `TargetUpdate(Left, enabled=true, temp=<requested>)` was received -- exact
++    /// match, not merely "some reply arrived". `start` only.
++    pub left_target_confirmed: bool,
++    pub right_target_confirmed: bool,
++    /// `true` iff this run pulsed Frozen's reset bit via the narrow startup mechanism because the
++    /// initial no-reset Ping probe found Frozen unresponsive. `false` whenever a responsive
++    /// Frozen was left untouched -- see `frozen_hold.rs` module docs. `start` only.
++    pub reset_performed: bool,
++    /// `true` iff a partial-transaction rollback (disabling an already-confirmed side after the
++    /// other side failed to confirm) occurred. `start` only.
++    pub rolled_back: bool,
++    /// `true` iff `TargetUpdate(<side>, enabled=false)` was received for that side. `stop` only.
++    pub left_disabled_confirmed: bool,
++    pub right_disabled_confirmed: bool,
++    /// `true` iff Frozen answered Ping at all (bootloader or firmware). `stop`/`status`.
++    pub frozen_responsive: bool,
++    /// Read-only telemetry, from `GetTemperatures`/an unsolicited `TemperatureUpdate`. `status`
++    /// only.
++    pub left_water_c: Option<f64>,
++    pub right_water_c: Option<f64>,
++    pub heatsink_c: Option<f64>,
++}
++
 +#[derive(Debug, Clone, Serialize, Default)]
 +pub struct Confirmations {
 +    pub cover_hydraulics_connected_declared: Option<bool>,
@@ -15825,6 +16991,9 @@ index 0000000..ff1b83d
 +    /// mode's narrower startup/shutdown); this struct adds the detailed numeric/telemetry fields
 +    /// (baseline/min/final temperatures, requested vs. actual duration, reservoir status, ...).
 +    pub cool_test_results: Option<CoolTestResults>,
++    /// Set only for a `frozen-hold-start`/`frozen-hold-stop`/`frozen-hold-status` run -- always
++    /// `None` otherwise.
++    pub hold_results: Option<HoldResults>,
 +    pub overall_pass: bool,
 +    pub exit_code: u8,
 +}
@@ -16384,10 +17553,10 @@ index 0000000..d403a88
 +}
 diff --git a/src/bin/opensleep-diagnostic/safety.rs b/src/bin/opensleep-diagnostic/safety.rs
 new file mode 100644
-index 0000000..dc28de5
+index 0000000..a411409
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/safety.rs
-@@ -0,0 +1,686 @@
+@@ -0,0 +1,756 @@
 +//! Structural enforcement of the per-mode Frozen command whitelist.
 +//!
 +//! Three independent layers keep everything except the documented command set unreachable:
@@ -16460,6 +17629,20 @@ index 0000000..dc28de5
 +    /// `Passive` permits. Never permits an enabled `SetTargetTemperature`: this mode primes the
 +    /// hydraulic loop, it does not run a cooling/heating test.
 +    PrimeTest,
++    /// `frozen-hold-start`: permits Ping/GetHardwareInfo/GetFirmware/JumpToFirmware/GetTemperatures
++    /// (used only by the initial no-reset responsiveness probe and the narrow-startup fallback),
++    /// `SafetyOff` (used only for partial-transaction rollback), and `HoldTarget` for either side.
++    /// Never `Prime`.
++    HoldStart,
++    /// `frozen-hold-stop`: permits only `Ping` (used to check responsiveness before disabling --
++    /// never to reset a responsive Frozen) and `SafetyOff` for either side. Never an enabled
++    /// target, never `Prime`.
++    HoldStop,
++    /// `frozen-hold-status`: strictly non-controlling. Permits only
++    /// Ping/GetHardwareInfo/GetFirmware/JumpToFirmware/GetTemperatures -- never `SafetyOff`, never
++    /// `HoldTarget`, never `Prime`. Safe to run at any time, including while `frozen-hold-start`'s
++    /// targets remain active.
++    HoldStatus,
 +}
 +
 +impl Mode {
@@ -16479,6 +17662,9 @@ index 0000000..dc28de5
 +            Mode::CoolTest { .. } => "frozen-cool-test",
 +            Mode::EmergencyStop => "emergency-stop",
 +            Mode::PrimeTest => "frozen-prime-test",
++            Mode::HoldStart => "frozen-hold-start",
++            Mode::HoldStop => "frozen-hold-stop",
++            Mode::HoldStatus => "frozen-hold-status",
 +        }
 +    }
 +}
@@ -16497,6 +17683,17 @@ index 0000000..dc28de5
 +        side: BedSide,
 +    },
 +    EnableCooling {
++        side: BedSide,
++        target_centideg: u16,
++    },
++    /// Persistent, firmware-owned absolute-temperature target -- `frozen-hold-start` only. Unlike
++    /// `EnableCooling` (which derives its target from a measured baseline minus a delta, and
++    /// refuses a non-positive delta since "heating is not implemented by this tool"), this takes
++    /// the operator's requested absolute target directly: no baseline measurement, no delta, and
++    /// no cooling-only restriction. Validated against the same absolute backstop range as
++    /// `EnableCooling` (see [`validate_absolute_target_centideg`]) -- deliberately the same range,
++    /// not a separately invented one.
++    HoldTarget {
 +        side: BedSide,
 +        target_centideg: u16,
 +    },
@@ -16522,6 +17719,19 @@ index 0000000..dc28de5
 +    }
 +}
 +impl std::error::Error for CoolingLimitError {}
++
++/// Shared absolute-range backstop used by both [`FrozenAction::enable_cooling`] (target computed
++/// from baseline minus delta) and [`FrozenAction::hold_target`] (target supplied directly): a
++/// conservative 0-45C envelope, independent of whatever range check the caller already did. There
++/// is exactly one operating-range constant in this binary; nothing invents a second one.
++fn validate_absolute_target_centideg(target: i32) -> Result<u16, CoolingLimitError> {
++    if !(0..=4500).contains(&target) {
++        return Err(CoolingLimitError(format!(
++            "target {target} centidegrees C is outside the conservative 0-45C backstop range"
++        )));
++    }
++    Ok(target as u16)
++}
 +
 +impl FrozenAction {
 +    pub fn ping() -> Self {
@@ -16567,17 +17777,17 @@ index 0000000..dc28de5
 +            )));
 +        }
 +        let target = i32::from(baseline_centideg) - delta_centideg;
-+        // Absolute backstop, independent of the caller's own baseline-range validation: refuse a
-+        // target outside a wide but still conservative 0-45C envelope.
-+        if !(0..=4500).contains(&target) {
-+            return Err(CoolingLimitError(format!(
-+                "computed target {target} centidegrees C is outside the conservative 0-45C backstop range"
-+            )));
-+        }
-+        Ok(FrozenAction::EnableCooling {
-+            side,
-+            target_centideg: target as u16,
-+        })
++        let target_centideg = validate_absolute_target_centideg(target)?;
++        Ok(FrozenAction::EnableCooling { side, target_centideg })
++    }
++
++    /// Validates and builds the persistent, firmware-owned absolute target `frozen-hold-start`
++    /// sends: no baseline, no delta -- `target_centideg` is exactly what the operator requested
++    /// (converted from degrees C by the caller), checked only against the same absolute 0-45C
++    /// backstop [`Self::enable_cooling`] uses (see [`validate_absolute_target_centideg`]).
++    pub fn hold_target(side: BedSide, target_centideg: i32) -> Result<Self, CoolingLimitError> {
++        let target_centideg = validate_absolute_target_centideg(target_centideg)?;
++        Ok(FrozenAction::HoldTarget { side, target_centideg })
 +    }
 +
 +    pub fn to_command(&self) -> FrozenCommand {
@@ -16604,6 +17814,13 @@ index 0000000..dc28de5
 +                    temp: *target_centideg,
 +                },
 +            },
++            FrozenAction::HoldTarget { side, target_centideg } => FrozenCommand::SetTargetTemperature {
++                side: *side,
++                tar: FrozenTarget {
++                    enabled: true,
++                    temp: *target_centideg,
++                },
++            },
 +            FrozenAction::Prime => FrozenCommand::Prime,
 +        }
 +    }
@@ -16617,6 +17834,7 @@ index 0000000..dc28de5
 +            FrozenAction::GetTemperatures => "GetTemperatures",
 +            FrozenAction::SafetyOff { .. } => "SetTargetTemperature(disable)",
 +            FrozenAction::EnableCooling { .. } => "SetTargetTemperature(enable)",
++            FrozenAction::HoldTarget { .. } => "SetTargetTemperature(hold)",
 +            FrozenAction::Prime => "Prime",
 +        }
 +    }
@@ -16625,6 +17843,7 @@ index 0000000..dc28de5
 +        match self {
 +            FrozenAction::SafetyOff { side } => Some(*side),
 +            FrozenAction::EnableCooling { side, .. } => Some(*side),
++            FrozenAction::HoldTarget { side, .. } => Some(*side),
 +            _ => None,
 +        }
 +    }
@@ -16633,6 +17852,7 @@ index 0000000..dc28de5
 +        match self {
 +            FrozenAction::SafetyOff { .. } => Some(false),
 +            FrozenAction::EnableCooling { .. } => Some(true),
++            FrozenAction::HoldTarget { .. } => Some(true),
 +            _ => None,
 +        }
 +    }
@@ -16643,6 +17863,7 @@ index 0000000..dc28de5
 +            FrozenAction::EnableCooling {
 +                target_centideg, ..
 +            } => Some(*target_centideg),
++            FrozenAction::HoldTarget { target_centideg, .. } => Some(*target_centideg),
 +            _ => None,
 +        }
 +    }
@@ -16662,6 +17883,7 @@ index 0000000..dc28de5
 +                BedSide::Left => left_allowed,
 +                BedSide::Right => right_allowed,
 +            },
++            HoldTarget { .. } => false,
 +            Prime => false,
 +        },
 +        Mode::EmergencyStop => matches!(action, SafetyOff { .. }),
@@ -16670,6 +17892,23 @@ index 0000000..dc28de5
 +        Mode::PrimeTest => matches!(
 +            action,
 +            Ping | GetHardwareInfo | GetFirmware | JumpToFirmware | GetTemperatures | SafetyOff { .. } | Prime
++        ),
++        // frozen-hold-start: the no-reset responsiveness probe and narrow-startup fallback need
++        // Ping/GetHardwareInfo/GetFirmware/JumpToFirmware/GetTemperatures; SafetyOff is permitted
++        // only for partial-transaction rollback; HoldTarget for either side is the whole point.
++        // Never Prime.
++        Mode::HoldStart => matches!(
++            action,
++            Ping | GetHardwareInfo | GetFirmware | JumpToFirmware | GetTemperatures | SafetyOff { .. } | HoldTarget { .. }
++        ),
++        // frozen-hold-stop: Ping only to check responsiveness (never to justify a reset), plus the
++        // two disable commands. Never an enabled target, never Prime.
++        Mode::HoldStop => matches!(action, Ping | SafetyOff { .. }),
++        // frozen-hold-status: strictly non-controlling. Never SafetyOff, never HoldTarget, never
++        // Prime.
++        Mode::HoldStatus => matches!(
++            action,
++            Ping | GetHardwareInfo | GetFirmware | JumpToFirmware | GetTemperatures
 +        ),
 +    }
 +}

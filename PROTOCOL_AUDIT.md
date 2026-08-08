@@ -111,6 +111,12 @@ unaffected. Raw packet buffers remain available for any frame, known or not, onl
 | `Prime` | `0x52` | `7E 01 52 B6 2B` | **never reachable** | **never reachable** | yes, **at most once per run** | **never reachable** |
 | `Random(_)` | any | — | **never reachable**: no `FrozenAction::Random` exists | **never reachable** | **never reachable** | **never reachable** |
 
+`frozen-hold-start`/`frozen-hold-stop`/`frozen-hold-status` (revision 22) are not columns in the
+table above -- they run under their own `Mode::HoldStart`/`Mode::HoldStop`/`Mode::HoldStatus`, not
+any of the four modes it covers. See SAFETY.md's command-whitelist table (now includes all three)
+and the "`frozen-hold-start`: the one deliberate absolute-target exception" section below for the
+full audit of what they add.
+
 Disable frame (`enabled=false`, temp field `0x0000`): `7E 05 40 00 00 00 00 <chk_hi> <chk_lo>`.
 Enable frame example (`side=Left(0x00)`, `enabled=true`, `temp=3600` i.e. 36.00C):
 `7E 05 40 00 01 0E 10 E6 A8` — this exact frame (and its checksum) is asserted byte-for-byte by
@@ -178,18 +184,52 @@ so even a hypothetical future bug that somehow produced a `Prime` frame through 
 would still be refused unless it also passed the mode and at-most-once checks above, which run
 first.
 
-### Why "no absolute target" and "no simultaneous both-sides" are structural
+### Why "no absolute target" and "no simultaneous both-sides" are structural (`EnableCooling`; `frozen-cool-test` only)
 
 `FrozenAction::EnableCooling`'s fields are private; the only public constructor is
 `FrozenAction::enable_cooling(side, baseline_centideg, delta_centideg)`, which computes
 `target = baseline - delta` and refuses (returns `Err`) if `delta` exceeds `MAX_COOL_DELTA_CENTIDEG`
 (200 = 2.0C) or is negative, or if the computed target falls outside a 0–45C backstop. There is no
-constructor that accepts a caller-supplied absolute target.
+`EnableCooling` constructor that accepts a caller-supplied absolute target -- revision 22's
+`FrozenAction::HoldTarget` (see below) is a *separate, independent* variant that does, deliberately,
+and is unreachable outside `Mode::HoldStart`; it does not weaken this claim about `EnableCooling`/
+`frozen-cool-test`.
 
 `Mode::CoolTest { side }` is fixed at construction of the whole run's `AuditedTransport` (from the
 CLI's single `--side` flag) and `AuditedTransport::check` only allows `EnableCooling` when its
 `side` matches that fixed value — so a single process invocation cannot enable both sides even if
-it tried, and there is no flag to select "both".
+it tried, and there is no flag to select "both". `frozen-hold-start` is different by design: it
+always targets both sides in the same run (see below), through `HoldTarget`, never `EnableCooling`.
+
+## `frozen-hold-start`: the one deliberate absolute-target exception
+
+Revision 22 adds `FrozenAction::HoldTarget { side, target_centideg }`, constructed only through
+`FrozenAction::hold_target(side, target_centideg)`. Unlike `EnableCooling`, this constructor takes
+the target directly -- no baseline, no delta -- because `frozen-hold-start`'s whole purpose is
+letting an operator set a fixed absolute target for Frozen firmware to own indefinitely, not run a
+bounded, host-observed cooling test. It still shares `EnableCooling`'s validation, not a separately
+invented range: both call the same extracted `safety::validate_absolute_target_centideg`, the
+conservative 0–45C backstop. `HoldTarget` serializes to the identical `FrozenCommand::
+SetTargetTemperature { enabled: true, .. }` wire frame `EnableCooling` produces -- there is no new
+opcode, only a new host-side reason (an explicit operator request instead of baseline-minus-delta)
+to send the existing one.
+
+`allowed_in_mode` permits `HoldTarget` in exactly one mode, `Mode::HoldStart` -- an exhaustive
+`match` over every `FrozenAction` variant in `Mode::CoolTest`'s own arm explicitly refuses it
+(`HoldTarget { .. } => false`), and `Mode::Passive`/`Mode::EmergencyStop`/`Mode::PrimeTest`/
+`Mode::HoldStop`/`Mode::HoldStatus` never list it at all, so it is unreachable there by the same
+"missing arm fails to compile" structural guarantee `Prime`'s audit above relies on.
+
+`frozen-hold-start` sends `HoldTarget` at most twice per run (once per side) and requires an *exact*
+matching `TargetUpdate(side, enabled=true, temp=<requested>)` for each before declaring success --
+not merely "some reply arrived" -- exactly the same confirmation discipline `--firmware-authoritative`
+already established for `frozen-cool-test`'s own enable step (see that mode's docs above). Once both
+sides are confirmed, the process sends nothing further and exits; see SAFETY.md's revision 22
+section for the full "no further command of any kind" enumeration and its proof
+(`successful_start_sends_nothing_further_after_confirmation_including_after_uart_loss`).
+
+`frozen-hold-stop` never constructs `HoldTarget` at all -- only `SafetyOff`, the same disable action
+every other mode already uses. `frozen-hold-status` constructs neither.
 
 ## `Prime`: full source audit
 

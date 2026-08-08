@@ -266,12 +266,12 @@ into code that hardcodes real serial ports or I2C devices.
 ## Command whitelist — the complete list of commands this binary's audited transport can ever send
 
 Every outgoing Frozen command sent by `frozen-passive`, `frozen-cool-test`, `frozen-prime-test`,
-`frozen-prime-opensleep-init --release-frozen-only`, and `emergency-stop` passes through
-`safety::AuditedTransport::check`, which enforces a fixed per-mode whitelist (see
-`src/bin/opensleep-diagnostic/safety.rs`). Plain `frozen-prime-opensleep-init` (without
-`--release-frozen-only`) is the one exception -- it never uses `AuditedTransport` at all; see its
-own section above for what governs it instead. The full command, opcode, and evidence table for
-the audited modes is in `PROTOCOL_AUDIT.md`; in summary:
+`frozen-prime-opensleep-init --release-frozen-only`, `emergency-stop`, `frozen-hold-start`,
+`frozen-hold-stop`, and `frozen-hold-status` passes through `safety::AuditedTransport::check`,
+which enforces a fixed per-mode whitelist (see `src/bin/opensleep-diagnostic/safety.rs`). Plain
+`frozen-prime-opensleep-init` (without `--release-frozen-only`) is the one exception -- it never
+uses `AuditedTransport` at all; see its own section above for what governs it instead. The full
+command, opcode, and evidence table for the audited modes is in `PROTOCOL_AUDIT.md`; in summary:
 
 | Mode | Permitted commands |
 |---|---|
@@ -279,17 +279,23 @@ the audited modes is in `PROTOCOL_AUDIT.md`; in summary:
 | `frozen-cool-test` | everything `frozen-passive` permits, **plus** `SetTargetTemperature(enabled=true)` for exactly the one side selected at the CLI (fixed for the whole run; the other side can only ever be sent `enabled=false`) |
 | `frozen-prime-test`, `--release-frozen-only` (both run as `Mode::PrimeTest`) | everything `frozen-passive` permits, **plus** `Prime`, at most once per run |
 | `emergency-stop` | `SetTargetTemperature(enabled=false)` for LEFT and RIGHT, and the `0x20` reset-assert write only |
+| `frozen-hold-start` (revision 22) | `Ping`, `GetHardwareInfo`, `GetFirmware`, `JumpToFirmware`, `GetTemperatures` (the no-reset responsiveness probe and narrow-startup fallback), `SetTargetTemperature(enabled=false)` (rollback only), and the one absolute, non-derived `SetTargetTemperature(enabled=true)` target for either side -- see the revision 22 section below |
+| `frozen-hold-stop` (revision 22) | `Ping` (logging only, never gates a reset), `SetTargetTemperature(enabled=false)` for LEFT and RIGHT |
+| `frozen-hold-status` (revision 22) | `Ping`, `GetHardwareInfo`, `GetFirmware`, `JumpToFirmware`, `GetTemperatures` only -- never any `SetTargetTemperature` |
 
-**Never reachable through `AuditedTransport`, in any of the five audited modes:** `Random(_)`, any
-raw/undocumented opcode, an absolute (non-derived) temperature target, or a simultaneously-enabled
-left+right target.
+**Never reachable through `AuditedTransport`, in any of `frozen-passive`, `frozen-cool-test`,
+`frozen-prime-test`/`--release-frozen-only`, `emergency-stop`, or `frozen-hold-stop`/
+`frozen-hold-status`:** `Random(_)`, any raw/undocumented opcode, an absolute (non-derived)
+temperature target, or a simultaneously-enabled left+right target. `frozen-hold-start` is the one
+deliberate, narrow exception to "no absolute target": it exists specifically to send one, exactly
+once per side, per its own spec -- see the revision 22 section below for the closed `HoldTarget`
+constructor and its own validation.
 **`Prime` (`0x52`)** is reachable through `AuditedTransport` in exactly one runtime mode
 (`Mode::PrimeTest`, constructed by `frozen-prime-test` and by `--release-frozen-only`, at most once
-per run either way) — never in `frozen-passive`, `frozen-cool-test`, or `emergency-stop`. This is
-enforced structurally in two independent layers (a closed `FrozenAction` enum, plus the runtime
-whitelist gate with its own at-most-once check for `Prime`), not by
-convention — see `safety::tests` and
-PROTOCOL_AUDIT.md.
+per run either way) — never in `frozen-passive`, `frozen-cool-test`, `emergency-stop`, or any of the
+three `frozen-hold-*` modes. This is enforced structurally in two independent layers (a closed
+`FrozenAction` enum, plus the runtime whitelist gate with its own at-most-once check for `Prime`),
+not by convention — see `safety::tests` and PROTOCOL_AUDIT.md.
 
 `sensor-probe` is entirely separate from `AuditedTransport`/`FrozenAction` above -- it speaks a
 different protocol over a different UART, gated by its own closed `SensorProbeAction` enum and
@@ -925,6 +931,67 @@ register, exactly as this Hub's own hardware already has it:
   same framing as every other "still silent" result this tool reports), `frozen_alive_sensor_silent`,
   and the shared `expander_verification_failed`.
 
+### Revision 22: `frozen-hold-start`/`frozen-hold-stop`/`frozen-hold-status` -- persistent, firmware-owned absolute-temperature control
+
+Every prior active mode is a bounded, host-observed session: `frozen-cool-test` runs for a
+requested duration and then disables; `frozen-prime-test`/`--release-frozen-only` send `Prime`
+once and observe completion. Revision 22 adds a genuinely different shape: a one-shot
+*configuration transaction* that sets a fixed target and then gets out of the way, leaving Frozen
+firmware to run the target indefinitely on its own -- exactly how stock OpenSleep's own scheduled
+`SetTargetTemperature` calls already work (`opensleep::frozen::manager::get_next_command`), just
+triggered explicitly by an operator instead of a time-of-day schedule.
+
+* **`frozen-hold-start --target-c <C>` (or `--left-target-c`/`--right-target-c` together) sends one
+  absolute target per side, requires an *exact* matching `TargetUpdate(side, enabled=true,
+  temp=<requested>)` for each, and exits.** No baseline measurement, no delta computation -- the
+  requested Celsius value converts directly to centidegrees and is validated by the new
+  `FrozenAction::hold_target` constructor against the *same* absolute 0-45C backstop
+  `frozen-cool-test`'s own `--target-c` already used (`safety::validate_absolute_target_centideg`,
+  extracted from `enable_cooling` -- one operating-range constant, not two). `--target-c` cannot be
+  combined with `--left-target-c`/`--right-target-c`; the latter two must both be supplied together.
+* **After both targets are confirmed, this process sends zero further Frozen commands of any kind
+  and exits.** No disable, no `SafetyOff`, no independent shutdown guard, no `Drop`-based shutdown
+  behavior, no duration timer, no firmware-message interpretation, no pump/TEC/fan observer, no
+  target-attainment logic, no host thermal watchdog, and no reaction to priming or
+  `tec[...] locked (pump)` messages -- there is no code path left to run once
+  `run_start_core` returns, regardless of what happens to the transport afterward (process exit,
+  descriptor close, or a UART disconnect), proven by
+  `successful_start_sends_nothing_further_after_confirmation_including_after_uart_loss` and
+  `messages_and_tec_lock_text_during_confirmation_do_not_affect_the_result`.
+* **Never resets a Frozen that is already responsive.** Unlike `frozen-cool-test`/
+  `--release-frozen-only` (which always pulse the narrow bit-1 reset on entry), `frozen-hold-start`
+  may be adjusting targets on a Frozen a previous `frozen-hold-start` already brought up and is
+  actively regulating -- resetting it would interrupt live thermal control. Startup here is
+  "probe first, reset only if silent": up to three bounded, reset-free Pings run first
+  (`frozen_hold::probe_responsive_without_reset`, `Mode::HoldStart`); only if Frozen never answers
+  does this fall back to the already-audited narrow startup/reset mechanism
+  (`frozen_startup::start_frozen_narrow`, unmodified, reused exactly as `frozen-cool-test`/
+  `--release-frozen-only` already do). `reset_performed` in the report distinguishes the two paths.
+  Never reintroduces the historical whole-register PCAL initialization, and never writes register
+  `0x07` -- proven for both the responsive (`no_pcal_write_when_frozen_is_already_responsive`) and
+  silent-then-reset (`register_0x07_is_never_written_even_when_the_reset_fallback_fires`) paths.
+* **Partial-transaction rollback, but only before success is declared.** If Left confirms and Right
+  does not, Left is disabled again (best-effort) and the run reports failure
+  (`partial_enable_failure_is_rolled_back`). Once *both* targets have been confirmed and success
+  printed, automatic rollback is structurally impossible: the function has already returned.
+* **`frozen-hold-stop`** Pings first (logging only -- never to justify a reset), then sends the
+  disable command for LEFT and RIGHT repeatedly (three attempts with short spacing, then a bounded
+  drain window for a further unsolicited confirmation) -- the same repeated-disable-and-confirm
+  shape `frozen-cool-test`'s own controlled shutdown uses, reimplemented independently
+  (`frozen_hold::disable_both_and_confirm`) rather than calling into `cool_test.rs` directly, since
+  unlike that shutdown path this one must never parse firmware message text and must never fall
+  back to asserting the I2C reset. Exits successfully only once both sides' disable is confirmed.
+* **`frozen-hold-status` is strictly non-controlling**: `Ping`/`GetTemperatures` only
+  (`Mode::HoldStatus` permits nothing else -- no `SafetyOff`, no `HoldTarget`, no `Prime`), never
+  touches PCAL state, and is safe to run at any time, including while `frozen-hold-start`'s targets
+  remain active (`status_sends_zero_control_commands`).
+* **New closed action**: `FrozenAction::HoldTarget { side, target_centideg }`, constructed only via
+  `FrozenAction::hold_target`, mapped to the same `FrozenCommand::SetTargetTemperature` wire format
+  every other enabled target uses -- there is no new opcode, only a new host-side reason to send the
+  existing one. Permitted only in `Mode::HoldStart`; refused everywhere else, including
+  `frozen-cool-test`, by the same exhaustive per-mode whitelist match every other action already
+  goes through.
+
 ## What no subcommand ever does, including `frozen-prime-opensleep-init`
 
 * **Never open the Sensor subsystem UART or reference it at all, in any mode, except
@@ -939,17 +1006,19 @@ register, exactly as this Hub's own hardware already has it:
 * Never write to the `0x53` LED controller other than through the real, already-nonfatal upstream
   code path (`frozen-prime-opensleep-init`) or a read-only, nonfatal probe (every other mode).
 
-## What `frozen-passive`, `frozen-cool-test`, `frozen-prime-test`, and `emergency-stop` never do
+## What `frozen-passive`, `frozen-cool-test`, `frozen-prime-test`, `emergency-stop`, and `frozen-hold-start`/`frozen-hold-stop`/`frozen-hold-status` never do
 
 * Never load the operator's own saved configuration file, never connect to MQTT, never run the
   Home Assistant integration.
 * Never call the real Frozen manager's command-scheduling loop or any profile/scheduled-priming
   logic -- `frozen-prime-test` only ever sends one manually-confirmed `Prime`, nothing resembling
-  the daily-scheduled automatic priming stock OpenSleep performs.
+  the daily-scheduled automatic priming stock OpenSleep performs; `frozen-hold-start` only ever
+  sends the one manually-requested absolute target per side, nothing resembling the
+  time-of-day-scheduled `SetTargetTemperature` calls stock OpenSleep's own manager makes.
 * Never install or touch a systemd unit; every run is a single foreground pass, manually initiated
-  every time -- priming is never automatic.
+  every time -- priming and holding a target are both never automatic.
 
-These are enforced both by the fact that these four modes' own source never references those code
+These are enforced both by the fact that these modes' own source never references those code
 paths (`guardrail_tests` in `main.rs` scans the diagnostic's own sources at test time to prove it)
 and by the command whitelist above.
 

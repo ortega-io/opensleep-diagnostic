@@ -1,11 +1,67 @@
 # TEST_RESULTS.md — opensleep-diagnostic
 
-All 347 unit/integration tests in `src/bin/opensleep-diagnostic/` pass (up from 332; see the
+All 361 unit/integration tests in `src/bin/opensleep-diagnostic/` pass (up from 347; see the
 revision note directly below), plus the 51 pre-existing `opensleep` library tests (unmodified,
-reused as-is) and 0 doc-tests — 398 total, 0 failed. Verified inside the
+reused as-is) and 0 doc-tests — 412 total, 0 failed. Verified inside the
 `messense/rust-musl-cross:aarch64-musl` builder image via `cargo test --locked` under its built-in
 QEMU aarch64 runner (the same environment the release binary is built in) as part of the
-diagnostic-v21 release build -- see `build-report.txt`.
+diagnostic-v22 release build -- see `build-report.txt`.
+
+## Revision note: add `frozen-hold-start`/`frozen-hold-stop`/`frozen-hold-status`, persistent firmware-owned absolute-temperature control
+
+Every prior active mode is a bounded, host-observed session. `frozen-hold-start --target-c <C>`
+(or `--left-target-c`/`--right-target-c` together) sends one absolute target per side -- no
+baseline, no delta, validated against the same 0-45C backstop `frozen-cool-test`'s own
+`--target-c` already used (`safety::validate_absolute_target_centideg`, extracted from
+`enable_cooling` so there is still only one operating-range constant) -- requires an *exact*
+matching `TargetUpdate(side, enabled=true, temp=<requested>)` confirmation for each, prints the
+required confirmation banner, and **exits**. After both confirmations, the process sends zero
+further Frozen commands of any kind: no disable, no independent shutdown guard, no `Drop`-based
+shutdown, no duration timer, no firmware-message interpretation, no pump/TEC/fan observer, no host
+thermal watchdog, no reaction to priming or `tec[...] locked (pump)` messages -- there is no code
+path left to run once the confirming function returns, proven directly by
+`successful_start_sends_nothing_further_after_confirmation_including_after_uart_loss` and
+`messages_and_tec_lock_text_during_confirmation_do_not_affect_the_result`. Partial-transaction
+rollback (disable the confirmed side if the other never confirms) is proven by
+`partial_enable_failure_is_rolled_back`; once both sides confirm, that path is structurally
+unreachable.
+
+Unlike `frozen-cool-test`/`--release-frozen-only`, this mode must never reset a Frozen that is
+already responsive (it may be adjusting targets on a Frozen a previous `frozen-hold-start` already
+brought up). Startup is "probe first, reset only if silent": a bounded, reset-free Ping probe runs
+first; only if Frozen never answers does this fall back to the already-audited, unmodified
+`frozen_startup::start_frozen_narrow`. Register `0x07` is never written on either path, proven by
+`no_pcal_write_when_frozen_is_already_responsive` (zero I2C writes at all when already responsive)
+and `register_0x07_is_never_written_even_when_the_reset_fallback_fires` (the reset fallback writes
+only registers `0x02`/`0x06`).
+
+`frozen-hold-stop` Pings first (logging only, never to justify a reset), then disables both sides
+via a new, independent repeated-disable-and-confirm loop (`frozen_hold::disable_both_and_confirm`
+-- same shape as `cool_test::run_cool_test_shutdown`, deliberately reimplemented rather than
+called into directly, since it must never parse firmware message text and must never fall back to
+asserting the I2C reset), requiring confirmation of both sides before exiting successfully
+(`stop_disables_and_confirms_both_sides`). `frozen-hold-status` is strictly non-controlling --
+`Ping`/`GetTemperatures` only, gated by a new `Mode::HoldStatus` that permits nothing else --
+proven by `status_sends_zero_control_commands`.
+
+A new closed action, `FrozenAction::HoldTarget`, serializes to the identical
+`SetTargetTemperature` wire frame `EnableCooling` already produces (no new opcode); it is
+reachable only in the new `Mode::HoldStart`, refused everywhere else (including
+`frozen-cool-test`) by the same exhaustive per-mode `match` every other action already goes
+through.
+
+14 net new tests, all in `frozen_hold.rs` (361 total, up from 347): target resolution/validation
+(exact centidegree conversion, independent left/right values, no baseline involved, mutual
+exclusion, both-sides-required), a full successful dry-run proving exactly one enabled command per
+side and no reset, the two register-`0x07`-preservation tests above, message/`tec[...] locked`
+robustness during confirmation, exact-match rejection of a wrong-temperature reply, the rollback
+test, the nothing-sent-after-success test, and one dry-run test each for `frozen-hold-stop`/
+`frozen-hold-status`. Every other existing test file (`safety::`, `cool_test::`, `link::`,
+`frozen_ops::`, `frozen_startup::`, `passive::`, `emergency_stop::`, `prime_test::`,
+`prime_opensleep_init::`, and every `guardrail_tests::` case) was re-run unmodified against this
+revision and still passes -- `enable_cooling`'s own behavior is unchanged; only its internal range
+check was extracted into the shared `validate_absolute_target_centideg` helper `hold_target` now
+also calls.
 
 ## Revision note: add `sensor-probe --combined-narrow-subsystem-init`, reproducing only the port-0
 ## portion of upstream's startup sequence (PCAL6416A bits 0 and 1, never register 0x07)
