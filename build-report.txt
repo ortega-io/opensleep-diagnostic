@@ -1,10 +1,12 @@
 opensleep-diagnostic — build report
 ====================================
 
-Patch revision: 18 (remove the 900s duration ceiling, add --side both for simultaneous dual-side
-operation, harden the independent shutdown guard for hours-long runs)
-Supersedes revision 17 (full firmware-authoritative cooling tests: no delta cap, no interactive
-confirmations, fixes a second false firmware-fault positive), revision 16 (adds
+Patch revision: 19 (add sensor-probe: read-only-for-I2C investigation of the Sensor subsystem over
+its own UART, independent of Frozen)
+Supersedes revision 18 (remove the 900s duration ceiling, add --side both for simultaneous
+dual-side operation, harden the independent shutdown guard for hours-long runs), revision 17 (full
+firmware-authoritative cooling tests: no delta cap, no interactive confirmations, fixes a second
+false firmware-fault positive), revision 16 (adds
 --firmware-authoritative, an optional narrower active-phase mode),
 revision 15 (fixes a watchdog-clock mismatch and a caller-side TEC control-flow bug),
 revision 14 (fixed a false TEC-lock abort; extended the active phase to 15 minutes),
@@ -19,6 +21,45 @@ frozen-prime-test, now removed), revision 5 (added frozen-prime-test), revision 
 active-test preflight/monitoring), revision 3 (staged, Frozen-only diagnostic redesign), revision 2
 (sensor-first post-reset bootloader retry-probe), and revision 1 (initial diagnostic-only fork).
 Same upstream base commit; only source.patch changed.
+
+What changed in revision 19
+----------------------------
+Added a sixth subcommand, sensor-probe, establishing reliable UART communication with the Sensor
+MCU (presence/piezo/temperature board -- a separate physical UART from Frozen, /dev/ttyS2 by
+default on this Hub) and decoding whatever is already available. Deliberately does not attempt
+presence calibration, piezo configuration, vibration actuation, alarms, or expander reset pulsing
+in this version.
+
+  - --passive (default): zero UART writes, zero I2C writes. Opens /dev/ttyS2 at each known Sensor
+    baud (115200 firmware, 38400 bootloader) in turn, listens for --listen-seconds (default 20),
+    and decodes through the real, unmodified PacketCodec<SensorPacket> -- never aborting merely
+    because a frame doesn't decode.
+  - --ping: may send Ping (firmware baud first, up to 3 tries; only if silent, bootloader baud, up
+    to 3 more), and nothing else -- never JumpToFirmware. Still zero I2C writes.
+  - --discover: implements upstream's own Ping / JumpToFirmware discovery sequence (firmware Ping
+    first; only if silent, bootloader Ping; only if bootloader responded, exactly one
+    JumpToFirmware followed by a re-ping at firmware baud), but never starts the normal Sensor
+    CommandScheduler and never sends any actuator/config command -- SensorProbeAction is a closed
+    four-variant enum with no such variant to construct. --query-info (only after a confirmed
+    firmware-mode Ping) additionally permits exactly two read-only queries already present in
+    upstream SensorCommand: GetHardwareInfo/GetFirmwareHash. Once communication is established,
+    listens for unsolicited traffic for --observe-seconds (default 60), tallying every packet type
+    seen and computing per-side capacitance/piezo min/max/latest values.
+  - --audit-expander (combinable with any mode): read-only PCAL6416A register dump (0x00-0x07, hex
+    and binary) -- this feature's own files contain no write_reg call at all, so every register,
+    including 0x02/0x06/0x07 (the ones the Frozen investigation proved sensitive), is structurally
+    unwritable here.
+  - Port-0 bit 0's function is deliberately left unproven: no reset/enable line pulsing of any kind
+    is implemented in this version. If Sensor stays silent after UART discovery, this stops and
+    reports the evidence (overall_result: "uart_silent", explicitly documented as not a hardware
+    failure) rather than guessing.
+  - Caught and fixed a bug before release: an early try_ping implementation could mistake an
+    unsolicited telemetry packet (interleaved with a solicited response, as real Sensor firmware
+    can do) for the awaited Pong, or exhaust its retry budget consuming unrelated packets while the
+    real response sat unread. Fixed with a drain-until-match helper (send_and_wait_for) instead of
+    treating any non-matching packet as a failed attempt.
+
+35 net new tests (309 total, up from 274). See TEST_RESULTS.md for the full writeup.
 
 What changed in revision 18
 ----------------------------
@@ -703,14 +744,15 @@ Tests:       cargo test --locked (run under the image's built-in QEMU test runne
 Test results (this build, inside the builder image)
 -----------------------------------------------------
 opensleep (lib) unit tests:               51 passed, 0 failed
-opensleep-diagnostic (bin) unit tests:    274 passed, 0 failed
+opensleep-diagnostic (bin) unit tests:    309 passed, 0 failed
 Doc-tests:                                 0 (none defined)
 
-This revision's build succeeded on the first attempt (a --no-cache rebuild was additionally run to
-confirm the test suite and release build both execute fresh, not from a stale cache, against the
-updated source.patch). The bin test suite finished in 117.02s under the builder image's QEMU
-aarch64 runner (101.76s for revision 17) -- expected, given the 15 net new dual-side/duration
-tests; still comfortably within the build's normal time budget.
+This revision's build was run with --no-cache (confirmed: only the Dockerfile-syntax pragma
+resolution and a trivial WORKDIR step were served from cache; the git clone/checkout, source.patch
+apply, `cargo test --locked`, and `cargo build --release` steps all executed fresh against this
+exact source.patch). The bin test suite finished in 117.02s under the builder image's QEMU aarch64
+runner (117.02s for revision 18) -- effectively unchanged despite the 35 net new sensor-probe
+tests, since they exercise mocked `tokio::io::duplex` transports with short/no artificial delays.
 
 See TEST_RESULTS.md for the full breakdown against the safety spec's checklists (30-item for the
 original redesign, 28-item for frozen-prime-test), plus the "New tests added" sections for each
@@ -722,37 +764,33 @@ file:      dist/opensleep-diagnostic-aarch64-static: ELF 64-bit LSB executable, 
            version 1 (SYSV), statically linked, stripped
 readelf -l: 6 program headers (LOAD x2, TLS, GNU_EH_FRAME, GNU_STACK, GNU_RELRO); no
            PT_INTERP segment -- confirms no dynamic program interpreter, i.e. truly static.
-sha256sum: 247d3663fd5f28d4d5de4caddc2ed09a78981b9ce7a6e54efee5c6b31ba689a6  opensleep-diagnostic-aarch64-static
-           (2,823,592 bytes)
+sha256sum: bb8f2b7cec7c0db09a9a43f22de08eafef34ce671ea9ff28de487c01835a2d06  opensleep-diagnostic-aarch64-static
+           (3,020,520 bytes)
            Verified against the .sha256 file written by the same build: OK
-           Identical checksum produced by both a cached and a --no-cache rebuild -- deterministic.
 Smoke test: qemu-aarch64-static (user-mode emulation, via the host's binfmt_misc registration) was
            used to actually run the built ARM64 binary directly on the x86-64 build host, exercising
-           this revision's item 11 exactly:
-           (a) `frozen-cool-test --side both --delta-c 5 --duration 2s --firmware-authoritative
-           --non-interactive --confirm-cover-hydraulics-connected --confirm-water-loop-filled
-           --confirm-no-visible-leaks --confirm-active-test --confirm-large-temperature-delta
-           --dry-run` -- 2 enabled target commands sent (left then right), stop reason
-           requested_duration_expired, Controlled shutdown: PASS, overall_pass: true.
-           (b) same but `--target-c 20 --duration 2s` in place of `--delta-c 5` -- calculated left
-           and right targets both exactly 20.00C, 2 enabled target commands sent, overall_pass: true.
-           (c) backward-compatible `--side left --delta-c 5 --duration-seconds 2
-           --firmware-authoritative --non-interactive ...` (no --duration) -- 1 enabled target
-           command sent, overall_pass: true, confirming --duration-seconds alone (no --duration)
-           still works unchanged.
-           A `--duration 1h --duration-seconds 60` command was also confirmed refused instantly
-           ("--duration and --duration-seconds are mutually exclusive"), and `--side both` without
-           `--firmware-authoritative` was confirmed refused ("--side both requires
-           --firmware-authoritative"). No regressions observed in the legacy (non-`--side both`)
-           path or the other subcommands, all unchanged by this revision.
+           this revision's new sensor-probe subcommand:
+           (a) `sensor-probe --listen-seconds 1 --dry-run --json-output ...` (passive, the default
+           mode) -- both baud rates opened, 3 unsolicited packets decoded (capacitance/temperature/
+           piezo) from the mocked device, overall_result: unsolicited_traffic_only, exit 0.
+           (b) `sensor-probe --discover --query-info --dry-run --json-output ...` -- firmware-mode
+           Ping confirmed on the first attempt, GetHardwareInfo/GetFirmwareHash both decoded
+           (hardware_info populated, firmware_info populated), overall_result:
+           communicating_firmware, exit 0.
+           (c) `sensor-probe --passive --listen-seconds 1 --audit-expander --dry-run` -- all 8
+           PCAL6416A registers (0x00-0x07) read and printed in hex/binary, i2c_writes=0,
+           overall_result reflects the passive listen, exit 0.
+           A `sensor-probe --ping --discover --dry-run` command was also confirmed refused instantly
+           ("--passive, --ping, and --discover are mutually exclusive", exit code 2). No regressions
+           observed in the five Frozen subcommands, all unchanged by this revision.
 
-           KNOWN COSMETIC GAP (carried over from revision 8, not a correctness issue): in plain
-           `frozen-prime-opensleep-init --dry-run`'s JSON output (without `--release-frozen-only`),
-           the top-level `frozen_port` field correctly reports `/dev/ttyS1`, but the nested
-           `opensleep_init_results.frozen_uart_requested` field is empty (`dry_run_report` builds
-           `OpenSleepInitResults` via `::default()` without populating it). Does not affect
-           `--release-frozen-only`'s own `--dry-run`, which populates its result block fully (see
-           smoke test above), nor either mode's real (non-dry-run) path.
+           KNOWN COSMETIC GAP (carried over from revision 18, --side both smoke test, itself
+           carried over from revision 8): in plain `frozen-prime-opensleep-init --dry-run`'s JSON
+           output (without `--release-frozen-only`), the top-level `frozen_port` field correctly
+           reports `/dev/ttyS1`, but the nested `opensleep_init_results.frozen_uart_requested`
+           field is empty (`dry_run_report` builds `OpenSleepInitResults` via `::default()` without
+           populating it). Unrelated to this revision's sensor-probe changes; does not affect
+           `--release-frozen-only`'s own `--dry-run`, nor either mode's real (non-dry-run) path.
 
 Deliverables
 ------------
