@@ -871,3 +871,56 @@ whole originally-captured byte. This means a change some other actor made to an 
 between enable and restore (e.g. Frozen independently transitioning its own bit-1 reset state) is
 preserved, not clobbered. `restore_only_touches_bit_0_and_preserves_current_other_bits` proves this
 against a mock where bit 1 differs between the captured-original and restore-time reads.
+
+## `--combined-narrow-subsystem-init`: PCAL6416A register-level audit
+
+Same bus/address as above (`/dev/i2c-1`, `0x20`, registers `0x02`/`0x06`), but bits 0 *and* 1
+together (`PORT0_COMBINED_MASK = SUSPECTED_SENSOR_ENABLE_BIT | FROZEN_RESET_BIT`). See
+`i2c::configure_combined_narrow_subsystem_init` for the implementation and `i2c::tests` (the
+`combined_init_*` tests) for the byte-level proofs.
+
+| Step | Operation | Register | Evidence / invariant |
+|---|---|---|---|
+| 1 | Read | `0x02` | Establishes `original`. |
+| 2 | Compute | — | `target = original \| 0x03` (bits 0 and 1). Verified mathematically to differ from `original` in no bit outside `0x03` before any write is issued. |
+| 3 | Write | `0x02` | Always issued, even when bit 0 was already high (mirrors the "never skip a step" convention `pulse_frozen_reset_bit`/`configure_suspected_sensor_enable_high` already use). |
+| 4 | Read back | `0x02` | `readback_matches` required. |
+| 5 | Read | `0x06` | Establishes `original` for the direction/config register. |
+| 6 | Compute | — | `target = original & !0x03` (both bits configured as outputs; `0` = output on the PCAL6416A). |
+| 7 | Write | `0x06` | Every other bit of `0x06` passes through unchanged. |
+| 8 | Read back | `0x06` | Same requirement as step 4. |
+| 9 | Wait | — | `PULSE_SETTLE` (~100ms, the same duration already proven for Frozen's own bit-1 pulse). |
+| 10 | Read | `0x02` | Fresh read (should already equal step 3's readback, since nothing else touches `0x02` in between). |
+| 11 | Compute | — | `released = (fresh read) & !FROZEN_RESET_BIT` — clears *only* bit 1; bit 0 (whatever the fresh read shows, i.e. still HIGH) is untouched. |
+| 12 | Write | `0x02` | The release write. |
+| 13 | Read back | `0x02` | Same requirement as step 4. |
+| 14 | (nothing else) | — | No register `0x07` or `0x03` access, no whole-register constant, anywhere in this sequence. |
+
+**On this Hub, starting from the observed pre-experiment state** (`0x02 = 0xFD`, `0x06 = 0xFF`,
+`0x07 = 0x77`, established by revision 20's own experiment), this sequence computes: step 3 target
+`0xFF` (bit 0 already high, bit 1 newly asserted), step 7 target `0xFC` (both bits now outputs),
+step 12 target `0xFD` (bit 1 released, bit 0 stays high) — matching the spec's own stated expected
+final state (`0x02 = 0xFD`, `0x06 = 0xFC`) exactly, with `0x07` never touched.
+`combined_init_matches_the_hub_evidence_in_the_spec` asserts this precise sequence of computed
+values, not just the final result.
+
+**Why three writes, not five:** a naive sequential composition of revision 19's
+`configure_suspected_sensor_enable_high` (2 writes: `0x02` bit-0-prep, `0x06` bit-0-config) followed
+by the existing `pulse_frozen_reset_bit` (3 writes: `0x02` bit-1-assert, `0x06` bit-1-config, `0x02`
+bit-1-release) would write `0x02` three times and `0x06` twice — redundant, and not what upstream's
+own sequence does. `configure_combined_narrow_subsystem_init` is a genuinely independent function
+(not a call to either existing one) that combines both bits into each of the three writes upstream's
+own sequence needs.
+
+### Frozen verification (`--combined-narrow-subsystem-init` only): reused, not reimplemented
+
+The Ping-only verification step reuses `frozen_ops::ping` and `frozen_ops::jump_to_firmware_and_wait`
+unmodified — the same functions `frozen-passive` and `frozen-cool-test` already use for their own
+mode-detection and bootloader-to-firmware transitions — under a fresh `AuditedTransport::new(Mode::
+Passive)`. `Mode::Passive`'s whitelist (see "Commands permitted per mode" above) permits `Ping`,
+`GetHardwareInfo`, `GetFirmware`, `JumpToFirmware`, `GetTemperatures`, and `SetTargetTemperature
+(enabled=false)` — it does **not** permit an enabled `SetTargetTemperature` or `Prime`, so this step
+cannot actuate anything even if a future bug tried to make it. `sensor_probe.rs` itself never
+constructs a `FrozenAction`/`FrozenCommand` directly — only `frozen_ops.rs` does, inside those two
+existing, already-tested wrapper functions — checked by `main.rs`'s updated `sensor_probe_never_
+touches_frozen` guardrail test.

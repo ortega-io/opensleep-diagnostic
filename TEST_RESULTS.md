@@ -1,11 +1,47 @@
 # TEST_RESULTS.md — opensleep-diagnostic
 
-All 332 unit/integration tests in `src/bin/opensleep-diagnostic/` pass (up from 309; see the
+All 347 unit/integration tests in `src/bin/opensleep-diagnostic/` pass (up from 332; see the
 revision note directly below), plus the 51 pre-existing `opensleep` library tests (unmodified,
-reused as-is) and 0 doc-tests — 383 total, 0 failed. Verified inside the
+reused as-is) and 0 doc-tests — 398 total, 0 failed. Verified inside the
 `messense/rust-musl-cross:aarch64-musl` builder image via `cargo test --locked` under its built-in
 QEMU aarch64 runner (the same environment the release binary is built in) as part of the
-diagnostic-v20 release build -- see `build-report.txt`.
+diagnostic-v21 release build -- see `build-report.txt`.
+
+## Revision note: add `sensor-probe --combined-narrow-subsystem-init`, reproducing only the port-0
+## portion of upstream's startup sequence (PCAL6416A bits 0 and 1, never register 0x07)
+
+Revision 20's bit-0-only experiment left Sensor completely silent at both known baud rates, and
+register `0x06` read `0xFE` afterward -- bit 1 (Frozen's own, already-proven reset line) was still
+an input. A separate critical observation: this Hub's actual register `0x07` reads `0x77`, not
+upstream's `0x31` -- a strong candidate for why the old global reset broke capwater/reservoir-related
+hardware.
+
+`--combined-narrow-subsystem-init` (opt-in; cannot be combined with `--enable-suspected-sensor-line`,
+`--restore-suspected-sensor-line`, or `--audit-expander`) reproduces only the port-0 portion of
+upstream's own startup -- bits 0 and 1 of registers `0x02`/`0x06` -- in three writes (assert both
+bits HIGH on `0x02`, configure both as outputs on `0x06`, hold ~100ms, release only bit 1 back LOW
+on `0x02`, reproducing Frozen's own already-proven pulse exactly), verified before proceeding
+(aborting before any UART probing on a mismatch), never touching register `0x07` or `0x03` -- proven,
+not assumed, via a full expander audit captured both before and after. After a verified sequence, it
+verifies Frozen is reachable with a single Ping (`Mode::Passive`'s whitelist -- no temperature
+target, no Prime, no pump, no cooling; reuses `frozen_ops::ping`/`jump_to_firmware_and_wait`
+unmodified), then probes Sensor using upstream's own bootloader-first discovery ordering, tracking
+best-effort `/proc/tty/driver/serial` byte counters and elapsed-time-to-first-byte/packet as
+additional evidence. State is left as configured on exit; there is no `--restore` option for this
+mode. This is the one deliberate, narrow exception to `sensor-probe` never touching Frozen --
+`main.rs`'s `sensor_probe_never_touches_frozen` guardrail test now describes exactly that exception
+(only `sensor_probe.rs`; only `FrozenLink`/`/dev/ttyS1`; still never a raw `FrozenAction`/
+`FrozenCommand` construction anywhere in that file).
+
+15 net new tests (347 total, up from 332): 6 in `i2c.rs` (byte-level proofs against `MockI2c` --
+ordering, bit-0-never-low, bits-0/1-only-changed sweep, `0x07`/`0x03` never written, settle
+duration, readback-mismatch detection) and 9 in `sensor_probe.rs` (opt-in/never-implied, mutual
+exclusion with the other experimental flags, full dry-run matching the Hub's own evidence exactly,
+readback-mismatch aborts before UART writes, Frozen verification sends no actuator command,
+bootloader-first Sensor discovery ordering, no-jump-when-silent, no `ResetController` reference,
+end-to-end write-count proof). Also fixed a small reporting-fidelity gap caught during this work:
+when the I2C device fails to even open, the combined-init register fields now correctly report
+`None` (never read) instead of a misleading `Some(0x00)`.
 
 ## Revision note: add `sensor-probe --enable-suspected-sensor-line`, an experimental, opt-in test
 ## of the suspected Sensor enable line (PCAL6416A port-0 bit 0)

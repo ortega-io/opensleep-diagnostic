@@ -764,10 +764,14 @@ alarms, or any expander reset pulsing.** See `sensor_probe.rs` module docs for t
   silent after ordinary UART discovery, this stops and reports the evidence
   (`overall_result: "uart_silent"`, explicitly documented as not proof of a hardware fault) rather
   than guessing at a reset line.
-* Never opens Frozen's UART (`frozen_port`) and never references Frozen's transport/command types
-  -- checked by the `sensor_probe_never_touches_frozen` guardrail test in `main.rs`, and by the
+* Never opens Frozen's UART (`frozen_port`) and never references Frozen's transport/command types,
+  **except `--combined-narrow-subsystem-init`'s own Ping-only verification step** (revision 21, see
+  its own subsection below) -- checked by the `sensor_probe_never_touches_frozen` guardrail test in
+  `main.rs`, which now describes that one exception precisely rather than a blanket ban, and by the
   report's own `frozen_uart_writes`/`frozen_uart_opens`/`frozen_port_never_opened` counters (always
-  `0`/`0`/`true`).
+  `0`/`0`/`true` for every other mode; `--combined-narrow-subsystem-init` is the only mode where
+  `frozen_uart_opens` becomes `1` and `frozen_port_never_opened` becomes `false` -- `frozen_uart_
+  writes` stays `0` even there, since that step never sends an *actuating* Frozen command).
 
 ### Revision 20: `--enable-suspected-sensor-line` -- an experimental, opt-in hypothesis test
 
@@ -849,6 +853,77 @@ output, driven HIGH, and nothing else -- without asserting it is correct:
   still only ever permits `GetHardwareInfo`/`GetFirmwareHash`, gated by the same closed
   `SensorProbeAction` enum revision 19 introduced -- this flag adds a new *I2C* capability, not a
   new UART command vocabulary.
+
+### Revision 21: `--combined-narrow-subsystem-init` -- reproducing only upstream's port-0 startup
+
+Revision 20's bit-0-only experiment left Sensor completely silent at both known baud rates
+(`0 bytes RX` at `115200` and at `38400`), and register `0x06` read `0xFE` afterward -- bit 1 (Frozen's
+own, already-proven reset line) was still configured as an *input*. Real hardware evidence already
+established that Frozen does not operate correctly until bit 1 is configured as an output and
+receives its proven assert/hold/release pulse. A separate, critical observation: this Hub's actual
+register `0x07` reads `0x77` -- upstream's own global initialization instead writes `0x31` there
+unconditionally, and that whole-register write is now a strong candidate for why the old global
+reset broke capwater/reservoir-related hardware (see revision 9's history above).
+
+`--combined-narrow-subsystem-init` reproduces *only* the port-0 portion of upstream's own startup
+sequence -- bits 0 and 1 of registers `0x02`/`0x06` -- while leaving register `0x07`, and every other
+register, exactly as this Hub's own hardware already has it:
+
+* **Opt-in only; not part of normal `--passive`/`--ping`/`--discover` operation**, and cannot be
+  combined with `--enable-suspected-sensor-line`, `--restore-suspected-sensor-line`, or
+  `--audit-expander` (this mode has its own fixed expander sequence and its own before/after audit;
+  refused instantly if combined).
+* **Three writes total**, in the same glitch-avoidance order established by
+  `pulse_frozen_reset_bit`/`configure_suspected_sensor_enable_high`: register `0x02` first
+  (`asserted = original | 0x03` -- both bits 0 and 1 driven HIGH on the output latch, before either
+  becomes an output), then register `0x06` (`configured = original & !0x03` -- both bits 0 and 1
+  configured as outputs), then, after holding `PULSE_SETTLE` (~100ms, the same duration already
+  proven for Frozen's own pulse), register `0x02` again (`released = (fresh read) & !0x02` -- clears
+  *only* bit 1, leaving bit 0 asserted HIGH). This is Frozen's own already-proven assert/hold/release
+  pulse for bit 1, combined with bit 0 staying HIGH throughout, in the three writes upstream's own
+  sequence would need -- not five, which a naive sequential composition of revision 19's and
+  revision 20's separate single-bit functions would otherwise produce. A dedicated, independent
+  helper (`i2c::configure_combined_narrow_subsystem_init`) implements this -- not a reuse of either
+  single-bit function, and not a generalization of them, for the same reason those two are
+  independent of each other.
+* **Every write's changed-bit mask is verified to be a subset of `{0x00, 0x01, 0x02, 0x03}`** before
+  proceeding; a mismatch, or any readback not matching what was written, **aborts before any UART
+  probing at all** (`overall_result: "expander_verification_failed"`) -- proven by
+  `combined_init_readback_aborts_before_any_uart_probing`.
+* **Register `0x07` is never written, and its preservation is proven, not assumed**: a full
+  read-only expander audit (`0x00`-`0x07`) is captured both immediately before and immediately after
+  the combined I2C sequence, and the report's `combined_reg07_preserved` field is `true` only when
+  both reads succeeded and produced the identical value. Register `0x03` is likewise never written.
+* **Verifies Frozen is reachable, Ping only.** After a verified expander sequence, opens Frozen's
+  UART, drains ~2s of startup traffic, then Pings using `AuditedTransport`'s `Mode::Passive`
+  whitelist -- the same whitelist `frozen-passive` itself uses, which structurally forbids an enabled
+  `SetTargetTemperature` and `Prime`. A bootloader response is followed by the same already-proven
+  bootloader-to-firmware handling `frozen-passive`/`frozen-cool-test` use
+  (`frozen_ops::jump_to_firmware_and_wait`). This is verification only: no temperature target is
+  ever set, no `Prime` is ever sent, no pump or cooling is ever started, and a verification failure
+  never triggers a global reset -- it is simply reported as `frozen_reached_firmware: false`.
+* **This is the one deliberate, narrow exception to `sensor-probe` never touching Frozen.** Every
+  other mode, and the other four `sensor-probe` source files, are held to the original, unqualified
+  ban -- `main.rs`'s `sensor_probe_never_touches_frozen` guardrail test now describes exactly this
+  one exception (only `sensor_probe.rs`; only `FrozenLink`/`/dev/ttyS1`; still never a raw
+  `FrozenAction`/`FrozenCommand` construction anywhere in that file -- only the two existing,
+  already-audited `frozen_ops::ping`/`frozen_ops::jump_to_firmware_and_wait` wrapper functions).
+* **Probes Sensor using upstream's own bootloader-first discovery ordering** (bootloader baud
+  `38400` first, listening passively for 1 second before transmitting, up to 3 Ping retries; then --
+  always, regardless of the bootloader step's outcome -- firmware baud `115200`, same pre-listen and
+  retry budget), identical in spirit to revision 20's `--discover` combination, but tracked with its
+  own additional evidence: best-effort `/proc/tty/driver/serial` byte counters for `ttyS2` before and
+  after the whole run, and `spontaneous_bytes_38400`/`spontaneous_bytes_115200` plus
+  `first_sensor_rx_after_init_ms`/`first_decoded_sensor_packet_after_init_ms` relative to when the
+  I2C sequence completed.
+* **State is preserved, not restored automatically** -- same rationale as revision 20: the intended
+  final port-0 condition (bit 0 output HIGH, bit 1 output LOW) is left in place on exit regardless of
+  outcome. There is no `--restore` option for this mode in this version.
+* **Result vocabulary**: `sensor_firmware_alive_after_combined_init`,
+  `sensor_bootloader_alive_after_combined_init`, `sensor_rx_activity_after_combined_init`,
+  `sensor_still_silent_after_combined_init` (explicitly not proof of a Sensor hardware failure --
+  same framing as every other "still silent" result this tool reports), `frozen_alive_sensor_silent`,
+  and the shared `expander_verification_failed`.
 
 ## What no subcommand ever does, including `frozen-prime-opensleep-init`
 

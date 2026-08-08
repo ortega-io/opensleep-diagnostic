@@ -164,10 +164,10 @@ index 0000000..be05be7
 +}
 diff --git a/src/bin/opensleep-diagnostic/cli.rs b/src/bin/opensleep-diagnostic/cli.rs
 new file mode 100644
-index 0000000..b1d80d2
+index 0000000..33543fe
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/cli.rs
-@@ -0,0 +1,528 @@
+@@ -0,0 +1,548 @@
 +//! CLI surface. Every flag here maps to a fixed, validated field -- there is no flag that accepts
 +//! a raw opcode, a raw frame, or an arbitrary absolute temperature target. Side selection is a
 +//! closed `ValueEnum`; the cooling delta and duration are validated in `cool_test.rs` against
@@ -637,6 +637,26 @@ index 0000000..b1d80d2
 +    /// separate opt-in.
 +    #[arg(long, default_value_t = false)]
 +    pub restore_suspected_sensor_line: bool,
++
++    /// **EXPERIMENTAL.** Reproduces only the port-0 portion of upstream OpenSleep's own startup
++    /// sequence -- bits 0 and 1 of PCAL6416A registers 0x02/0x06 -- while leaving every other
++    /// register (0x07 in particular) exactly as this Hub's own hardware already has it: prepares
++    /// both bits HIGH on 0x02, configures both as outputs on 0x06, holds ~100ms, then releases only
++    /// bit 1 (Frozen's own reset bit) back LOW, reproducing Frozen's already-proven assert/hold/
++    /// release pulse exactly while leaving bit 0 (the suspected Sensor enable line) asserted HIGH.
++    /// Never a whole-register constant, never writes 0x07 or 0x03, never calls
++    /// `opensleep::reset::ResetController`. After a verified expander sequence, verifies Frozen is
++    /// reachable (Ping only -- no temperature targets, no Prime, no pumps, no cooling) and then
++    /// probes Sensor using upstream's own bootloader-first discovery ordering. Opt-in only; not
++    /// part of normal `--passive`/`--ping`/`--discover` operation. See SAFETY.md and
++    /// `sensor_probe.rs` module docs for the full experimental design.
++    #[arg(long, default_value_t = false)]
++    pub combined_narrow_subsystem_init: bool,
++
++    /// Frozen's UART, used only by `--combined-narrow-subsystem-init`'s Ping-only verification
++    /// step -- see that flag's doc comment. Every other `sensor-probe` mode never opens this port.
++    #[arg(long, default_value = "/dev/ttyS1")]
++    pub frozen_port: String,
 +
 +    #[arg(long, value_name = "PATH")]
 +    pub json_output: Option<String>,
@@ -8547,10 +8567,10 @@ index 0000000..c120bf8
 +}
 diff --git a/src/bin/opensleep-diagnostic/i2c.rs b/src/bin/opensleep-diagnostic/i2c.rs
 new file mode 100644
-index 0000000..eab7172
+index 0000000..b1e378b
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/i2c.rs
-@@ -0,0 +1,1122 @@
+@@ -0,0 +1,1375 @@
 +//! I2C access, generic over an [`I2cPort`] trait so the exact same probe/reset code runs against
 +//! the real `/dev/i2c-1` bus, a scripted mock in tests, and the always-succeeding mock used by
 +//! `--dry-run`.
@@ -8568,7 +8588,12 @@ index 0000000..eab7172
 +//! ([`configure_suspected_sensor_enable_high`]/[`restore_suspected_sensor_bit`]), gated behind an
 +//! explicit, opt-in experimental flag and never implied by any other `sensor-probe` mode -- these
 +//! only ever touch bit 0 of registers 0x02/0x06, are never a pulse, never drive bit 0 low, and
-+//! never write 0x07. No other register, on `0x20` or any other address, is ever written.
++//! never write 0x07; and (e) the narrow, read-modify-write bits-0-and-1 operations used by
++//! `sensor-probe --combined-narrow-subsystem-init`
++//! ([`configure_combined_narrow_subsystem_init`]), gated behind its own explicit, opt-in flag --
++//! these only ever touch bits 0/1 of registers 0x02/0x06, reproduce bit 1's already-proven
++//! assert/hold/release pulse exactly, never drive bit 0 low, and never write 0x07 or 0x03. No
++//! other register, on `0x20` or any other address, is ever written.
 +
 +use std::time::Duration;
 +use tokio::time::{Instant, sleep};
@@ -9220,6 +9245,152 @@ index 0000000..eab7172
 +    Ok(SuspectedSensorLineResult { reg02, reg06 })
 +}
 +
++/// Bits 0 and 1 of port 0 together -- the combined narrow-subsystem-init mask. Real hardware
++/// evidence: with only bit 0 configured as an output (via [`configure_suspected_sensor_enable_high`]
++/// alone), Sensor stayed completely silent at both known baud rates, and register 0x06 was
++/// observed at `0xFE` (bit 1 still an input) -- consistent with bit 1 (already proven to be
++/// Frozen's own reset line) also needing to be an output before Frozen operates correctly. This
++/// mask reproduces only the relevant port-0 portion of upstream's own startup sequence -- both bits
++/// as outputs, bit 1 pulsed exactly as already proven for Frozen -- while never touching register
++/// 0x07 (observed on this Hub as `0x77`, not upstream's `0x31`) or any other register. See
++/// `i2c::configure_combined_narrow_subsystem_init`'s doc comment and `sensor_probe.rs` module docs.
++pub const PORT0_COMBINED_MASK: u8 = SUSPECTED_SENSOR_ENABLE_BIT | FROZEN_RESET_BIT;
++
++/// The result of one narrow, bits-0-and-1-only read-modify-write step on register 0x02 or 0x06.
++/// Distinct from [`RegBitReadModifyWriteResult`] (bit 1 only) and [`SuspectedSensorBitStepResult`]
++/// (bit 0 only) -- `only_combined_bits_changed` is named for what it actually checks.
++#[derive(Debug, Clone, Copy, Default)]
++pub struct CombinedBitStepResult {
++    pub original: u8,
++    pub target: u8,
++    pub changed_mask: u8,
++    pub readback: u8,
++    pub readback_matches: bool,
++    /// `true` iff `changed_mask` is a subset of [`PORT0_COMBINED_MASK`] -- i.e. no bit outside
++    /// bits 0/1 differs between `original` and `target`.
++    pub only_combined_bits_changed: bool,
++}
++
++/// Bits-0-and-1 analog of `read_modify_write_reg`/`read_modify_write_bit0` above: reads `reg`,
++/// computes a new value via `transform`, verifies mathematically (before writing) that the change
++/// touches only bits 0/1, writes it, and reads it back to verify. Kept as an independent function
++/// (not a generalization of either single-bit helper) for the same reason those two are
++/// independent of each other: this experimental combined sequence must never be able to affect
++/// either bit's own already-proven or already-tested single-bit logic.
++async fn read_modify_write_combined<P: I2cPort>(
++    dev: &mut P,
++    reg: u8,
++    reg_label: &str,
++    transform: impl FnOnce(u8) -> u8,
++    target_label: &str,
++) -> Result<CombinedBitStepResult, I2cIoError> {
++    let original = dev.read_reg(RESET_EXPANDER_ADDR, reg)?;
++    let target = transform(original);
++    let changed_mask = original ^ target;
++    log::info!("[combined-init] original register {reg_label}: 0b{original:08b} (0x{original:02X})");
++    log::info!("[combined-init] {target_label} register {reg_label}: 0b{target:08b} (0x{target:02X})");
++    log::info!("[combined-init] changed-bit mask: 0b{changed_mask:08b} (0x{changed_mask:02X})");
++    // Verified mathematically, before any write is issued: every `transform` this function is ever
++    // called with is constructed as `original | PORT0_COMBINED_MASK`, `original &
++    // !PORT0_COMBINED_MASK`, or `original & !FROZEN_RESET_BIT` (the release step, which only ever
++    // clears bit 1), each of which can only ever differ from `original` in bits 0/1 -- this can
++    // never actually fail, but is asserted as a structural proof rather than an assumption.
++    assert_eq!(
++        changed_mask & !PORT0_COMBINED_MASK,
++        0,
++        "computed target for register {reg_label} would change a bit other than bits 0/1 (original=0b{original:08b} target=0b{target:08b})"
++    );
++    dev.write_reg(RESET_EXPANDER_ADDR, reg, target)?;
++    let readback = dev.read_reg(RESET_EXPANDER_ADDR, reg)?;
++    log::info!("[combined-init] readback result: 0b{readback:08b} (0x{readback:02X})");
++    Ok(CombinedBitStepResult {
++        original,
++        target,
++        changed_mask,
++        readback,
++        readback_matches: readback == target,
++        only_combined_bits_changed: (changed_mask & !PORT0_COMBINED_MASK) == 0,
++    })
++}
++
++/// The result of [`configure_combined_narrow_subsystem_init`]: the three steps (0x02 assert, 0x06
++/// configure, 0x02 release), each independently verified.
++#[derive(Debug, Clone, Copy, Default)]
++pub struct CombinedNarrowSubsystemInitResult {
++    pub reg02_assert: CombinedBitStepResult,
++    pub reg06_config: CombinedBitStepResult,
++    pub reg02_release: CombinedBitStepResult,
++}
++
++impl CombinedNarrowSubsystemInitResult {
++    /// `true` iff every step verified: each write's readback matched what was written, and each
++    /// write changed only bits 0/1 (of its own register). Callers must check this before
++    /// proceeding to any UART probing -- see `sensor_probe.rs`'s `expander_verification_failed`
++    /// result.
++    pub fn fully_verified(&self) -> bool {
++        self.reg02_assert.readback_matches
++            && self.reg02_assert.only_combined_bits_changed
++            && self.reg06_config.readback_matches
++            && self.reg06_config.only_combined_bits_changed
++            && self.reg02_release.readback_matches
++            && self.reg02_release.only_combined_bits_changed
++    }
++}
++
++/// **Experimental.** Reproduces only the port-0 portion of upstream's own startup sequence --
++/// bits 0 and 1 of registers 0x02/0x06 -- while leaving every other register (0x07 in particular)
++/// exactly as this Hub's own hardware already has it. Three writes total, in order:
++///
++/// 1. Register 0x02: `asserted = original | PORT0_COMBINED_MASK` (both bits 0 and 1 driven HIGH on
++///    the output latch, before either becomes an output -- same glitch-avoidance ordering
++///    [`pulse_frozen_reset_bit`]/[`configure_suspected_sensor_enable_high`] already use).
++/// 2. Register 0x06: `configured = original & !PORT0_COMBINED_MASK` (both bits 0 and 1 configured
++///    as outputs; `0` = output on the PCAL6416A).
++/// 3. Holds [`PULSE_SETTLE`] (the same ~100ms already proven for Frozen's own bit-1 pulse), then
++///    register 0x02 again: `released = (fresh read) & !FROZEN_RESET_BIT` -- clears *only* bit 1,
++///    leaving bit 0 asserted HIGH and every other bit (including whatever bits 2-7 currently read)
++///    untouched. This is exactly [`pulse_frozen_reset_bit`]'s own proven assert/hold/release
++///    sequence for bit 1, combined with [`configure_suspected_sensor_enable_high`]'s bit-0-stays-
++///    HIGH behavior, in the three writes upstream's own sequence would need instead of the five a
++///    naive sequential composition of the two existing single-bit functions would produce.
++///
++/// Never writes register 0x07 or 0x03, never calls `opensleep::reset::ResetController` or
++/// `run_reset_sequence`, never uses a hardcoded whole-register constant -- every value written is
++/// computed from what was actually read at that step. Callers must check
++/// [`CombinedNarrowSubsystemInitResult::fully_verified`] before proceeding to any UART probing.
++pub async fn configure_combined_narrow_subsystem_init<P: I2cPort>(dev: &mut P) -> Result<CombinedNarrowSubsystemInitResult, I2cIoError> {
++    let reg02_assert = read_modify_write_combined(
++        dev,
++        REG_OUTPUT_PORT_0,
++        "0x02",
++        |original| original | PORT0_COMBINED_MASK,
++        "prepared (bits 0+1 high)",
++    )
++    .await?;
++
++    let reg06_config = read_modify_write_combined(
++        dev,
++        REG_CONFIG_PORT_0,
++        "0x06",
++        |original| original & !PORT0_COMBINED_MASK,
++        "configured (bits 0+1 as outputs)",
++    )
++    .await?;
++
++    sleep(PULSE_SETTLE).await;
++
++    let reg02_release = read_modify_write_combined(
++        dev,
++        REG_OUTPUT_PORT_0,
++        "0x02",
++        |original| original & !FROZEN_RESET_BIT,
++        "released (bit 1 only; bit 0 stays high)",
++    )
++    .await?;
++
++    Ok(CombinedNarrowSubsystemInitResult { reg02_assert, reg06_config, reg02_release })
++}
++
 +#[cfg(test)]
 +mod tests {
 +    use super::*;
@@ -9671,6 +9842,108 @@ index 0000000..eab7172
 +        let r = restore_suspected_sensor_bit(&mut mock, 0xFC, 0xFC).await.unwrap();
 +        assert_eq!(r.reg02.target & SUSPECTED_SENSOR_ENABLE_BIT, 0);
 +        assert_eq!(r.reg06.target & SUSPECTED_SENSOR_ENABLE_BIT, 0);
++    }
++
++    // ---- configure_combined_narrow_subsystem_init ----
++
++    #[tokio::test]
++    async fn combined_init_matches_the_hub_evidence_in_the_spec() {
++        // reg02 = 0xFD (bit0 low, bit1 high), reg06 = 0xFF (both inputs) -- matches "Observed
++        // expander state before the experiment" in the spec.
++        let mut mock = mock_with_reg02_reg06(0xFD, 0xFF);
++        let r = configure_combined_narrow_subsystem_init(&mut mock).await.unwrap();
++        assert_eq!(r.reg02_assert.target, 0xFD | PORT0_COMBINED_MASK); // 0xFF
++        assert_eq!(r.reg06_config.target, 0xFF & !PORT0_COMBINED_MASK); // 0xFC
++        assert_eq!(r.reg02_release.target, 0xFF & !FROZEN_RESET_BIT); // 0xFD: bit0 high, bit1 low
++        assert!(r.fully_verified());
++        // Expected final state per the spec: reg 0x02 = 0xFD, reg 0x06 = 0xFC.
++        assert_eq!(r.reg02_release.readback, 0xFD);
++        assert_eq!(r.reg06_config.readback, 0xFC);
++    }
++
++    #[tokio::test]
++    async fn combined_init_writes_0x02_before_0x06_and_never_touches_0x07_or_0x03() {
++        let mut mock = mock_with_reg02_reg06(0xFD, 0xFF);
++        configure_combined_narrow_subsystem_init(&mut mock).await.unwrap();
++        assert_eq!(mock.writes.len(), 3, "exactly three writes: 0x02 assert, 0x06 config, 0x02 release");
++        assert_eq!(mock.writes[0].1, REG_OUTPUT_PORT_0);
++        assert_eq!(mock.writes[1].1, REG_CONFIG_PORT_0);
++        assert_eq!(mock.writes[2].1, REG_OUTPUT_PORT_0);
++        for (_, reg, _) in &mock.writes {
++            assert_ne!(*reg, REG_CONFIG_PORT_1, "must never write register 0x07");
++            assert_ne!(*reg, 0x03, "must never write register 0x03");
++        }
++    }
++
++    #[tokio::test]
++    async fn combined_init_waits_the_settle_duration() {
++        let mut mock = mock_with_reg02_reg06(0xFD, 0xFF);
++        let start = std::time::Instant::now();
++        configure_combined_narrow_subsystem_init(&mut mock).await.unwrap();
++        assert!(start.elapsed() >= PULSE_SETTLE);
++    }
++
++    #[tokio::test]
++    async fn combined_init_bit0_never_reads_low_in_either_0x02_write() {
++        // Sweep via `read_modify_write_combined` directly (no PULSE_SETTLE sleep per iteration --
++        // see the equivalent single-bit sweep tests above for why this matters at 256 iterations).
++        for original in 0u8..=255 {
++            let mut mock = mock_with_reg02_reg06(original, 0xFF);
++            let assert_step = read_modify_write_combined(&mut mock, REG_OUTPUT_PORT_0, "0x02", |o| o | PORT0_COMBINED_MASK, "prepared")
++                .await
++                .unwrap();
++            assert_eq!(assert_step.target & SUSPECTED_SENSOR_ENABLE_BIT, SUSPECTED_SENSOR_ENABLE_BIT, "original=0b{original:08b}");
++            let release_step = read_modify_write_combined(&mut mock, REG_OUTPUT_PORT_0, "0x02", |o| o & !FROZEN_RESET_BIT, "released")
++                .await
++                .unwrap();
++            assert_eq!(release_step.target & SUSPECTED_SENSOR_ENABLE_BIT, SUSPECTED_SENSOR_ENABLE_BIT, "original=0b{original:08b}");
++            assert_eq!(release_step.target & FROZEN_RESET_BIT, 0, "bit 1 must be low after release; original=0b{original:08b}");
++        }
++    }
++
++    #[tokio::test]
++    async fn combined_init_only_bits_0_and_1_ever_change_on_either_register() {
++        for original in 0u8..=255 {
++            let mut mock = mock_with_reg02_reg06(original, original);
++            let step02 = read_modify_write_combined(&mut mock, REG_OUTPUT_PORT_0, "0x02", |o| o | PORT0_COMBINED_MASK, "prepared")
++                .await
++                .unwrap();
++            assert!(step02.only_combined_bits_changed, "original=0b{original:08b}");
++            assert_eq!(step02.target & !PORT0_COMBINED_MASK, original & !PORT0_COMBINED_MASK, "original=0b{original:08b}");
++
++            let step06 = read_modify_write_combined(&mut mock, REG_CONFIG_PORT_0, "0x06", |o| o & !PORT0_COMBINED_MASK, "configured")
++                .await
++                .unwrap();
++            assert!(step06.only_combined_bits_changed, "original=0b{original:08b}");
++            assert_eq!(step06.target & !PORT0_COMBINED_MASK, original & !PORT0_COMBINED_MASK, "original=0b{original:08b}");
++        }
++    }
++
++    #[tokio::test]
++    async fn combined_init_readback_mismatch_is_not_fully_verified() {
++        struct StaleReg02 {
++            inner: MockI2c,
++            stale_value: u8,
++        }
++        impl I2cPort for StaleReg02 {
++            fn read_byte(&mut self, addr: u8) -> Result<u8, I2cIoError> {
++                self.inner.read_byte(addr)
++            }
++            fn read_reg(&mut self, addr: u8, reg: u8) -> Result<u8, I2cIoError> {
++                if addr == RESET_EXPANDER_ADDR && reg == REG_OUTPUT_PORT_0 && !self.inner.writes.is_empty() {
++                    return Ok(self.stale_value);
++                }
++                self.inner.read_reg(addr, reg)
++            }
++            fn write_reg(&mut self, addr: u8, reg: u8, value: u8) -> Result<(), I2cIoError> {
++                self.inner.write_reg(addr, reg, value)
++            }
++        }
++        let mock = mock_with_reg02_reg06(0xFD, 0xFF);
++        let mut stale = StaleReg02 { inner: mock, stale_value: 0x00 };
++        let r = configure_combined_narrow_subsystem_init(&mut stale).await.unwrap();
++        assert!(!r.reg02_assert.readback_matches);
++        assert!(!r.fully_verified());
 +    }
 +}
 diff --git a/src/bin/opensleep-diagnostic/io_logging.rs b/src/bin/opensleep-diagnostic/io_logging.rs
@@ -10440,10 +10713,10 @@ index 0000000..216770e
 +}
 diff --git a/src/bin/opensleep-diagnostic/main.rs b/src/bin/opensleep-diagnostic/main.rs
 new file mode 100644
-index 0000000..f7591cc
+index 0000000..bc751fd
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/main.rs
-@@ -0,0 +1,385 @@
+@@ -0,0 +1,401 @@
 +//! opensleep-diagnostic: a staged hardware diagnostic for an Eight Sleep Pod 3 Hub, historically
 +//! Frozen-only and now also covering the Sensor subsystem.
 +//!
@@ -10795,8 +11068,24 @@ index 0000000..f7591cc
 +    /// guarantee that the capability isn't even reachable.
 +    #[test]
 +    fn sensor_probe_never_touches_frozen() {
++        // `sensor_probe.rs` is the one deliberate exception, and only for
++        // `--combined-narrow-subsystem-init`'s Ping-only verification step: it may open a
++        // `FrozenLink` and reference `/dev/ttyS1` (via `cli.rs`'s `--frozen-port` default), but it
++        // must still never construct a raw `FrozenAction`/`FrozenCommand` itself -- that
++        // verification step only ever calls the two existing, already-audited wrapper functions
++        // (`frozen_ops::ping`/`frozen_ops::jump_to_firmware_and_wait`), which internally go through
++        // `AuditedTransport`'s `Mode::Passive` whitelist, never constructing a command directly in
++        // this file. The other four `sensor-probe` files have no legitimate reason to reference
++        // Frozen at all, and are held to the original, unqualified ban.
 +        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/bin/opensleep-diagnostic");
-+        for name in ["sensor_probe.rs", "sensor_link.rs", "sensor_safety.rs", "sensor_report.rs", "sensor_mock.rs"] {
++
++        let sensor_probe_path = std::path::Path::new(dir).join("sensor_probe.rs");
++        let sensor_probe_src = std::fs::read_to_string(&sensor_probe_path).expect("readable .rs file");
++        for needle in ["FrozenAction", "FrozenCommand"] {
++            assert!(!sensor_probe_src.contains(needle), "sensor_probe.rs must never construct a raw {needle}");
++        }
++
++        for name in ["sensor_link.rs", "sensor_safety.rs", "sensor_report.rs", "sensor_mock.rs"] {
 +            let path = std::path::Path::new(dir).join(name);
 +            let src = std::fs::read_to_string(&path).expect("readable .rs file");
 +            for needle in ["/dev/ttyS1", "FrozenLink", "FrozenAction", "FrozenCommand", "FrozenPacket"] {
@@ -17246,10 +17535,10 @@ index 0000000..29da4a1
 +}
 diff --git a/src/bin/opensleep-diagnostic/sensor_probe.rs b/src/bin/opensleep-diagnostic/sensor_probe.rs
 new file mode 100644
-index 0000000..f6ff6d7
+index 0000000..a1c128f
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/sensor_probe.rs
-@@ -0,0 +1,2010 @@
+@@ -0,0 +1,2828 @@
 +//! `sensor-probe`: investigates the Eight Sleep Sensor subsystem (presence/piezo/temperature MCU)
 +//! over its own UART, entirely independent of Frozen. This first version establishes reliable
 +//! communication and decodes whatever is already available -- it deliberately does NOT attempt
@@ -17274,7 +17563,19 @@ index 0000000..f6ff6d7
 +//! spec -- no reset-line pulsing of any kind is implemented in this version.
 +//!
 +//! Never opens Frozen's own dedicated UART device or references its transport/command types at
-+//! all -- see `main.rs`'s `sensor_probe_never_touches_frozen` guardrail test.
++//! all, with exactly one deliberate, narrow exception: `--combined-narrow-subsystem-init`'s
++//! Ping-only verification step (see that mode's own section below) -- checked by the same
++//! `sensor_probe_never_touches_frozen` guardrail test in `main.rs`, updated to describe exactly
++//! that one exception rather than a blanket ban.
++//!
++//! `--combined-narrow-subsystem-init` (opt-in; not part of normal `--passive`/`--ping`/
++//! `--discover` operation) reproduces only the port-0 portion of upstream OpenSleep's own startup
++//! sequence -- bits 0 and 1 of the PCAL6416A's registers 0x02/0x06 -- while leaving every other
++//! register (0x07 in particular) exactly as this Hub's own hardware already has it. After a
++//! verified expander sequence, it verifies Frozen is reachable (Ping only, `Mode::Passive`'s
++//! whitelist -- no temperature targets, no Prime, no pumps, no cooling, no global
++//! `ResetController`), then probes Sensor using upstream's own bootloader-first discovery
++//! ordering. See SAFETY.md and `i2c::configure_combined_narrow_subsystem_init` for the full design.
 +
 +use std::collections::BTreeMap;
 +use std::sync::{Arc, Mutex};
@@ -17286,9 +17587,15 @@ index 0000000..f6ff6d7
 +
 +use crate::buildinfo::{DIAGNOSTIC_VERSION, kernel_release, source_commit};
 +use crate::cli::SensorProbeArgs;
-+use crate::i2c::{I2cPort, MockI2c, RealI2c, configure_suspected_sensor_enable_high, restore_suspected_sensor_bit};
++use crate::frozen_ops;
++use crate::i2c::{
++    I2cPort, MockI2c, RealI2c, configure_combined_narrow_subsystem_init, configure_suspected_sensor_enable_high, restore_suspected_sensor_bit,
++};
 +use crate::io_logging::RawIoCapture;
++use crate::link::{FrozenLink, PacketOutcome as FrozenPacketOutcome};
++use crate::mock::mock_frozen_link_pair;
 +use crate::ownership;
++use crate::safety::{AuditedTransport, Mode as FrozenMode};
 +use crate::sensor_link::{LinkError, PacketOutcome, SensorLink};
 +use crate::sensor_mock::{spawn_mock_sensor_device_bootloader, spawn_mock_sensor_device_firmware, spawn_mock_sensor_device_silent};
 +use crate::sensor_report::{ExpanderAudit, ExpanderRegisterReading, PacketTallyJson, SensorProbeReport};
@@ -17317,7 +17624,20 @@ index 0000000..f6ff6d7
 +        return (empty_report(args, mode, args.dry_run, "invalid_arguments"), 2);
 +    }
 +
-+    let (mut report, _code) = if args.dry_run {
++    if args.combined_narrow_subsystem_init && (args.enable_suspected_sensor_line || args.restore_suspected_sensor_line || args.audit_expander) {
++        let msg = "--combined-narrow-subsystem-init has its own fixed expander sequence and audit; it cannot be combined with --enable-suspected-sensor-line, --restore-suspected-sensor-line, or --audit-expander";
++        log::error!("{msg}");
++        return (empty_report(args, mode, args.dry_run, "invalid_arguments"), 2);
++    }
++
++    let (mut report, _code) = if args.combined_narrow_subsystem_init {
++        if args.dry_run {
++            log::warn!("--dry-run: no real UART or I2C access; using mocked Sensor/Frozen devices");
++        } else if let Some(early) = refuse_if_owned(args) {
++            return early;
++        }
++        run_combined_narrow_subsystem_init(args).await
++    } else if args.dry_run {
 +        log::warn!("--dry-run: no real UART or I2C access; using a mocked Sensor device");
 +        if args.enable_suspected_sensor_line {
 +            run_dry_line_enable(args, mode).await
@@ -17339,7 +17659,7 @@ index 0000000..f6ff6d7
 +        }
 +    };
 +
-+    if args.audit_expander {
++    if args.audit_expander && !args.combined_narrow_subsystem_init {
 +        // `write_count` is always 0: `audit_expander` never calls `write_reg` (see its own doc
 +        // comment and the `expander_audit_never_writes_any_register` test) -- computed from the
 +        // mock's own write log rather than hardcoded, so a future regression would fail loudly.
@@ -17395,12 +17715,19 @@ index 0000000..f6ff6d7
 +        log::error!("refusing to run: {} appears to be open in another process", args.sensor_port);
 +        return Some((empty_report(args, ProbeMode::Passive, false, "sensor_port_open_elsewhere"), 40));
 +    }
-+    if (args.audit_expander || args.enable_suspected_sensor_line)
++    if (args.audit_expander || args.enable_suspected_sensor_line || args.combined_narrow_subsystem_init)
 +        && ownership::device_exists(&args.i2c_device)
 +        && ownership::device_is_open_elsewhere(&args.i2c_device)
 +    {
 +        log::error!("refusing to run: {} appears to be open in another process", args.i2c_device);
 +        return Some((empty_report(args, ProbeMode::Passive, false, "i2c_device_open_elsewhere"), 40));
++    }
++    if args.combined_narrow_subsystem_init
++        && ownership::device_exists(&args.frozen_port)
++        && ownership::device_is_open_elsewhere(&args.frozen_port)
++    {
++        log::error!("refusing to run: {} appears to be open in another process", args.frozen_port);
++        return Some((empty_report(args, ProbeMode::Passive, false, "frozen_port_open_elsewhere"), 40));
 +    }
 +    None
 +}
@@ -17682,7 +18009,9 @@ index 0000000..f6ff6d7
 +        i2c_reads: 0,
 +        i2c_writes: 0,
 +        actuator_commands_sent: 0,
-+        frozen_port_never_opened: true,
++        // `--combined-narrow-subsystem-init` is the one deliberate exception that intentionally
++        // opens Frozen's UART -- see that mode's own module docs. Every other mode never does.
++        frozen_port_never_opened: !args.combined_narrow_subsystem_init,
 +        frozen_command_sent: false,
 +        prime_command_sent: false,
 +        temperature_target_changed: false,
@@ -17706,6 +18035,36 @@ index 0000000..f6ff6d7
 +        passive_rx_after_enable: 0,
 +        first_rx_after_enable_ms: None,
 +        first_decoded_packet_after_enable_ms: None,
++        combined_init_requested: args.combined_narrow_subsystem_init,
++        combined_init_verified: false,
++        combined_reg02_assert_original: None,
++        combined_reg02_assert_target: None,
++        combined_reg02_assert_readback: None,
++        combined_reg02_assert_changed_mask: None,
++        combined_reg06_config_original: None,
++        combined_reg06_config_target: None,
++        combined_reg06_config_readback: None,
++        combined_reg06_config_changed_mask: None,
++        combined_reg02_release_original: None,
++        combined_reg02_release_target: None,
++        combined_reg02_release_readback: None,
++        combined_reg02_release_changed_mask: None,
++        combined_reg07_preserved: false,
++        combined_reg07_original: None,
++        combined_reg07_final: None,
++        expander_audit_before: None,
++        expander_audit_after: None,
++        frozen_reached_firmware: false,
++        sensor_bootloader_confirmed: false,
++        sensor_firmware_confirmed: false,
++        rx_count_before: None,
++        tx_count_before: None,
++        rx_count_after: None,
++        tx_count_after: None,
++        spontaneous_bytes_38400: 0,
++        spontaneous_bytes_115200: 0,
++        first_sensor_rx_after_init_ms: None,
++        first_decoded_sensor_packet_after_init_ms: None,
 +        overall_result: "uart_silent".to_string(),
 +        exit_code: 10,
 +    }
@@ -17725,8 +18084,11 @@ index 0000000..f6ff6d7
 +        | "unsolicited_traffic_only"
 +        | "sensor_alive_after_line_enable"
 +        | "sensor_bootloader_after_line_enable"
-+        | "spontaneous_sensor_traffic_after_line_enable" => 0,
-+        "uart_silent" | "still_silent_after_line_enable" => 10,
++        | "spontaneous_sensor_traffic_after_line_enable"
++        | "sensor_firmware_alive_after_combined_init"
++        | "sensor_bootloader_alive_after_combined_init"
++        | "sensor_rx_activity_after_combined_init" => 0,
++        "uart_silent" | "still_silent_after_line_enable" | "sensor_still_silent_after_combined_init" | "frozen_alive_sensor_silent" => 10,
 +        "undecodable_traffic" => 11,
 +        "unresolved" => 12,
 +        "expander_verification_failed" => 13,
@@ -18764,6 +19126,552 @@ index 0000000..f6ff6d7
 +    ExpanderAudit { readings, read_only: true }
 +}
 +
++// ---------------------------------------------------------------------------------------------
++// EXPERIMENTAL: --combined-narrow-subsystem-init
++//
++// Reproduces only the port-0 portion of upstream OpenSleep's own startup sequence (bits 0 and 1
++// of PCAL6416A registers 0x02/0x06), verifies Frozen is reachable (Ping only), then probes Sensor
++// using upstream's own bootloader-first discovery ordering. See module docs and SAFETY.md.
++// ---------------------------------------------------------------------------------------------
++
++/// `/dev/ttyS2`'s index in `/proc/tty/driver/serial` on this MT8365 Hub.
++const SENSOR_TTY_INDEX: u32 = 2;
++
++/// Best-effort `/proc/tty/driver/serial` byte-counter read for `ttyS{tty_index}` -- `(rx, tx)`.
++/// `None` for either value whenever the file is unavailable, the line for that index is missing,
++/// or the expected `rx:`/`tx:` fields aren't present on it. Never treated as fatal -- see this
++/// feature's own "or equivalent internal counters if practical" framing.
++fn read_serial_counters(tty_index: u32) -> (Option<u64>, Option<u64>) {
++    let Ok(contents) = std::fs::read_to_string("/proc/tty/driver/serial") else {
++        return (None, None);
++    };
++    let prefix = format!("{tty_index}:");
++    let Some(line) = contents.lines().find(|l| l.trim_start().starts_with(&prefix)) else {
++        return (None, None);
++    };
++    (parse_counter_field(line, "rx:"), parse_counter_field(line, "tx:"))
++}
++
++fn parse_counter_field(line: &str, field: &str) -> Option<u64> {
++    let idx = line.find(field)?;
++    let rest = &line[idx + field.len()..];
++    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
++    digits.parse().ok()
++}
++
++#[derive(Debug, Clone, Copy, Default)]
++struct CombinedInitOutcome {
++    /// `true` iff the I2C sequence was actually attempted (whether it then succeeded or failed) --
++    /// `false` only when the I2C device itself never opened, so the register fields below were
++    /// never actually read and must be reported as `None`, not a misleading `Some(0x00)`.
++    attempted: bool,
++    verified: bool,
++    reg02_assert_original: u8,
++    reg02_assert_target: u8,
++    reg02_assert_readback: u8,
++    reg02_assert_changed_mask: u8,
++    reg06_config_original: u8,
++    reg06_config_target: u8,
++    reg06_config_readback: u8,
++    reg06_config_changed_mask: u8,
++    reg02_release_original: u8,
++    reg02_release_target: u8,
++    reg02_release_readback: u8,
++    reg02_release_changed_mask: u8,
++}
++
++/// Prints the required prominent warning, then performs and translates
++/// `i2c::configure_combined_narrow_subsystem_init`'s result. Never itself decides whether to
++/// proceed to UART probing -- callers must check `verified` first.
++async fn apply_combined_narrow_subsystem_init<P: I2cPort>(dev: &mut P) -> CombinedInitOutcome {
++    log::warn!("EXPERIMENTAL: configuring PCAL6416A port-0 bits 0 and 1 (combined narrow subsystem init).");
++    log::warn!("Bit 1 will receive the already-proven Frozen assert/hold/release pulse; bit 0 will be left asserted HIGH. No other register will be written.");
++    match configure_combined_narrow_subsystem_init(dev).await {
++        Ok(r) => CombinedInitOutcome {
++            attempted: true,
++            verified: r.fully_verified(),
++            reg02_assert_original: r.reg02_assert.original,
++            reg02_assert_target: r.reg02_assert.target,
++            reg02_assert_readback: r.reg02_assert.readback,
++            reg02_assert_changed_mask: r.reg02_assert.changed_mask,
++            reg06_config_original: r.reg06_config.original,
++            reg06_config_target: r.reg06_config.target,
++            reg06_config_readback: r.reg06_config.readback,
++            reg06_config_changed_mask: r.reg06_config.changed_mask,
++            reg02_release_original: r.reg02_release.original,
++            reg02_release_target: r.reg02_release.target,
++            reg02_release_readback: r.reg02_release.readback,
++            reg02_release_changed_mask: r.reg02_release.changed_mask,
++        },
++        Err(e) => {
++            log::error!("failed to configure combined narrow subsystem init: {e}");
++            CombinedInitOutcome { attempted: true, ..Default::default() }
++        }
++    }
++}
++
++async fn drain_frozen_startup_traffic<T: AsyncRead + AsyncWrite + Unpin>(link: &mut FrozenLink<T>, duration: Duration) {
++    let deadline = tokio::time::Instant::now() + duration;
++    loop {
++        let now = tokio::time::Instant::now();
++        if now >= deadline {
++            break;
++        }
++        match link.recv(deadline - now).await {
++            Ok(FrozenPacketOutcome::Received(_)) | Ok(FrozenPacketOutcome::TimedOut) => {}
++            Ok(FrozenPacketOutcome::Closed) | Err(_) => break,
++        }
++    }
++}
++
++/// Ping-only Frozen verification: `Mode::Passive`'s whitelist structurally forbids everything this
++/// step must never send (an enabled `SetTargetTemperature`, `Prime`) -- see module docs. Drains
++/// ~2s of startup traffic first, then Pings; a bootloader response is followed by the same
++/// already-proven bootloader-to-firmware handling `frozen-passive`/`frozen-cool-test` use
++/// (`frozen_ops::jump_to_firmware_and_wait`). Returns `true` only once application firmware
++/// actually answers.
++async fn verify_frozen_reachable<T: AsyncRead + AsyncWrite + Unpin>(link: &mut FrozenLink<T>) -> bool {
++    let mut audit = AuditedTransport::new(FrozenMode::Passive);
++    drain_frozen_startup_traffic(link, Duration::from_secs(2)).await;
++    let (ok, mode) = frozen_ops::ping(link, &mut audit, Duration::from_secs(1)).await;
++    match (ok, mode) {
++        (true, frozen_ops::DeviceMode::Firmware) => true,
++        (true, frozen_ops::DeviceMode::Bootloader) => frozen_ops::jump_to_firmware_and_wait(link, &mut audit, Duration::from_secs(1)).await,
++        _ => false,
++    }
++}
++
++/// Bootloader-first Sensor discovery (mirrors `line_enable_discover_probe`'s ordering exactly),
++/// additionally tracking `spontaneous_bytes_38400`/`spontaneous_bytes_115200` and the elapsed time
++/// to the first raw byte/decoded packet relative to `init_completed_at` -- kept as its own function
++/// rather than generalizing `line_enable_discover_probe`, for the same reason every other pair of
++/// similar-but-distinct flows in this file is kept separate.
++#[allow(clippy::too_many_arguments)]
++async fn combined_init_sensor_probe<T: AsyncRead + AsyncWrite + Unpin, O>(
++    args: &SensorProbeArgs,
++    audit: &mut SensorAudit,
++    init_completed_at: tokio::time::Instant,
++    spontaneous_bytes_38400: &mut u64,
++    spontaneous_bytes_115200: &mut u64,
++    first_rx_ms: &mut Option<u64>,
++    first_decoded_ms: &mut Option<u64>,
++    mut open: O,
++) -> ModeOutcome
++where
++    O: FnMut(u32) -> Result<(SensorLink<T>, RawIoCapture), String>,
++{
++    let mut outcome = ModeOutcome::default();
++
++    // Bootloader first.
++    if let Ok((mut link, capture)) = open(BOOTLOADER_BAUD) {
++        outcome.bootloader_baud_opened = true;
++        let _pre =
++            listen_with_enable_timing(&mut link, &capture, Duration::from_secs(1), init_completed_at, first_rx_ms, first_decoded_ms).await;
++        let (bytes, _) = tally_raw_capture(&capture);
++        *spontaneous_bytes_38400 += bytes;
++        let r = try_ping(&mut link, audit, ProbeMode::Discover, false, 3).await;
++        let bootloader_confirmed = r == Some(false);
++        outcome.bootloader_ping_response = Some(bootloader_confirmed);
++        if bootloader_confirmed {
++            match link.send(audit, ProbeMode::Discover, SensorProbeAction::JumpToFirmware, false, Duration::from_secs(1)).await {
++                Ok(_) => outcome.jump_to_firmware_sent = true,
++                Err(e) => log::error!("JumpToFirmware failed: {e}"),
++            }
++            let _ = listen_and_tally(&mut link, Duration::from_secs(2)).await; // wait for mode transition
++        }
++    } else {
++        log::error!("failed to open Sensor UART @ {BOOTLOADER_BAUD}");
++    }
++    // `link` (if any) drops here -- UART closed before the firmware-baud reopen below.
++
++    // Firmware -- always attempted, regardless of the bootloader step's outcome.
++    if let Ok((mut link, capture)) = open(FIRMWARE_BAUD) {
++        outcome.firmware_baud_opened = true;
++        let _pre =
++            listen_with_enable_timing(&mut link, &capture, Duration::from_secs(1), init_completed_at, first_rx_ms, first_decoded_ms).await;
++        let (bytes, _) = tally_raw_capture(&capture);
++        *spontaneous_bytes_115200 += bytes;
++        let r = try_ping(&mut link, audit, ProbeMode::Discover, false, 3).await;
++        outcome.firmware_ping_response = Some(matches!(r, Some(true)));
++        outcome.firmware_mode_confirmed = outcome.firmware_ping_response == Some(true);
++
++        if outcome.firmware_mode_confirmed && args.query_info {
++            if let Some(SensorPacket::HardwareInfo(hw)) = send_and_wait_for(
++                &mut link,
++                audit,
++                ProbeMode::Discover,
++                SensorProbeAction::GetHardwareInfo,
++                true,
++                Duration::from_secs(1),
++                |p| matches!(p, SensorPacket::HardwareInfo(_)),
++            )
++            .await
++            {
++                outcome.hardware_info = Some(hw.to_string());
++            }
++            if let Some(SensorPacket::GetFirmware(v)) = send_and_wait_for(
++                &mut link,
++                audit,
++                ProbeMode::Discover,
++                SensorProbeAction::GetFirmwareHash,
++                true,
++                Duration::from_secs(1),
++                |p| matches!(p, SensorPacket::GetFirmware(_)),
++            )
++            .await
++            {
++                outcome.firmware_info = Some(format!("firmware hash response value: {v}"));
++            }
++        }
++    } else {
++        log::error!("failed to open Sensor UART @ {FIRMWARE_BAUD}");
++    }
++
++    outcome
++}
++
++#[allow(clippy::too_many_arguments)]
++fn finish_combined_init(
++    args: &SensorProbeArgs,
++    dry_run: bool,
++    init: CombinedInitOutcome,
++    audit_before: Option<ExpanderAudit>,
++    audit_after: Option<ExpanderAudit>,
++    frozen_uart_opens: u32,
++    frozen_reached_firmware: bool,
++    sensor_probe: ModeOutcome,
++    sensor_audit: SensorAudit,
++    rx_before: Option<u64>,
++    tx_before: Option<u64>,
++    rx_after: Option<u64>,
++    tx_after: Option<u64>,
++    spontaneous_bytes_38400: u64,
++    spontaneous_bytes_115200: u64,
++    first_sensor_rx_after_init_ms: Option<u64>,
++    first_decoded_sensor_packet_after_init_ms: Option<u64>,
++    i2c_reads: u32,
++    i2c_writes: u32,
++) -> (SensorProbeReport, u8) {
++    let mut r = base_report(args, ProbeMode::Discover, dry_run);
++    r.mode = "combined-narrow-subsystem-init".to_string();
++
++    r.combined_init_verified = init.verified;
++    // `None` (not a misleading `Some(0x00)`) whenever the I2C sequence was never actually
++    // attempted at all (the device failed to open) -- see `CombinedInitOutcome::attempted`'s doc
++    // comment.
++    let opt = |v: u8| init.attempted.then_some(v);
++    r.combined_reg02_assert_original = opt(init.reg02_assert_original);
++    r.combined_reg02_assert_target = opt(init.reg02_assert_target);
++    r.combined_reg02_assert_readback = opt(init.reg02_assert_readback);
++    r.combined_reg02_assert_changed_mask = opt(init.reg02_assert_changed_mask);
++    r.combined_reg06_config_original = opt(init.reg06_config_original);
++    r.combined_reg06_config_target = opt(init.reg06_config_target);
++    r.combined_reg06_config_readback = opt(init.reg06_config_readback);
++    r.combined_reg06_config_changed_mask = opt(init.reg06_config_changed_mask);
++    r.combined_reg02_release_original = opt(init.reg02_release_original);
++    r.combined_reg02_release_target = opt(init.reg02_release_target);
++    r.combined_reg02_release_readback = opt(init.reg02_release_readback);
++    r.combined_reg02_release_changed_mask = opt(init.reg02_release_changed_mask);
++
++    let reg07_before = audit_before.as_ref().and_then(|a| a.readings.iter().find(|x| x.register == 0x07)).and_then(|x| x.value);
++    let reg07_after = audit_after.as_ref().and_then(|a| a.readings.iter().find(|x| x.register == 0x07)).and_then(|x| x.value);
++    r.combined_reg07_original = reg07_before;
++    r.combined_reg07_final = reg07_after;
++    r.combined_reg07_preserved = reg07_before.is_some() && reg07_before == reg07_after;
++
++    r.expander_audit_before = audit_before;
++    r.expander_audit_after = audit_after;
++
++    r.frozen_uart_opens = frozen_uart_opens;
++    r.frozen_reached_firmware = frozen_reached_firmware;
++
++    r.firmware_baud_opened = sensor_probe.firmware_baud_opened;
++    r.bootloader_baud_opened = sensor_probe.bootloader_baud_opened;
++    r.bootloader_ping_response = sensor_probe.bootloader_ping_response;
++    r.firmware_ping_response = sensor_probe.firmware_ping_response;
++    r.jump_to_firmware_sent = sensor_probe.jump_to_firmware_sent;
++    r.firmware_mode_confirmed = sensor_probe.firmware_mode_confirmed;
++    r.hardware_info = sensor_probe.hardware_info;
++    r.firmware_info = sensor_probe.firmware_info;
++    r.sensor_bootloader_confirmed = sensor_probe.bootloader_ping_response == Some(true);
++    r.sensor_firmware_confirmed = sensor_probe.firmware_mode_confirmed;
++
++    r.rx_count_before = rx_before;
++    r.tx_count_before = tx_before;
++    r.rx_count_after = rx_after;
++    r.tx_count_after = tx_after;
++    r.spontaneous_bytes_38400 = spontaneous_bytes_38400;
++    r.spontaneous_bytes_115200 = spontaneous_bytes_115200;
++    r.first_sensor_rx_after_init_ms = first_sensor_rx_after_init_ms;
++    r.first_decoded_sensor_packet_after_init_ms = first_decoded_sensor_packet_after_init_ms;
++
++    r.sensor_uart_writes = sensor_audit.sensor_uart_writes;
++    r.actuator_commands_sent = sensor_audit.actuator_commands_sent;
++    r.i2c_reads = i2c_reads;
++    r.i2c_writes = i2c_writes;
++
++    let spontaneous_seen = spontaneous_bytes_38400 > 0 || spontaneous_bytes_115200 > 0;
++
++    r.overall_result = if !init.verified {
++        "expander_verification_failed"
++    } else if r.sensor_firmware_confirmed {
++        "sensor_firmware_alive_after_combined_init"
++    } else if r.sensor_bootloader_confirmed {
++        "sensor_bootloader_alive_after_combined_init"
++    } else if spontaneous_seen {
++        "sensor_rx_activity_after_combined_init"
++    } else if frozen_reached_firmware {
++        "frozen_alive_sensor_silent"
++    } else {
++        "sensor_still_silent_after_combined_init"
++    }
++    .to_string();
++    r.exit_code = exit_code_for(&r.overall_result);
++    let code = r.exit_code;
++    (r, code)
++}
++
++async fn run_combined_narrow_subsystem_init(args: &SensorProbeArgs) -> (SensorProbeReport, u8) {
++    if args.dry_run { run_dry_combined_init(args).await } else { run_real_combined_init(args).await }
++}
++
++async fn run_real_combined_init(args: &SensorProbeArgs) -> (SensorProbeReport, u8) {
++    let mut i2c = match RealI2c::open(&args.i2c_device) {
++        Ok(dev) => dev,
++        Err(e) => {
++            log::error!("failed to open I2C device {} for --combined-narrow-subsystem-init: {e}", args.i2c_device);
++            return finish_combined_init(
++                args,
++                false,
++                CombinedInitOutcome::default(),
++                None,
++                None,
++                0,
++                false,
++                ModeOutcome::default(),
++                SensorAudit::new(),
++                None,
++                None,
++                None,
++                None,
++                0,
++                0,
++                None,
++                None,
++                0,
++                0,
++            );
++        }
++    };
++
++    let (rx_before, tx_before) = read_serial_counters(SENSOR_TTY_INDEX);
++    let audit_before = audit_expander(&mut i2c);
++    let mut i2c_reads = audit_before.readings.len() as u32;
++
++    let init = apply_combined_narrow_subsystem_init(&mut i2c).await;
++    // Three writes (0x02 assert, 0x06 config, 0x02 release), each with a read-then-readback (2
++    // reads per step).
++    i2c_reads += 6;
++    let i2c_writes = 3u32;
++
++    let audit_after = audit_expander(&mut i2c);
++    i2c_reads += audit_after.readings.len() as u32;
++
++    if !init.verified {
++        log::error!("expander verification failed (changed a bit other than bits 0/1, or a readback mismatch): aborting before any UART probing");
++        return finish_combined_init(
++            args,
++            false,
++            init,
++            Some(audit_before),
++            Some(audit_after),
++            0,
++            false,
++            ModeOutcome::default(),
++            SensorAudit::new(),
++            rx_before,
++            tx_before,
++            None,
++            None,
++            0,
++            0,
++            None,
++            None,
++            i2c_reads,
++            i2c_writes,
++        );
++    }
++
++    let mut frozen_uart_opens = 0u32;
++    let mut frozen_reached_firmware = false;
++    match FrozenLink::<SerialStream>::open(&args.frozen_port) {
++        Ok(mut flink) => {
++            frozen_uart_opens += 1;
++            frozen_reached_firmware = verify_frozen_reachable(&mut flink).await;
++        }
++        Err(e) => {
++            frozen_uart_opens += 1;
++            log::error!("failed to open Frozen UART {} for verification: {e}", args.frozen_port);
++        }
++    }
++    log::info!("frozen_reached_firmware={frozen_reached_firmware} (verification only -- no target set, no Prime, no pump/cooling started)");
++
++    let mut sensor_audit = SensorAudit::new();
++    let init_completed_at = tokio::time::Instant::now();
++    let mut spontaneous_bytes_38400 = 0u64;
++    let mut spontaneous_bytes_115200 = 0u64;
++    let mut first_rx_ms = None;
++    let mut first_decoded_ms = None;
++
++    let sensor_probe = combined_init_sensor_probe(
++        args,
++        &mut sensor_audit,
++        init_completed_at,
++        &mut spontaneous_bytes_38400,
++        &mut spontaneous_bytes_115200,
++        &mut first_rx_ms,
++        &mut first_decoded_ms,
++        |baud| {
++            let cap: RawIoCapture = Arc::new(Mutex::new(Vec::new()));
++            SensorLink::<SerialStream>::open_capturing(&args.sensor_port, baud, cap.clone(), args.raw_serial_log)
++                .map(|l| (l, cap))
++                .map_err(|e| e.to_string())
++        },
++    )
++    .await;
++
++    let (rx_after, tx_after) = read_serial_counters(SENSOR_TTY_INDEX);
++
++    finish_combined_init(
++        args,
++        false,
++        init,
++        Some(audit_before),
++        Some(audit_after),
++        frozen_uart_opens,
++        frozen_reached_firmware,
++        sensor_probe,
++        sensor_audit,
++        rx_before,
++        tx_before,
++        rx_after,
++        tx_after,
++        spontaneous_bytes_38400,
++        spontaneous_bytes_115200,
++        first_rx_ms,
++        first_decoded_ms,
++        i2c_reads,
++        i2c_writes,
++    )
++}
++
++async fn run_dry_combined_init(args: &SensorProbeArgs) -> (SensorProbeReport, u8) {
++    let mut mock = MockI2c::always_succeed();
++    // Matches this feature's own motivating hardware evidence: reg 0x02 = 0xFD, reg 0x06 = 0xFF
++    // (bit 0 already configured HIGH by a prior --enable-suspected-sensor-line run; bit 1 still an
++    // input) -- so --dry-run demonstrates the interesting "both bits become outputs, bit 1 pulses"
++    // case rather than the degenerate all-zeros mock default.
++    mock.reg_state.insert((crate::i2c::RESET_EXPANDER_ADDR, 0x02), 0xFD);
++    mock.reg_state.insert((crate::i2c::RESET_EXPANDER_ADDR, 0x06), 0xFF);
++    // Real hardware evidence: this Hub's register 0x07 reads 0x77, never touched by this feature
++    // -- seeded here so --dry-run's own `combined_reg07_preserved` demonstrates `true` rather than
++    // `false` purely because the mock never had 0x07 seeded at all.
++    mock.reg_state.insert((crate::i2c::RESET_EXPANDER_ADDR, 0x07), 0x77);
++
++    let audit_before = audit_expander(&mut mock);
++    let init = apply_combined_narrow_subsystem_init(&mut mock).await;
++    let audit_after = audit_expander(&mut mock);
++    let i2c_reads = (audit_before.readings.len() + audit_after.readings.len()) as u32 + 6;
++    let i2c_writes = mock.writes.len() as u32;
++
++    if !init.verified {
++        return finish_combined_init(
++            args,
++            true,
++            init,
++            Some(audit_before),
++            Some(audit_after),
++            0,
++            false,
++            ModeOutcome::default(),
++            SensorAudit::new(),
++            None,
++            None,
++            None,
++            None,
++            0,
++            0,
++            None,
++            None,
++            i2c_reads,
++            i2c_writes,
++        );
++    }
++
++    // Dry-run Frozen verification against the same mocked Frozen device other dry-run paths use
++    // (`crate::mock::mock_frozen_link_pair` -- already-in-firmware, answers Ping immediately).
++    let (frozen_client, frozen_task) = mock_frozen_link_pair();
++    let mut flink = FrozenLink::wrap(frozen_client, "dry-run");
++    let frozen_reached_firmware = verify_frozen_reachable(&mut flink).await;
++    drop(flink);
++    frozen_task.abort();
++    log::info!("frozen_reached_firmware={frozen_reached_firmware} (verification only -- no target set, no Prime, no pump/cooling started)");
++
++    let mut sensor_audit = SensorAudit::new();
++    let init_completed_at = tokio::time::Instant::now();
++    let mut spontaneous_bytes_38400 = 0u64;
++    let mut spontaneous_bytes_115200 = 0u64;
++    let mut first_rx_ms = None;
++    let mut first_decoded_ms = None;
++
++    // Same persistent-mock approach `run_dry_line_enable` uses -- a single simulated Sensor device
++    // reused across the bootloader-baud and firmware-baud "opens" -- see that function's own doc
++    // comment for why this is a deliberate dry-run-only shortcut, not a faithful simulation of a
++    // real UART reopen.
++    let sensor_probe = combined_init_sensor_probe(
++        args,
++        &mut sensor_audit,
++        init_completed_at,
++        &mut spontaneous_bytes_38400,
++        &mut spontaneous_bytes_115200,
++        &mut first_rx_ms,
++        &mut first_decoded_ms,
++        {
++            let mut calls = 0u32;
++            move |_baud| {
++                calls += 1;
++                let (client, device) = tokio::io::duplex(4096);
++                let _ = if calls == 1 { spawn_mock_sensor_device_bootloader(device) } else { spawn_mock_sensor_device_firmware(device) };
++                let cap: RawIoCapture = Arc::new(Mutex::new(Vec::new()));
++                Ok((SensorLink::wrap_capturing(client, "dry-run", cap.clone()), cap))
++            }
++        },
++    )
++    .await;
++
++    finish_combined_init(
++        args,
++        true,
++        init,
++        Some(audit_before),
++        Some(audit_after),
++        1,
++        frozen_reached_firmware,
++        sensor_probe,
++        sensor_audit,
++        None,
++        None,
++        None,
++        None,
++        spontaneous_bytes_38400,
++        spontaneous_bytes_115200,
++        first_rx_ms,
++        first_decoded_ms,
++        i2c_reads,
++        i2c_writes,
++    )
++}
++
 +#[cfg(test)]
 +mod tests {
 +    use super::*;
@@ -18781,6 +19689,8 @@ index 0000000..f6ff6d7
 +            audit_expander: false,
 +            enable_suspected_sensor_line: false,
 +            restore_suspected_sensor_line: false,
++            combined_narrow_subsystem_init: false,
++            frozen_port: "/dev/ttyS1".into(),
 +            json_output: None,
 +            csv_output: None,
 +            verbose: false,
@@ -19259,13 +20169,210 @@ index 0000000..f6ff6d7
 +        assert_eq!(report.reg_0x06_final, report.reg_0x06_original);
 +        assert_eq!(report.reg_0x02_final, report.reg_0x02_original);
 +    }
++
++    // =============================================================================================
++    // --combined-narrow-subsystem-init
++    // =============================================================================================
++
++    #[tokio::test]
++    async fn combined_init_is_opt_in_and_not_part_of_normal_operation() {
++        for (passive, ping, discover) in [(true, false, false), (false, true, false), (false, false, true)] {
++            let mut a = args(true);
++            a.passive = passive;
++            a.ping = ping;
++            a.discover = discover;
++            let (report, _) = run(&a).await;
++            assert!(!report.combined_init_requested, "passive={passive} ping={ping} discover={discover}");
++        }
++    }
++
++    #[tokio::test]
++    async fn combined_init_cannot_be_combined_with_enable_or_audit_expander() {
++        for (enable, restore, audit) in [(true, false, false), (false, true, false), (false, false, true)] {
++            let mut a = args(true);
++            a.combined_narrow_subsystem_init = true;
++            a.enable_suspected_sensor_line = enable;
++            a.restore_suspected_sensor_line = restore || enable; // restore alone requires enable
++            a.audit_expander = audit;
++            let (_, code) = run(&a).await;
++            assert_eq!(code, 2, "enable={enable} restore={restore} audit={audit}");
++        }
++    }
++
++    #[tokio::test]
++    async fn full_combined_init_dry_run_matches_the_hub_evidence() {
++        let mut a = args(true);
++        a.combined_narrow_subsystem_init = true;
++        let (report, code) = run(&a).await;
++        assert!(report.combined_init_requested);
++        assert!(report.combined_init_verified);
++        assert_eq!(report.combined_reg02_release_readback, Some(0xFD));
++        assert_eq!(report.combined_reg06_config_readback, Some(0xFC));
++        assert!(report.combined_reg07_preserved);
++        assert_eq!(report.combined_reg07_original, Some(0x77));
++        assert_eq!(report.overall_result, "sensor_firmware_alive_after_combined_init");
++        assert_eq!(code, 0);
++    }
++
++    #[tokio::test]
++    async fn combined_init_readback_mismatch_aborts_before_any_uart_probing() {
++        struct StaleReg02 {
++            inner: MockI2c,
++            stale_value: u8,
++        }
++        impl I2cPort for StaleReg02 {
++            fn read_byte(&mut self, addr: u8) -> Result<u8, crate::i2c::I2cIoError> {
++                self.inner.read_byte(addr)
++            }
++            fn read_reg(&mut self, addr: u8, reg: u8) -> Result<u8, crate::i2c::I2cIoError> {
++                if addr == crate::i2c::RESET_EXPANDER_ADDR && reg == 0x02 && !self.inner.writes.is_empty() {
++                    return Ok(self.stale_value);
++                }
++                self.inner.read_reg(addr, reg)
++            }
++            fn write_reg(&mut self, addr: u8, reg: u8, value: u8) -> Result<(), crate::i2c::I2cIoError> {
++                self.inner.write_reg(addr, reg, value)
++            }
++        }
++        let mut mock = MockI2c::always_succeed();
++        mock.reg_state.insert((crate::i2c::RESET_EXPANDER_ADDR, 0x02), 0xFD);
++        mock.reg_state.insert((crate::i2c::RESET_EXPANDER_ADDR, 0x06), 0xFF);
++        let mut stale = StaleReg02 { inner: mock, stale_value: 0x00 };
++        let init = apply_combined_narrow_subsystem_init(&mut stale).await;
++        assert!(!init.verified);
++
++        let a = args(true);
++        let (report, code) = finish_combined_init(
++            &a,
++            true,
++            init,
++            None,
++            None,
++            0,
++            false,
++            ModeOutcome::default(),
++            SensorAudit::new(),
++            None,
++            None,
++            None,
++            None,
++            0,
++            0,
++            None,
++            None,
++            0,
++            0,
++        );
++        assert_eq!(report.overall_result, "expander_verification_failed");
++        assert_eq!(report.sensor_uart_writes, 0, "verification failure must abort before any Sensor UART writes");
++        assert_eq!(code, 13);
++    }
++
++    #[tokio::test]
++    async fn combined_init_frozen_verification_sends_no_actuator_command() {
++        let mut a = args(true);
++        a.combined_narrow_subsystem_init = true;
++        let (report, _) = run(&a).await;
++        // Mode::Passive's own whitelist structurally forbids an enabled SetTargetTemperature and
++        // Prime -- see safety::tests::passive_rejects_enabled_cooling_for_either_side /
++        // prime_is_refused_outside_prime_test_mode. This is the report-level cross-check that this
++        // mode's Frozen verification step never sets a target, primes, or otherwise actuates.
++        assert!(!report.frozen_command_sent);
++        assert!(!report.prime_command_sent);
++        assert!(!report.temperature_target_changed);
++        assert!(report.frozen_reached_firmware);
++    }
++
++    #[tokio::test]
++    async fn combined_init_sensor_discovery_tries_bootloader_before_firmware() {
++        let mut audit = SensorAudit::new();
++        let mut spontaneous_38400 = 0u64;
++        let mut spontaneous_115200 = 0u64;
++        let mut first_rx_ms = None;
++        let mut first_decoded_ms = None;
++        let mut a = args(true);
++        a.observe_seconds = 0;
++        let outcome = combined_init_sensor_probe(
++            &a,
++            &mut audit,
++            tokio::time::Instant::now(),
++            &mut spontaneous_38400,
++            &mut spontaneous_115200,
++            &mut first_rx_ms,
++            &mut first_decoded_ms,
++            {
++                let mut calls = 0u32;
++                move |_baud| {
++                    calls += 1;
++                    let (client, device) = tokio::io::duplex(4096);
++                    let _ = if calls == 1 { spawn_mock_sensor_device_bootloader(device) } else { spawn_mock_sensor_device_firmware(device) };
++                    let cap: RawIoCapture = Arc::new(Mutex::new(Vec::new()));
++                    Ok((SensorLink::wrap_capturing(client, "test", cap.clone()), cap))
++                }
++            },
++        )
++        .await;
++        assert_eq!(outcome.bootloader_ping_response, Some(true));
++        assert!(outcome.jump_to_firmware_sent);
++        assert!(outcome.firmware_mode_confirmed);
++    }
++
++    #[tokio::test]
++    async fn combined_init_sensor_discovery_never_jumps_when_bootloader_silent() {
++        let mut audit = SensorAudit::new();
++        let mut spontaneous_38400 = 0u64;
++        let mut spontaneous_115200 = 0u64;
++        let mut first_rx_ms = None;
++        let mut first_decoded_ms = None;
++        let mut a = args(true);
++        a.observe_seconds = 0;
++        let outcome = combined_init_sensor_probe(
++            &a,
++            &mut audit,
++            tokio::time::Instant::now(),
++            &mut spontaneous_38400,
++            &mut spontaneous_115200,
++            &mut first_rx_ms,
++            &mut first_decoded_ms,
++            |_baud| {
++                let (client, device) = tokio::io::duplex(4096);
++                let _ = spawn_mock_sensor_device_silent(device);
++                let cap: RawIoCapture = Arc::new(Mutex::new(Vec::new()));
++                Ok((SensorLink::wrap_capturing(client, "test", cap.clone()), cap))
++            },
++        )
++        .await;
++        assert_eq!(outcome.bootloader_ping_response, Some(false));
++        assert!(!outcome.jump_to_firmware_sent);
++        assert!(!outcome.firmware_mode_confirmed);
++    }
++
++    #[test]
++    fn combined_init_never_references_reset_controller() {
++        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/bin/opensleep-diagnostic/sensor_probe.rs");
++        let src = std::fs::read_to_string(path).expect("readable source file");
++        let needle = format!("{}{}{}", "Reset", "Controller", "::");
++        assert!(!src.contains(&needle), "sensor_probe.rs must never construct/call ResetController");
++    }
++
++    #[tokio::test]
++    async fn combined_init_never_writes_register_0x07_or_0x03_end_to_end() {
++        let mut a = args(true);
++        a.combined_narrow_subsystem_init = true;
++        let (report, _) = run(&a).await;
++        // Exactly three I2C writes total (0x02 assert, 0x06 config, 0x02 release) -- if either
++        // 0x07 or 0x03 had been written, this count would be higher (see the i2c.rs-level
++        // byte-for-byte proof, `combined_init_writes_0x02_before_0x06_and_never_touches_0x07_or_0x03`,
++        // for the direct register-identity check).
++        assert_eq!(report.i2c_writes, 3);
++    }
 +}
 diff --git a/src/bin/opensleep-diagnostic/sensor_report.rs b/src/bin/opensleep-diagnostic/sensor_report.rs
 new file mode 100644
-index 0000000..f94f048
+index 0000000..156ca6d
 --- /dev/null
 +++ b/src/bin/opensleep-diagnostic/sensor_report.rs
-@@ -0,0 +1,296 @@
+@@ -0,0 +1,411 @@
 +//! `sensor-probe`'s report: a self-contained struct with its own JSON/CSV/text output, entirely
 +//! separate from `report.rs`'s `Report` (which is Frozen-specific top to bottom -- `frozen_port`,
 +//! `frozen_uart_opened`, `cool_test_results`, ... -- and stays untouched by this file). Mirrors
@@ -19422,6 +20529,55 @@ index 0000000..f94f048
 +    pub first_rx_after_enable_ms: Option<u64>,
 +    pub first_decoded_packet_after_enable_ms: Option<u64>,
 +
++    // --combined-narrow-subsystem-init (all default/`None`/`false`/`0` unless requested). See
++    // SAFETY.md and `sensor_probe.rs` module docs.
++    pub combined_init_requested: bool,
++    pub combined_init_verified: bool,
++
++    pub combined_reg02_assert_original: Option<u8>,
++    pub combined_reg02_assert_target: Option<u8>,
++    pub combined_reg02_assert_readback: Option<u8>,
++    pub combined_reg02_assert_changed_mask: Option<u8>,
++
++    pub combined_reg06_config_original: Option<u8>,
++    pub combined_reg06_config_target: Option<u8>,
++    pub combined_reg06_config_readback: Option<u8>,
++    pub combined_reg06_config_changed_mask: Option<u8>,
++
++    pub combined_reg02_release_original: Option<u8>,
++    pub combined_reg02_release_target: Option<u8>,
++    pub combined_reg02_release_readback: Option<u8>,
++    pub combined_reg02_release_changed_mask: Option<u8>,
++
++    /// `register 0x07 original == register 0x07 final` -- proven, not assumed, by reading the
++    /// expander both before and after the combined sequence. `false` whenever either read failed.
++    pub combined_reg07_preserved: bool,
++    pub combined_reg07_original: Option<u8>,
++    pub combined_reg07_final: Option<u8>,
++
++    /// Full read-only expander audit (0x00-0x07) captured immediately before the combined I2C
++    /// sequence and immediately after it.
++    pub expander_audit_before: Option<ExpanderAudit>,
++    pub expander_audit_after: Option<ExpanderAudit>,
++
++    pub frozen_reached_firmware: bool,
++    pub sensor_bootloader_confirmed: bool,
++    pub sensor_firmware_confirmed: bool,
++
++    /// Best-effort `/proc/tty/driver/serial` byte counters for the Sensor UART, captured
++    /// immediately before the I2C change and again at the end of the run. `None` when the file is
++    /// unavailable or unparseable (e.g. not running on Linux, or a kernel build without that proc
++    /// entry) -- never treated as fatal.
++    pub rx_count_before: Option<u64>,
++    pub tx_count_before: Option<u64>,
++    pub rx_count_after: Option<u64>,
++    pub tx_count_after: Option<u64>,
++
++    pub spontaneous_bytes_38400: u64,
++    pub spontaneous_bytes_115200: u64,
++    pub first_sensor_rx_after_init_ms: Option<u64>,
++    pub first_decoded_sensor_packet_after_init_ms: Option<u64>,
++
 +    pub overall_result: String,
 +    pub exit_code: u8,
 +}
@@ -19480,6 +20636,18 @@ index 0000000..f94f048
 +            self.first_decoded_packet_after_enable_ms.map(|v| v.to_string()).unwrap_or_default()
 +        );
 +        csv_field!("frozen_uart_opens", self.frozen_uart_opens);
++        csv_field!("combined_init_requested", self.combined_init_requested);
++        csv_field!("combined_init_verified", self.combined_init_verified);
++        csv_field!("combined_reg07_preserved", self.combined_reg07_preserved);
++        csv_field!("frozen_reached_firmware", self.frozen_reached_firmware);
++        csv_field!("sensor_bootloader_confirmed", self.sensor_bootloader_confirmed);
++        csv_field!("sensor_firmware_confirmed", self.sensor_firmware_confirmed);
++        csv_field!("spontaneous_bytes_38400", self.spontaneous_bytes_38400);
++        csv_field!("spontaneous_bytes_115200", self.spontaneous_bytes_115200);
++        csv_field!(
++            "first_sensor_rx_after_init_ms",
++            self.first_sensor_rx_after_init_ms.map(|v| v.to_string()).unwrap_or_default()
++        );
 +        csv_field!("overall_result", self.overall_result);
 +        csv_field!("exit_code", self.exit_code);
 +        Ok(())
@@ -19530,6 +20698,49 @@ index 0000000..f94f048
 +            );
 +            log::info!("restore_requested: {}", self.suspected_sensor_line_restore_requested);
 +        }
++        if self.combined_init_requested {
++            log::info!("---- EXPERIMENTAL: combined narrow subsystem init (port-0 bits 0+1) ----");
++            log::info!(
++                "reg 0x02 assert: original=0x{:02X?} target=0x{:02X?} readback=0x{:02X?} changed_mask=0x{:02X?}",
++                self.combined_reg02_assert_original,
++                self.combined_reg02_assert_target,
++                self.combined_reg02_assert_readback,
++                self.combined_reg02_assert_changed_mask
++            );
++            log::info!(
++                "reg 0x06 config: original=0x{:02X?} target=0x{:02X?} readback=0x{:02X?} changed_mask=0x{:02X?}",
++                self.combined_reg06_config_original,
++                self.combined_reg06_config_target,
++                self.combined_reg06_config_readback,
++                self.combined_reg06_config_changed_mask
++            );
++            log::info!(
++                "reg 0x02 release: original=0x{:02X?} target=0x{:02X?} readback=0x{:02X?} changed_mask=0x{:02X?}",
++                self.combined_reg02_release_original,
++                self.combined_reg02_release_target,
++                self.combined_reg02_release_readback,
++                self.combined_reg02_release_changed_mask
++            );
++            log::info!(
++                "combined_init_verified={} reg07: original=0x{:02X?} final=0x{:02X?} preserved={}",
++                self.combined_init_verified, self.combined_reg07_original, self.combined_reg07_final, self.combined_reg07_preserved
++            );
++            log::info!(
++                "frozen_reached_firmware={} sensor_bootloader_confirmed={} sensor_firmware_confirmed={}",
++                self.frozen_reached_firmware, self.sensor_bootloader_confirmed, self.sensor_firmware_confirmed
++            );
++            log::info!(
++                "serial counters (ttyS2): rx {:?} -> {:?}  tx {:?} -> {:?}",
++                self.rx_count_before, self.rx_count_after, self.tx_count_before, self.tx_count_after
++            );
++            log::info!(
++                "spontaneous_bytes_38400={} spontaneous_bytes_115200={} first_sensor_rx_after_init_ms={:?} first_decoded_sensor_packet_after_init_ms={:?}",
++                self.spontaneous_bytes_38400,
++                self.spontaneous_bytes_115200,
++                self.first_sensor_rx_after_init_ms,
++                self.first_decoded_sensor_packet_after_init_ms
++            );
++        }
 +        if let Some(hw) = &self.hardware_info {
 +            log::info!("hardware_info: {hw}");
 +        }
@@ -19550,6 +20761,17 @@ index 0000000..f94f048
 +                        r.register_hex, r.label, v, v
 +                    ),
 +                    None => log::info!("  reg {} ({}): read failed (errno {:?})", r.register_hex, r.label, r.os_error),
++                }
++            }
++        }
++        for (label, audit) in [("before", &self.expander_audit_before), ("after", &self.expander_audit_after)] {
++            if let Some(audit) = audit {
++                log::info!("---- PCAL6416A expander audit ({label} combined init, read-only) ----");
++                for r in &audit.readings {
++                    match r.value {
++                        Some(v) => log::info!("  reg {} ({}): 0x{:02X} = 0b{:08b}", r.register_hex, r.label, v, v),
++                        None => log::info!("  reg {} ({}): read failed (errno {:?})", r.register_hex, r.label, r.os_error),
++                    }
 +                }
 +            }
 +        }
